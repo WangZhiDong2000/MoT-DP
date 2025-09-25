@@ -1,0 +1,162 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Data files
+*.zarr/
+*.zarr
+*.hdf5
+*.h5
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.json.gz
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# Large directories
+data/
+datasets/
+checkpoints/
+logs/
+outputs/
+results/
+wandb/
+runs/
+tb_logs/
+tensorboard/
+
+# Media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.webm
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+*.svg
+*.ico
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+*.aac
+*.ogg
+*.wma
+
+# Archives
+*.tar
+*.gz
+*.bz2
+*.xz
+*.lz
+*.lzma
+*.Z
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+conda-meta/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.out
+*.err
+
+# Large model files
+*.bin
+*.safetensors
+*.onnx
+*.tflite
+*.pb
+
+# Weights & Biases
+wandb/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# DVC
+.dvc/
+*.dvc
+
+# Node.js (if using any web components)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Config files with sensitive data
+config/secrets.yaml
+config/private.yaml
+*.secret.yaml
