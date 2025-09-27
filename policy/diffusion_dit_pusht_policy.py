@@ -10,13 +10,16 @@ from model.pusht_encoder import create_pusht_encoder
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
 import os
 
-try:
-    from model.vlm_backbone import VLMDriveBackbone
-    VLM_AVAILABLE = True
-except ImportError as e:
-    print(f"VLM backbone not available: {e}")
-    VLMDriveBackbone = None
-    VLM_AVAILABLE = False
+# try:
+#     from model.vlm_backbone import VLMDriveBackbone
+#     VLM_AVAILABLE = True
+# except ImportError as e:
+#     print(f"VLM backbone not available: {e}")
+#     VLMDriveBackbone = None
+#     VLM_AVAILABLE = False
+
+VLMDriveBackbone = None
+VLM_AVAILABLE = False
 
 
 def dict_apply(
@@ -72,7 +75,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
             print("⚠ VLM backbone not available, using simulated features")
         self.feature_encoder = None
         # Initialize fixed VLM features for consistent behavior across train/val/test
-        self._init_fixed_vlm_features()
+        self._init_loaded_vlm_features()
 
 
         # create diffusion model
@@ -245,7 +248,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
-        vl_features, vl_mask = self.generate_simulated_vlm_outputs(batch_size, trajectory.device)
+        vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0],trajectory.device)
         vl_embeds = self.feature_encoder(vl_features)
 
         for t in scheduler.timesteps:
@@ -338,6 +341,28 @@ class DiffusionDiTPushTPolicy(nn.Module):
         return result
     
     # ========= VLM feature simulati, temporary! TODO   ============
+
+    def _init_loaded_vlm_features(self):
+        """
+        从预先保存的文件中加载VLM特征
+        """
+        print("Loading VLM features from file...")
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        template_path = os.path.join(project_root, 'fixed_vlm_template.pt')
+        if os.path.exists(template_path):
+            self.fixed_vlm_template = torch.load(template_path)
+            self.fixed_seq_len = self.fixed_vlm_template.shape[0]
+            print(f"✓ VLM features loaded: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
+            # 根据实际VLM特征维度创建特征编码器
+            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度
+            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
+            self.feature_encoder.eval()
+            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
+        else:
+            print("⚠ VLM feature file not found, using simulated features")
+            self._init_fixed_vlm_features()
+
+
     def _init_fixed_vlm_features(self):
         """
         初始化真实的VLM特征,从实际的VLM模型中提取隐藏层特征

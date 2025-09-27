@@ -7,7 +7,10 @@ from tqdm import tqdm
 import time
 import sys
 import collections
-sys.path.append("..")
+
+# Add the project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.append(str(project_root))
 
 from dataset.pusht_dataset_zip import PushTImageDataset
 from pusht_dataset_zip import PushTImageDataset as PushTImageDataset_ori
@@ -42,7 +45,12 @@ def unnormalize_data(ndata, stats):
 
 def load_policy_from_checkpoint(checkpoint_path, device='cuda'):
     print(f"Loading checkpoint from: {checkpoint_path}")
-    dataset_path = "/media/z/data/mzq/code/diffusion_policy_z/data/pusht/pusht_cchi_v7_replay.zarr"
+    dataset_path = "/home/wang/projects/diffusion_policy_z/data/pusht/pusht/pusht_cchi_v7_replay.zarr"
+    
+    # Fix for PyTorch 2.6+ weights_only default change
+    # Allow types.SimpleNamespace which is commonly used in configs
+    import types
+    torch.serialization.add_safe_globals([types.SimpleNamespace])
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config_dict = checkpoint['config']
@@ -239,7 +247,7 @@ def evaluate_policy(policy, policy_config, stats, num_episodes=5, max_steps=200,
 
 def main():
     import os
-    checkpoint_path = "/media/z/data/mzq/code/diffusion_policy_z/checkpoints/pusht_dit/300_0.0151.pth"
+    checkpoint_path = "/home/wang/projects/diffusion_policy_z/checkpoints/pusht_dit/2_0.1572.pth"
     base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(base_path, "config/pusht_dit.yaml")
     with open(config_path, 'r') as f:
@@ -272,7 +280,7 @@ def main():
         num_episodes=50,   
         max_steps=1000,    
         render=False,     
-        save_video=False
+        save_video=True
     )
 
 if __name__ == "__main__":
