@@ -97,98 +97,28 @@ class LowdimMaskGenerator(ModuleAttrMixin):
         
         return mask
 
-class TransformerForDiffusion(ModuleAttrMixin):
-    def __init__(self,
-            input_dim: int,
-            output_dim: int,
-            horizon: int,
-            n_obs_steps: int = None,
-            cond_dim: int = 0,
-            n_layer: int = 12,
-            n_head: int = 12,
-            n_emb: int = 768,
-            p_drop_emb: float = 0.1,
-            p_drop_attn: float = 0.1,
-            causal_attn: bool=False,
-            time_as_cond: bool=True,
-            obs_as_cond: bool=False,
-            n_cond_layers: int = 0,
-            vl_emb_dim: int = 1536,
-            max_vl_tokens: int = 512,
-            use_vl_pooling: bool = False,  # pooling
-            use_adaptive_vl_projection: bool = True, # not pooling, project to a suitable length
-            target_vl_tokens: Optional[int] = None,  # a suitable length
-            adaptive_projection_method: str = 'learned_pooling'  # project methods, 'learned_pooling', 'conv_downsample', 'linear_compress'
-        ) -> None:
+class CustomEncoderBlock(nn.Module):
+    """
+    Encoder block that handles condition embedding, VL pooling, encoding, and memory projection
+    """
+    def __init__(self, n_emb, n_head, n_cond_layers, p_drop_emb, p_drop_attn, vl_emb_dim, 
+                 obs_as_cond, cond_dim, T_cond):
         super().__init__()
-
-        # compute number of tokens for main trunk and condition encoder
-        if n_obs_steps is None:
-            n_obs_steps = horizon
+        self.n_emb = n_emb
+        self.obs_as_cond = obs_as_cond
+        self.T_cond = T_cond
         
-        T = horizon
-        T_cond = 1
-        if not time_as_cond:
-            T += 1
-            T_cond -= 1
-        obs_as_cond = cond_dim > 0
-        if obs_as_cond:
-            assert time_as_cond
-            T_cond += n_obs_steps
-        
-        # Compute a suitable target VL length and adjust T_cond
-        if use_adaptive_vl_projection:
-            if target_vl_tokens is None:
-                base_cond_tokens = 1 + (n_obs_steps if obs_as_cond else 0)  # time + obs_tokens
-                self.target_vl_tokens = max(1, min(base_cond_tokens * 2, n_obs_steps)) if obs_as_cond else 1
-            else:
-                self.target_vl_tokens = target_vl_tokens
-        else:
-            self.target_vl_tokens = None
-        if T_cond > 0:  
-            if use_vl_pooling:
-                vl_tokens_count = 1 
-            elif use_adaptive_vl_projection and self.target_vl_tokens is not None:
-                vl_tokens_count = self.target_vl_tokens
-            else:
-                vl_tokens_count = max_vl_tokens
-            T_cond += vl_tokens_count   
-
-        # input embedding stem
-        self.input_emb = nn.Linear(input_dim, n_emb)
-        self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
-        self.drop = nn.Dropout(p_drop_emb)
+        # Time embedding
         self.time_emb = SinusoidalPosEmb(n_emb)
+        
+        # Observation condition embedding
         self.cond_obs_emb = None
         if obs_as_cond:
             self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
+        
+        # VL features processing
         self.vl_emb_proj = nn.Linear(vl_emb_dim, n_emb)
         self.vl_emb_norm = nn.LayerNorm(n_emb)
-
-        # Adaptive VL projection modules
-        self.adaptive_vl_projection = None
-        self.adaptive_pooling_queries = None
-        self.adaptive_conv_layer = None
-        self.adaptive_linear_layer = None
-        if use_adaptive_vl_projection and self.target_vl_tokens is not None:
-            if adaptive_projection_method == 'learned_pooling':
-                self.adaptive_pooling_queries = nn.Parameter(torch.randn(1, self.target_vl_tokens, n_emb))
-                self.adaptive_vl_projection = nn.MultiheadAttention(
-                    embed_dim=n_emb,
-                    num_heads=n_head,
-                    dropout=p_drop_attn,
-                    batch_first=True
-                )
-            elif adaptive_projection_method == 'conv_downsample':
-                downsample_ratio = max(1, max_vl_tokens // self.target_vl_tokens)
-                self.adaptive_conv_layer = nn.Conv1d(n_emb, n_emb, kernel_size=downsample_ratio, 
-                                                   stride=downsample_ratio, padding=0)
-                self.adaptive_vl_projection = nn.LayerNorm(n_emb)
-            elif adaptive_projection_method == 'linear_compress':
-                self.adaptive_linear_layer = nn.Linear(max_vl_tokens * n_emb, self.target_vl_tokens * n_emb)
-                self.adaptive_vl_projection = nn.LayerNorm(n_emb)
-        
-        # attention pooling for vl features
         self.vl_attention_pooling = nn.MultiheadAttention(
             embed_dim=n_emb,
             num_heads=n_head,
@@ -197,27 +127,27 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
         
-        # cross attention for vl features
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=n_emb,
-            num_heads=n_head,
-            dropout=p_drop_attn,
-            batch_first=True
-        )
-
-        # FFN layer before trajectory head
-        self.cross_attn_norm = nn.LayerNorm(n_emb)
-        self.cross_attn_ffn = nn.Sequential(
-            nn.Linear(n_emb, 4 * n_emb),
-            nn.GELU(),
-            nn.Dropout(p_drop_attn),
-            nn.Linear(4 * n_emb, n_emb),
-            nn.Dropout(p_drop_attn)
-        )
-        self.ffn_norm = nn.LayerNorm(n_emb)
-
-        # memory norm and projection
+        # Position embedding and preprocessing
+        self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
+        self.drop = nn.Dropout(p_drop_emb)
         self.pre_encoder_norm = nn.LayerNorm(n_emb)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=n_emb,
+            nhead=n_head,
+            dim_feedforward=4*n_emb,
+            dropout=p_drop_attn,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=n_cond_layers
+        )
+        
+        # Memory processing
         self.memory_norm = nn.LayerNorm(n_emb)
         self.memory_proj = nn.Sequential(
             nn.Linear(n_emb, n_emb),
@@ -225,47 +155,260 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Dropout(p_drop_attn),
             nn.Linear(n_emb, n_emb)
         )
+    
+    def _attention_pool_vl_features(self, vl_features: torch.Tensor, vl_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Apply attention pooling to vl features"""
+        batch_size = vl_features.shape[0]
+        query = self.vl_pool_query.expand(batch_size, -1, -1)  # (B, 1, n_emb)
+        pooled_features, _ = self.vl_attention_pooling(
+            query=query,                    # (B, 1, n_emb)
+            key=vl_features,               # (B, T_vl, n_emb)
+            value=vl_features,             # (B, T_vl, n_emb)
+            key_padding_mask=vl_padding_mask  # (B, T_vl)
+        )
+        return pooled_features  # (B, 1, n_emb)
+    
+    def forward(self, timestep: torch.Tensor, vl_embeds: torch.Tensor, cond: Optional[torch.Tensor] = None, 
+                vl_padding_mask: Optional[torch.Tensor] = None):
+        """
+        timestep: (B,) timestep tensor
+        vl_embeds: (B, T_vl, D_vl) vision-language embeddings
+        cond: (B, T_cond, cond_dim) condition tensor
+        vl_padding_mask: (B, T_vl) padding mask for VL features
+        """
+        
+        # 1. Time embedding
+        time_emb = self.time_emb(timestep).unsqueeze(1)  # (B, 1, n_emb)
+        
+        # 2. Process VL features
+        vl_features = self.vl_emb_proj(vl_embeds)  # (B, T_vl, n_emb)
+        vl_features = self.vl_emb_norm(vl_features)
+        vl_features_processed = self._attention_pool_vl_features(vl_features, vl_padding_mask)
+        
+        # 3. Combine condition embeddings
+        cond_embeddings = time_emb
+        if self.obs_as_cond and cond is not None:
+            cond_obs_emb = self.cond_obs_emb(cond)
+            cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
+        cond_embeddings = torch.cat([cond_embeddings, vl_features_processed], dim=1)
+        
+        # 4. Add position embedding
+        tc = cond_embeddings.shape[1]
+        if tc <= self.cond_pos_emb.shape[1]:
+            position_embeddings = self.cond_pos_emb[:, :tc, :]
+        else:
+            position_embeddings = torch.zeros(1, tc, self.cond_pos_emb.shape[2], 
+                                            device=self.cond_pos_emb.device, dtype=self.cond_pos_emb.dtype)
+            position_embeddings[:, :self.cond_pos_emb.shape[1], :] = self.cond_pos_emb
+            if tc > self.cond_pos_emb.shape[1]:
+                torch.nn.init.normal_(position_embeddings[:, self.cond_pos_emb.shape[1]:, :], mean=0.0, std=0.02)
+        
+        # 5. Apply dropout and pre-norm
+        x = self.drop(cond_embeddings + position_embeddings)
+        x = self.pre_encoder_norm(x)
+        
+        # 6. Transformer encoder
+        x = self.encoder(x)
+        
+        # 7. Memory processing
+        memory = self.memory_norm(x)
+        memory = memory + self.memory_proj(memory)
+        
+        return memory, vl_features
+
+
+class CustomDecoderLayer(nn.Module):
+    """
+    DP decoder. Memory first enhanced by VL feature, than guide trajectory generation
+    """
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, batch_first=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
+        self.memory_vl_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
+        self.traj_memory_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
+        
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.norm4 = nn.LayerNorm(d_model)
+        
+        self.activation = torch.nn.functional.gelu
+    
+    def forward(self, tgt, memory, vl_features, tgt_mask=None, memory_mask=None, 
+                vl_key_padding_mask=None):
+        
+        # three masks are used: tgt_mask, memory_mask, vl_key_padding_mask
+        # 1. Self-attention on trajectory 
+        tgt2 = self.norm1(tgt)
+        tgt2, _ = self.self_attn(tgt2, tgt2, tgt2, attn_mask=tgt_mask, key_padding_mask=None)
+        tgt = tgt + self.dropout1(tgt2)
+        
+        # 2. Memory-VL cross attention 
+        memory2 = self.norm2(memory)
+        enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, vl_features, vl_features, 
+                                                      key_padding_mask=vl_key_padding_mask)
+        enhanced_memory = memory + self.dropout2(enhanced_memory_output)
+        
+        # 3. Trajectory-Memory cross attention 
+        tgt2 = self.norm3(tgt)
+        tgt2, _ = self.traj_memory_cross_attn(tgt2, enhanced_memory, enhanced_memory, 
+                                             attn_mask=memory_mask, key_padding_mask=None)
+        tgt = tgt + self.dropout3(tgt2)
+        
+        # 4. Feed forward
+        tgt2 = self.norm4(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout(tgt2)
+            
+        return tgt
+
+
+class CustomTransformerDecoder(nn.Module):
+    def __init__(self, decoder_layer, num_layers, obs_as_cond=False, causal_attn=False):
+        super().__init__()
+        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
+        self.num_layers = num_layers
+        
+        # Mask generation settings
+        self.obs_as_cond = obs_as_cond
+        self.causal_attn = causal_attn
+    
+    def _generate_memory_mask(self, x, memory, cond, tgt_mask):
+        """Generate dynamic memory mask for causal attention"""
+        if not self.causal_attn or tgt_mask is None:
+            return None
+            
+        actual_memory_length = memory.shape[1]
+        T_actual = x.shape[1]  
+        S_actual = actual_memory_length 
+        time_pos = 0  
+        obs_start = 1   
+        obs_end = obs_start + (cond.shape[1] if cond is not None and self.obs_as_cond else 0)
+        
+        # VL features are pooled to 1 token
+        vl_start = obs_end
+        vl_end = vl_start + 1
+        
+        memory_mask_dynamic = torch.zeros((T_actual, S_actual), device=x.device, dtype=torch.bool)
+        
+        for t in range(T_actual):
+            # Time embedding: visible to all positions
+            memory_mask_dynamic[t, time_pos] = True
+            
+            # Vision-language features: visible to all positions (1 pooled token)
+            if vl_start < S_actual and vl_end <= S_actual:
+                memory_mask_dynamic[t, vl_start:vl_end] = True
+            
+            # Observation conditions: causal visibility
+            if self.obs_as_cond and cond is not None and obs_start < obs_end:
+                visible_obs_end = min(obs_start + t + 1, obs_end)
+                memory_mask_dynamic[t, obs_start:visible_obs_end] = True
+        
+        memory_mask = memory_mask_dynamic.float().masked_fill(
+            memory_mask_dynamic == 0, float('-inf')
+        ).masked_fill(memory_mask_dynamic == 1, float(0.0))
+        
+        return memory_mask
+        
+    def forward(self, tgt, memory, vl_features, cond=None, tgt_mask=None, 
+                vl_key_padding_mask=None):
+        # Generate dynamic memory mask
+        memory_mask = self._generate_memory_mask(tgt, memory, cond, tgt_mask)
+        
+        # Decoder layers
+        output = tgt
+        for layer in self.layers:
+            output = layer(output, memory, vl_features, tgt_mask=tgt_mask, memory_mask=memory_mask,
+                          vl_key_padding_mask=vl_key_padding_mask)
+        return output
+
+
+class TrajectoryHead(nn.Module):
+    def __init__(self, n_emb, output_dim, p_drop_emb):
+        super().__init__()
+        self.ln_f = nn.LayerNorm(n_emb)
+        self.drop = nn.Dropout(p_drop_emb)
+        self.head = nn.Linear(n_emb, output_dim)
+
+    def forward(self, x):
+        x = self.ln_f(x)
+        x = self.drop(x)
+        x = self.head(x)
+        return x
+
+
+class TransformerForDiffusion(ModuleAttrMixin):
+    def __init__(self,
+            input_dim: int,
+            output_dim: int,
+            horizon: int,
+            n_obs_steps: int = None,
+            cond_dim: int = 2,
+            n_layer: int = 12,
+            n_head: int = 12,
+            n_emb: int = 768,
+            p_drop_emb: float = 0.1,
+            p_drop_attn: float = 0.1,
+            causal_attn: bool=False,
+            obs_as_cond: bool=False,
+            n_cond_layers: int = 4,
+            vl_emb_dim: int = 1536
+        ) -> None:
+        super().__init__()
+
+        if n_obs_steps is None:
+            n_obs_steps = horizon
+        
+        T = horizon
+        T_cond = 1
+        obs_as_cond = cond_dim > 0
+        if obs_as_cond:
+            T_cond += n_obs_steps
+        
+        # Compute VL tokens count for T_cond
+        self.target_vl_tokens = None
+        vl_tokens_count = 1 
+        T_cond += vl_tokens_count   
+
+        # input embedding stem
+        self.input_emb = nn.Linear(input_dim, n_emb)
+        self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
+        self.drop = nn.Dropout(p_drop_emb)
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
 
-        self.cond_pos_emb = None
-        self.encoder = None
-        self.decoder = None
-        if T_cond > 0:
-            self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
-            if n_cond_layers > 0:
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=n_emb,
-                    nhead=n_head,
-                    dim_feedforward=4*n_emb,
-                    dropout=p_drop_attn,
-                    activation='gelu',
-                    batch_first=True,
-                    norm_first=True
-                )
-                self.encoder = nn.TransformerEncoder(
-                    encoder_layer=encoder_layer,
-                    num_layers=n_cond_layers
-                )
-            else:
-                self.encoder = nn.Sequential(
-                    nn.Linear(n_emb, 4 * n_emb),
-                    nn.Mish(),
-                    nn.Linear(4 * n_emb, n_emb)
-                )
-            # decoder
-            decoder_layer = nn.TransformerDecoderLayer(
-                d_model=n_emb,
-                nhead=n_head,
-                dim_feedforward=4*n_emb,
-                dropout=p_drop_attn,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True # important for stability
-            )
-            self.decoder = nn.TransformerDecoder(
-                decoder_layer=decoder_layer,
-                num_layers=n_layer
-            )
+        # Custom encoder block that handles all condition processing
+        self.encoder_block = CustomEncoderBlock(
+            n_emb=n_emb,
+            n_head=n_head,
+            n_cond_layers=n_cond_layers,
+            p_drop_emb=p_drop_emb,
+            p_drop_attn=p_drop_attn,
+            vl_emb_dim=vl_emb_dim,
+            obs_as_cond=obs_as_cond,
+            cond_dim=cond_dim,
+            T_cond=T_cond
+        )
+        # Custom decoder that integrates VL cross attention and pre-processing
+        custom_decoder_layer = CustomDecoderLayer(
+            d_model=n_emb,
+            nhead=n_head,
+            dim_feedforward=4*n_emb,
+            dropout=p_drop_attn,
+            batch_first=True
+        )
+        self.decoder = CustomTransformerDecoder(
+            decoder_layer=custom_decoder_layer,
+            num_layers=n_layer,
+            obs_as_cond=obs_as_cond,
+            causal_attn=causal_attn
+        )
 
         # attention mask
         if causal_attn:
@@ -280,40 +423,37 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.mask = None
             self.memory_mask = None
 
-        # decoder head
-        self.ln_f = nn.LayerNorm(n_emb)
-        self.head = nn.Linear(n_emb, output_dim)
-            
+        # trajectory head block
+        self.trajectory_head = TrajectoryHead(n_emb, output_dim, p_drop_emb)
+        
         # constants
         self.T = T
         self.T_cond = T_cond
         self.horizon = horizon
-        self.time_as_cond = time_as_cond
         self.obs_as_cond = obs_as_cond
         self.vl_emb_dim = vl_emb_dim
-        self.max_vl_tokens = max_vl_tokens
-        self.use_vl_pooling = use_vl_pooling
-        self.use_adaptive_vl_projection = use_adaptive_vl_projection
-        self.adaptive_projection_method = adaptive_projection_method
 
-        # init
         self.apply(self._init_weights)
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
 
     def _init_weights(self, module):
-        ignore_types = (nn.Dropout, 
+        ignore_types = (
+            nn.Dropout, 
             SinusoidalPosEmb, 
             nn.TransformerEncoderLayer, 
             nn.TransformerDecoderLayer,
             nn.TransformerEncoder,
             nn.TransformerDecoder,
-            nn.ModuleList,
-            nn.Mish,
             nn.GELU,
             nn.Sequential,
-            nn.Conv1d)  # Add Conv1d to ignored types
+            CustomEncoderBlock,
+            CustomDecoderLayer,
+            CustomTransformerDecoder,
+            TrajectoryHead,
+            nn.ModuleList
+        )  #
         if isinstance(module, (nn.Linear, nn.Embedding)):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -338,91 +478,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
             if hasattr(module, 'vl_pool_query'):
                 torch.nn.init.normal_(module.vl_pool_query, mean=0.0, std=0.02)
-            # Initialize adaptive pooling queries if present
-            if hasattr(module, 'adaptive_pooling_queries') and module.adaptive_pooling_queries is not None:
-                torch.nn.init.normal_(module.adaptive_pooling_queries, mean=0.0, std=0.02)
-            if module.cond_pos_emb is not None:
+            if hasattr(module, 'cond_pos_emb') and module.cond_pos_emb is not None:
                 torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
         elif isinstance(module, ignore_types):
-            # no param
             pass
         else:
             raise RuntimeError("Unaccounted module {}".format(module))
-    
-    def _adaptive_project_vl_features(self, vl_features: torch.Tensor, vl_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Apply vlm feature projection to a suitable length.
-
-        """
-        if not self.use_adaptive_vl_projection or self.target_vl_tokens is None:
-            return vl_features
-        
-        batch_size, seq_len, n_emb = vl_features.shape
-        
-        if self.adaptive_projection_method == 'learned_pooling':
-            if self.adaptive_pooling_queries is None or self.adaptive_vl_projection is None:
-                return vl_features
-                
-            queries = self.adaptive_pooling_queries.expand(batch_size, -1, -1)  # (B, target_vl_tokens, n_emb)
-            
-            projected_features, _ = self.adaptive_vl_projection(
-                query=queries,                    # (B, target_vl_tokens, n_emb)
-                key=vl_features,                 # (B, T_vl, n_emb)
-                value=vl_features,               # (B, T_vl, n_emb)
-                key_padding_mask=vl_padding_mask  # (B, T_vl)
-            )
-            
-        elif self.adaptive_projection_method == 'conv_downsample':
-            if self.adaptive_conv_layer is None or self.adaptive_vl_projection is None:
-                return vl_features
-            vl_transposed = vl_features.transpose(1, 2)  # (B, n_emb, T_vl)
-            conv_output = self.adaptive_conv_layer(vl_transposed)  # (B, n_emb, output_len)
-            projected_features = conv_output.transpose(1, 2)  # (B, output_len, n_emb)
-            projected_features = self.adaptive_vl_projection(projected_features)
-            current_len = projected_features.shape[1]
-            if current_len > self.target_vl_tokens:
-                projected_features = projected_features[:, :self.target_vl_tokens, :]
-            elif current_len < self.target_vl_tokens:
-                padding = torch.zeros(batch_size, self.target_vl_tokens - current_len, n_emb,
-                                    device=vl_features.device, dtype=vl_features.dtype)
-                projected_features = torch.cat([projected_features, padding], dim=1)
-        
-        elif self.adaptive_projection_method == 'linear_compress':
-            if self.adaptive_linear_layer is None or self.adaptive_vl_projection is None:
-                return vl_features
-            vl_flattened = vl_features.view(batch_size, -1)  # (B, T_vl * n_emb)
-            expected_input_size = self.adaptive_linear_layer.in_features
-            if vl_flattened.shape[1] < expected_input_size:
-                padding_size = expected_input_size - vl_flattened.shape[1]
-                padding = torch.zeros(batch_size, padding_size, 
-                                    device=vl_features.device, dtype=vl_features.dtype)
-                vl_flattened = torch.cat([vl_flattened, padding], dim=1)
-            elif vl_flattened.shape[1] > expected_input_size:
-                vl_flattened = vl_flattened[:, :expected_input_size]
-            
-            compressed = self.adaptive_linear_layer(vl_flattened)  # (B, target_vl_tokens * n_emb)
-            projected_features = compressed.view(batch_size, self.target_vl_tokens, n_emb)
-            projected_features = self.adaptive_vl_projection(projected_features)
-        
-        else:
-            raise ValueError(f"Unknown adaptive projection method: {self.adaptive_projection_method}")
-        
-        return projected_features
-    
-    
-    def _attention_pool_vl_features(self, vl_features: torch.Tensor, vl_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Apply attention pooling to vl features
-        """
-        batch_size = vl_features.shape[0]
-        query = self.vl_pool_query.expand(batch_size, -1, -1)  # (B, 1, n_emb)
-        pooled_features, _ = self.vl_attention_pooling(
-            query=query,                    # (B, 1, n_emb)
-            key=vl_features,               # (B, T_vl, n_emb)
-            value=vl_features,             # (B, T_vl, n_emb)
-            key_padding_mask=vl_padding_mask  # (B, T_vl)
-        )
-        return pooled_features  # (B, 1, n_emb)
     
     def get_optim_groups(self, weight_decay: float=1e-3):
         """
@@ -454,18 +515,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
                     # weights of blacklist modules will NOT be weight decayed
                     no_decay.add(fpn)
 
-        # special case the position embedding parameter in the root GPT module as not decayed
-        no_decay.add("pos_emb")
-        no_decay.add("_dummy_variable")
-        no_decay.add("vl_pool_query")  # Learnable query for vision-language attention pooling
-
-        if self.adaptive_pooling_queries is not None:
-            no_decay.add("adaptive_pooling_queries")  # Learnable queries for adaptive pooling
-        if self.cond_pos_emb is not None:
-            no_decay.add("cond_pos_emb")
+        # special case the position embedding parameter in the root module as not decayed
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        for name in param_dict:
+            if 'pos_emb' in name or '_dummy_variable' in name:
+                no_decay.add(name)
+            elif 'vl_pool_query' in name or 'cond_pos_emb' in name:
+                no_decay.add(name)
 
         # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert (
@@ -504,7 +562,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
         vl_embeds: torch.Tensor,
-        cond: Optional[torch.Tensor]=None, **kwargs):
+        cond: torch.Tensor, **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
@@ -513,226 +571,76 @@ class TransformerForDiffusion(ModuleAttrMixin):
         output: (B,T,input_dim)
         """
         sample = sample.contiguous()
-        cond= cond.contiguous() if cond is not None else None
+        cond = cond.contiguous() 
         vl_embeds = vl_embeds.contiguous()
-        if len(vl_embeds.shape) != 3:
-            raise ValueError(f"vl_embeds must be 3D tensor, got shape {vl_embeds.shape}")
         
-        # 1. time
+        # 1. Prepare timesteps
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
         timesteps = timesteps.expand(sample.shape[0])
-        time_emb = self.time_emb(timesteps).unsqueeze(1)
-        # (B,1,n_emb)
-
-        # 2. condition input
-        input_emb = self.input_emb(sample)
-        vl_features = self.vl_emb_proj(vl_embeds)  # (B, T_vl, n_emb)
-        vl_features = self.vl_emb_norm(vl_features)
         
-        # 3. Check if vl_embeds has padding
+        # 2. Check VL padding
         vl_padding_mask = None
         if 'vl_mask' in kwargs and kwargs['vl_mask'] is not None:
             vl_padding_mask = ~kwargs['vl_mask']  
         else:
             vl_norm = torch.norm(vl_embeds, dim=-1)  # (B, T_vl)
             vl_padding_mask = (vl_norm == 0) 
-        vl_features_for_cross_attn = vl_features
-        vl_padding_mask_for_cross_attn = vl_padding_mask  
-
-
-
-        ## (1.1). encoder, handle time/observation/vision language as condition
-        cond_embeddings = time_emb
-        if self.obs_as_cond and cond is not None:
-            cond_obs_emb = self.cond_obs_emb(cond)
-            cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
-            
-        # (1.2). Handle VL features - either pooled, adaptive projected, or full sequence
-        if self.use_vl_pooling:
-            vl_features_processed = self._attention_pool_vl_features(vl_features, vl_padding_mask)
-        elif self.use_adaptive_vl_projection:
-            vl_features_processed = self._adaptive_project_vl_features(vl_features, vl_padding_mask)
-        else:
-            vl_seq_len = vl_features.shape[1]
-            if vl_seq_len > self.max_vl_tokens:
-                vl_features_processed = vl_features[:, :self.max_vl_tokens, :]
-                if vl_padding_mask is not None:
-                    vl_padding_mask = vl_padding_mask[:, :self.max_vl_tokens]
-            elif vl_seq_len < self.max_vl_tokens:
-                padding_length = self.max_vl_tokens - vl_seq_len
-                padding = torch.zeros(vl_features.shape[0], padding_length, vl_features.shape[2], 
-                                    device=vl_features.device, dtype=vl_features.dtype)
-                vl_features_processed = torch.cat([vl_features, padding], dim=1)
-                if vl_padding_mask is not None:
-                    padding_mask = torch.ones(vl_features.shape[0], padding_length, 
-                                            device=vl_features.device, dtype=torch.bool)
-                    vl_padding_mask = torch.cat([vl_padding_mask, padding_mask], dim=1)
-            else:
-                vl_features_processed = vl_features
-        cond_embeddings = torch.cat([cond_embeddings, vl_features_processed], dim=1)
-
-        # (1.3).Create encoder attention mask for padded tokens
-        encoder_attn_mask = None
-        if vl_padding_mask is not None and not self.use_vl_pooling:
-            batch_size = cond_embeddings.shape[0]
-            time_mask = torch.zeros(batch_size, 1, device=cond_embeddings.device, dtype=torch.bool)  # time is never masked
-            
-            obs_mask = torch.zeros(batch_size, cond.shape[1] if (self.obs_as_cond and cond is not None) else 0, 
-                                 device=cond_embeddings.device, dtype=torch.bool) if self.obs_as_cond and cond is not None else torch.empty(batch_size, 0, device=cond_embeddings.device, dtype=torch.bool)
-            
-
-            vl_mask_for_encoder = vl_padding_mask
-            if self.use_adaptive_vl_projection and vl_features_processed.shape[1] != vl_padding_mask.shape[1]:
-                target_len = vl_features_processed.shape[1]
-                if vl_padding_mask.shape[1] > target_len:
-                    vl_mask_for_encoder = vl_padding_mask[:, :target_len]
-                elif vl_padding_mask.shape[1] < target_len:
-                    padding_mask_len = target_len - vl_padding_mask.shape[1]
-                    padding_mask_ext = torch.ones(batch_size, padding_mask_len, device=cond_embeddings.device, dtype=torch.bool)
-                    vl_mask_for_encoder = torch.cat([vl_padding_mask, padding_mask_ext], dim=1)
-            
-            # [time_mask, obs_mask, vl_mask]
-            if obs_mask.shape[1] > 0:
-                encoder_attn_mask = torch.cat([time_mask, obs_mask, vl_mask_for_encoder], dim=1)
-            else:
-                encoder_attn_mask = torch.cat([time_mask, vl_mask_for_encoder], dim=1)
-
-            
-        # (1.4). Handle position embedding
-        tc = cond_embeddings.shape[1]
-        if self.cond_pos_emb is not None:
-            if tc <= self.cond_pos_emb.shape[1]:
-                position_embeddings = self.cond_pos_emb[:, :tc, :]
-            else:
-                position_embeddings = torch.zeros(1, tc, self.cond_pos_emb.shape[2], 
-                                                device=self.cond_pos_emb.device, dtype=self.cond_pos_emb.dtype)
-                position_embeddings[:, :self.cond_pos_emb.shape[1], :] = self.cond_pos_emb
-                if tc > self.cond_pos_emb.shape[1]:
-                    torch.nn.init.normal_(position_embeddings[:, self.cond_pos_emb.shape[1]:, :], mean=0.0, std=0.02)
-        else:
-            position_embeddings = torch.zeros(1, tc, cond_embeddings.shape[2], 
-                                            device=cond_embeddings.device, dtype=cond_embeddings.dtype)
-
-        x = self.drop(cond_embeddings + position_embeddings)
-        x = self.pre_encoder_norm(x)
-        if self.encoder is not None:
-            if encoder_attn_mask is not None and hasattr(self.encoder, 'layers'):
-                x = self.encoder(x, src_key_padding_mask=encoder_attn_mask)
-            else:
-                x = self.encoder(x)
-            
-        # (1.5). Handle memory 
-        memory = self.memory_norm(x) 
-        memory = memory + self.memory_proj(memory)  
         
-        # (2.1). Pre-decoder
-        token_embeddings = input_emb
+        # 3. Process conditions through encoder block to get memory
+        memory, vl_features = self.encoder_block(
+            timestep=timesteps, 
+            vl_embeds=vl_embeds, 
+            cond=cond, 
+            vl_padding_mask=vl_padding_mask)
+        
+        # 4. Pre-decoder processing
+        token_embeddings = self.input_emb(sample)
         t = token_embeddings.shape[1]
-        position_embeddings = self.pos_emb[
-            :, :t, :
-        ]  
+        position_embeddings = self.pos_emb[:, :t, :]
         x = self.drop(token_embeddings + position_embeddings)
-        x = self.pre_decoder_norm(x)  
-
-        # (2.2).Handle memory_mask
-        actual_memory_length = memory.shape[1]
-        if self.mask is not None: 
-            T_actual = x.shape[1]  
-            S_actual = actual_memory_length 
-            time_pos = 0  
-            obs_start = 1   
-            obs_end = obs_start + (cond.shape[1] if cond is not None and self.obs_as_cond else 0)
-            
-            if self.use_vl_pooling:
-                vl_start = obs_end
-                vl_end = vl_start + 1
-            else:
-                vl_start = obs_end
-                vl_len = vl_features_processed.shape[1] if 'vl_features_processed' in locals() else self.max_vl_tokens
-                vl_end = vl_start + vl_len
-            
-            memory_mask_dynamic = torch.zeros((T_actual, S_actual), device=x.device, dtype=torch.bool)
-            
-            for t in range(T_actual):
-                # Time embedding: visible to all positions
-                memory_mask_dynamic[t, time_pos] = True
-                
-                # Vision-language features: visible to all positions  
-                if vl_start < S_actual and vl_end <= S_actual:
-                    memory_mask_dynamic[t, vl_start:vl_end] = True
-                
-                # Observation conditions: causal visibility
-                if self.obs_as_cond and cond is not None and obs_start < obs_end:
-                    visible_obs_end = min(obs_start + t + 1, obs_end)
-                    memory_mask_dynamic[t, obs_start:visible_obs_end] = True
-            
-            memory_mask = memory_mask_dynamic.float().masked_fill(
-                memory_mask_dynamic == 0, float('-inf')
-            ).masked_fill(memory_mask_dynamic == 1, float(0.0))
-        else:
-            memory_mask = None
-
-        # (2.3).Decoder, with memory mask and causal mask
-        if self.decoder is not None:
-            x = self.decoder(
-                tgt=x,
-                memory=memory,
-                tgt_mask=self.mask,
-                memory_mask=memory_mask
-            )
-
-        # (2.4). VL cross attention 
-        x_norm_for_cross = self.cross_attn_norm(x)  
-        x_cross, _ = self.cross_attention(
-            query=x_norm_for_cross,  # (B, T, n_emb) 
-            key=vl_features_for_cross_attn,         # (B, T_vl, n_emb) 
-            value=vl_features_for_cross_attn,       # (B, T_vl, n_emb)
-            key_padding_mask=vl_padding_mask_for_cross_attn  # (B, T_vl) 
-        )
-        x = x + x_cross 
+        x = self.pre_decoder_norm(x)
         
-        # (2.5). FFN 
-        x_norm_for_ffn = self.ffn_norm(x)  
-        x_ffn = self.cross_attn_ffn(x_norm_for_ffn)
-        x = x + x_ffn        
+        # 5. Decoder with integrated memory mask handling and VL cross attention
+        x = self.decoder(
+            tgt=x,
+            memory=memory,
+            vl_features=vl_features,
+            cond=cond,
+            tgt_mask=self.mask,
+            vl_key_padding_mask=vl_padding_mask
+        )        
         
-        # 3. trajectory head
-        x = self.ln_f(x)          
-        x = self.drop(x)          
-        x = self.head(x)         
+        # 6. trajectory head 
+        x = self.trajectory_head(x)
         return x
 
 
 
-# def test():
-#     # GPT with time embedding and obs cond and encoder
-#     transformer = TransformerForDiffusion(
-#         input_dim=16,
-#         output_dim=16,
-#         horizon=8,
-#         n_obs_steps=4,
-#         cond_dim=10,
-#         causal_attn=True,
-#         time_as_cond=True,
-#         n_cond_layers=4,
-#         vl_emb_dim=1536
-#     )
-#     opt = transformer.configure_optimizers()
+def test():
+    # GPT with time embedding and obs cond and encoder
+    transformer = TransformerForDiffusion(
+        input_dim=16,
+        output_dim=16,
+        horizon=8,
+        n_obs_steps=4,
+        cond_dim=10,
+        causal_attn=True,
+        n_cond_layers=4,
+        vl_emb_dim=1536
+    )
+    opt = transformer.configure_optimizers()
     
-#     timestep = torch.tensor(0)
-#     sample = torch.zeros((4,8,16))
-#     cond = torch.zeros((4,4,10))
-#     vl_embeds = torch.ones((4,36,1536))
-#     out = transformer(sample, timestep, vl_embeds, cond)
-#     print(out.shape)
+    timestep = torch.tensor(0)
+    sample = torch.zeros((4,8,16))
+    cond = torch.zeros((4,4,10))
+    vl_embeds = torch.ones((4,36,1536))
+    out = transformer(sample, timestep, vl_embeds, cond)
+    print(out.shape)
 
     
-# if __name__ == "__main__":
-#     test()   
-
-  
-
+if __name__ == "__main__":
+    test()

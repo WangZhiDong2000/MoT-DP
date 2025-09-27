@@ -91,7 +91,7 @@ logging:
   wandb_project: "diffusion_policy_pusht_dit"
   run_name: "pusht_dit_transformer"
   checkpoint_dir: "/home/wang/projects/diffusion_policy_z/checkpoints/pusht_dit"
-  save_every: 2
+  save_every: 20
 
 # Evaluation settings
 eval:

@@ -98,7 +98,6 @@ class DiffusionDiTPushTPolicy(nn.Module):
             p_drop_emb=policy_cfg.get('p_drop_emb', 0.1),
             p_drop_attn=policy_cfg.get('p_drop_attn', 0.1),
             causal_attn=policy_cfg.get('causal_attn', True),
-            time_as_cond=policy_cfg.get('time_as_cond', True),
             obs_as_cond=obs_as_global_cond,
             n_cond_layers=policy_cfg.get('n_cond_layers', 4)
         )

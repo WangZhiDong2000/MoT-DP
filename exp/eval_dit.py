@@ -247,7 +247,7 @@ def evaluate_policy(policy, policy_config, stats, num_episodes=5, max_steps=200,
 
 def main():
     import os
-    checkpoint_path = "/home/wang/projects/diffusion_policy_z/checkpoints/pusht_dit/2_0.1572.pth"
+    checkpoint_path = "/home/wang/projects/diffusion_policy_z/checkpoints/pusht_dit/200_0.0190.pth"
     base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(base_path, "config/pusht_dit.yaml")
     with open(config_path, 'r') as f:
