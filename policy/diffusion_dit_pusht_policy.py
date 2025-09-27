@@ -10,14 +10,6 @@ from model.pusht_encoder import create_pusht_encoder
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
 import os
 
-# try:
-#     from model.vlm_backbone import VLMDriveBackbone
-#     VLM_AVAILABLE = True
-# except ImportError as e:
-#     print(f"VLM backbone not available: {e}")
-#     VLMDriveBackbone = None
-#     VLM_AVAILABLE = False
-
 VLMDriveBackbone = None
 VLM_AVAILABLE = False
 
@@ -57,22 +49,6 @@ class DiffusionDiTPushTPolicy(nn.Module):
         self.obs_encoder = obs_encoder
 
         # TODO load vlm and vlm encoder model）
-        self.vlm_backbone = None
-        
-        if VLM_AVAILABLE and VLMDriveBackbone is not None:
-            try:
-                vlm_device = 'cpu'  
-                self.vlm_backbone = VLMDriveBackbone(
-                    model_type='qwen',
-                    checkpoint_path='Qwen/Qwen2.5-VL-3B-Instruct',
-                    device=vlm_device
-                )
-                print("✓ VLM backbone initialized successfully on CPU")
-            except Exception as e:
-                print(f"⚠ VLM backbone initialization failed: {e}")
-                self.vlm_backbone = None
-        else:
-            print("⚠ VLM backbone not available, using simulated features")
         self.feature_encoder = None
         # Initialize fixed VLM features for consistent behavior across train/val/test
         self._init_loaded_vlm_features()
@@ -362,124 +338,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
             self._init_fixed_vlm_features()
 
 
-    def _init_fixed_vlm_features(self):
-        """
-        初始化真实的VLM特征,从实际的VLM模型中提取隐藏层特征
-        如果VLM模型不可用,则使用固定的随机特征作为备用
-        """
-        print("Initializing VLM features...")
-        
-        # 检查VLM backbone是否可用
-        if self.vlm_backbone is not None:
-            try:
-                print("Attempting to use real VLM model...")
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                # 创建一个简单的图像输入来获取VLM特征
-                # 使用PIL创建一个测试图像，这是Qwen VL模型所期望的格式
-                import numpy as np
-                from PIL import Image
-                
-                # 创建一个固定的测试图像 (224x224 RGB)
-                test_image_array = np.random.RandomState(42).randint(0, 255, (224, 224, 3), dtype=np.uint8)
-                test_image = Image.fromarray(test_image_array)
-                test_text = "What actions should be taken based on this scene?"
-                
-                try:
-                    # 使用VLM的processor来正确处理图像和文本
-                    messages = [
-                        {
-                            "role": "user", 
-                            "content": [
-                                {"type": "image", "image": test_image},
-                                {"type": "text", "text": test_text}
-                            ]
-                        }
-                    ]
-                    
-                    # 应用聊天模板
-                    text_inputs = self.vlm_backbone.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
-                    
-                    # 处理输入
-                    inputs = self.vlm_backbone.tokenizer(
-                        text=[text_inputs],
-                        images=[test_image], 
-                        return_tensors="pt",
-                        padding=True
-                    )
-                    
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    if device == 'cuda' and hasattr(self.vlm_backbone, 'model'):
-                        self.vlm_backbone.model = self.vlm_backbone.model.to(device)
-                    
-                    inputs = {k: v.to(device) for k, v in inputs.items()}
-                    
-                    # 获取VLM模型的隐藏状态
-                    with torch.no_grad():
-                        outputs = self.vlm_backbone.model(
-                            **inputs,
-                            output_hidden_states=True,
-                            return_dict=True,
-                        )
-                        
-                        # 获取最后一层隐藏状态
-                        if hasattr(outputs, 'hidden_states') and outputs.hidden_states:
-                            hidden_states = outputs.hidden_states[-1]  
-                            
-                            # 移除batch维度并转换为float32
-                            self.fixed_vlm_template = hidden_states.squeeze(0).float()  # (seq_len, hidden_size)
-                            self.fixed_seq_len = self.fixed_vlm_template.shape[0]
-                            
-                            print(f"✓ Real VLM features initialized: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
-                            
-                            # 根据实际VLM特征维度创建特征编码器
-                            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度
-                            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
-                            self.feature_encoder.eval()
-                            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
-                            self.fixed_vlm_template = self.fixed_vlm_template.cpu()
-                            
-                            if device == 'cuda':
-                                self.vlm_backbone.model = self.vlm_backbone.model.cpu()
-                                del self.vlm_backbone.model
-                                self.vlm_backbone.model = None
-                                torch.cuda.empty_cache()
-                                print("✓ VLM model moved to CPU and GPU memory cleared")
-                            
-                            return
-                        else:
-                            print("⚠ VLM model output does not contain hidden_states, falling back to simulated features")
-                            
-                except Exception as inner_e:
-                    print(f"⚠ Error in VLM processing: {inner_e}")
-                    
-            except Exception as e:
-                print(f"⚠ Failed to initialize real VLM features: {e}")
-        
-        # 备用方案：使用固定的随机特征
-        print("Using simulated VLM features...")
-        F = 3584  # VLM隐藏层维度
-        self.fixed_seq_len = 25  # 固定序列长度
-        
-        generator = torch.Generator()
-        generator.manual_seed(42)  
-        
-        # 生成单个固定的VLM特征模板 (seq_len, F)
-        self.fixed_vlm_template = torch.randn(
-            self.fixed_seq_len, F, 
-            generator=generator, 
-            dtype=torch.float32
-        )
-        
-        print(f"✓ Simulated VLM features initialized: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
-        
-        # 根据VLM特征维度创建特征编码器
-        if self.feature_encoder is None:
-            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度 
-            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
-            self.feature_encoder.eval()
-            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
+
     
     def generate_simulated_vlm_outputs(self, batch_size, device, max_seq_len=None):
         """
