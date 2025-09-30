@@ -10,23 +10,23 @@ except ImportError:
     print("Warning: Qwen2_5_VLForConditionalGeneration not available. Using mock for testing.")
     Qwen2_5_VLForConditionalGeneration = None
 
-try:
-    from .utils.conversation import get_conv_template
-except ImportError:
-    # Fallback for when running as a script
-    try:
-        from utils.conversation import get_conv_template
-    except ImportError:
-        # Create a mock function if conversation utils are not available
-        def get_conv_template(name):
-            return type('MockConv', (), {
-                'append_message': lambda self, role, message: None,
-                'get_prompt': lambda self: f"System: Mock conversation template\nUser: ",
-                'messages': [],
-                'roles': ['user', 'assistant'],
-                'system_message': ''
-            })()
-        print("Warning: conversation utils not available. Using mock for testing.")
+# try:
+#     from .utils.conversation import get_conv_template
+# except ImportError:
+#     # Fallback for when running as a script
+#     try:
+#         from utils.conversation import get_conv_template
+#     except ImportError:
+#         # Create a mock function if conversation utils are not available
+#         def get_conv_template(name):
+#             return type('MockConv', (), {
+#                 'append_message': lambda self, role, message: None,
+#                 'get_prompt': lambda self: f"System: Mock conversation template\nUser: ",
+#                 'messages': [],
+#                 'roles': ['user', 'assistant'],
+#                 'system_message': ''
+#             })()
+#         print("Warning: conversation utils not available. Using mock for testing.")
 
 IMG_CONTEXT_TOKEN = '<IMG_CONTEXT>'
 IMG_START_TOKEN = '<img>'

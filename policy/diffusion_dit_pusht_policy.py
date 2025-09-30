@@ -115,6 +115,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
         nobs = dict_apply(nobs, lambda x: x.to(device))
         # nobs = batch['obs']
         nactions = batch['action'].to(device)
+        nvl_features = batch['vlm_feature'].to(device)
 
 
         batch_size = nactions.shape[0]
@@ -132,6 +133,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
+            vl = nvl_features[:, -1, :]
             #if self.pred_action_steps_only:
             #    start = To - 1
             #    end = start + self.n_action_steps
@@ -142,8 +144,9 @@ class DiffusionDiTPushTPolicy(nn.Module):
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
+            vl = nvl_features[:, -1, :]
             trajectory = torch.cat([nactions, nobs_features], dim=-1).detach()
-
+        
         # generate impainting mask
         # condition_mask = self.mask_generator(trajectory.shape)
         condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
@@ -168,9 +171,10 @@ class DiffusionDiTPushTPolicy(nn.Module):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        vl_features, vl_mask = self.generate_simulated_vlm_outputs(batch_size, trajectory.device)
-        vl_embeds = self.feature_encoder(vl_features)
-        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask)
+        # vl_features, vl_mask = self.generate_simulated_vlm_outputs(batch_size, trajectory.device)
+
+        vl_embeds = self.feature_encoder(vl)
+        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':

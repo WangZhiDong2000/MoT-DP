@@ -1,7 +1,7 @@
 # Dataset settings
 dataloader:
   batch_size: 64
-  num_workers: 8
+  num_workers: 1
   persistent_workers: false
   pin_memory: true
   shuffle: true
@@ -83,6 +83,7 @@ training:
   num_epochs: 300
   max_grad_norm: 1.0
   dataset_path: "/home/wang/projects/diffusion_policy_z/data/pusht/pusht/pusht_cchi_v7_replay.zarr"
+  vlm_features_path: "/home/wang/projects/diffusion_policy_z/data/pusht/pusht/vlm_features/vlm_features.zarr"
   lr_final: 1e-7
 
 # Logging

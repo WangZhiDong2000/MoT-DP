@@ -25,6 +25,9 @@ from policy.diffusion_dit_pusht_policy import DiffusionDiTPushTPolicy
 from dataset.pusht_dataset_zip import PushTImageDataset
 from model.pusht_encoder import create_pusht_encoder
 
+# import multiprocessing as mp
+# mp.set_start_method('spawn', force=True)
+
 
 class PushTTrainer:
     def __init__(self, config_dict):
@@ -91,9 +94,11 @@ class PushTTrainer:
     def create_datasets(self):
         """Create train and validation datasets"""
         dataset_path = self.config.training.dataset_path
+        vlm_features_path = self.config.training.vlm_features_path
         
         self.train_dataset = PushTImageDataset(
             dataset_path=dataset_path,
+            vlm_features_path=vlm_features_path,
             pred_horizon=self.config.pred_horizon,
             obs_horizon=self.config.obs_horizon,
             action_horizon=self.config.action_horizon
@@ -220,7 +225,6 @@ class PushTTrainer:
             avg_loss = self.train_epoch(epoch)
             
             print(f"Epoch {epoch}/{self.config.training.num_epochs} - Average Loss: {avg_loss:.4f}")
-            
             # Save checkpoint
             if epoch % self.config.logging.save_every == 0:
                 self.save_checkpoint(epoch, avg_loss)

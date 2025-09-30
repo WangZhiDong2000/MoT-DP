@@ -18,6 +18,9 @@ import zarr
 import os
 import zipfile
 import io
+import sys
+import os
+
 
 def create_sample_indices(
         episode_ends:np.ndarray, sequence_length:int,
@@ -92,6 +95,7 @@ def unnormalize_data(ndata, stats):
 class PushTImageDataset(torch.utils.data.Dataset):
     def __init__(self,
                  dataset_path: str,
+                 vlm_features_path: str,
                  pred_horizon: int,
                  obs_horizon: int,
                  action_horizon: int):
@@ -122,20 +126,23 @@ class PushTImageDataset(torch.utils.data.Dataset):
 
         # compute statistics and normalized data to [-1,1]
         stats = dict()
-        normalized_train_data = dict()
+        self.normalized_train_data = dict()
         for key, data in train_data.items():
             stats[key] = get_data_stats(data)
-            normalized_train_data[key] = normalize_data(data, stats[key])
+            self.normalized_train_data[key] = normalize_data(data, stats[key])
 
         # images are already normalized
-        normalized_train_data['image'] = train_image_data
+        self.normalized_train_data['image'] = train_image_data
 
         self.indices = indices
         self.stats = stats
-        self.normalized_train_data = normalized_train_data
-        self.pred_horizon = pred_horizon
+        vlm_zarr = zarr.open(vlm_features_path, 'r')
+        self.vlm_features = vlm_zarr['features']
         self.action_horizon = action_horizon
         self.obs_horizon = obs_horizon
+        self.pred_horizon = pred_horizon
+        self.vlm_features_path = vlm_features_path
+
 
     def __len__(self):
         return len(self.indices)
@@ -158,4 +165,47 @@ class PushTImageDataset(torch.utils.data.Dataset):
         # discard unused observations
         nsample['image'] = nsample['image'][:self.obs_horizon,:]
         nsample['agent_pos'] = nsample['agent_pos'][:self.obs_horizon,:]
+
+        # VLM feature
+        vlm_feature_data = {'vlm_feature': self.vlm_features}
+        nsample['vlm_feature'] = sample_sequence( 
+            train_data=vlm_feature_data,
+            sequence_length=self.pred_horizon,
+            buffer_start_idx=buffer_start_idx,
+            buffer_end_idx=buffer_end_idx,
+            sample_start_idx=sample_start_idx,
+            sample_end_idx=sample_end_idx
+        )['vlm_feature'][:self.obs_horizon, ...]
+
         return nsample
+    
+   
+if __name__ == "__main__":
+    # simple test
+    dataset_path = '/home/wang/projects/diffusion_policy_z/data/pusht/pusht/pusht_cchi_v7_replay.zarr'
+    vlm_features_path = '/home/wang/projects/diffusion_policy_z/data/pusht/pusht/vlm_features/vlm_features.zarr'
+    dataset = PushTImageDataset(
+        dataset_path=dataset_path,
+        vlm_features_path=vlm_features_path,
+        pred_horizon=16,
+        obs_horizon=8,
+        action_horizon=8
+    )
+    print(f"Dataset size: {len(dataset)}")
+    nsample = dataset[0]
+    print({k: v.shape for k, v in nsample.items()})
+    print(f"VLM feature shape: {nsample['vlm_feature'].shape}")
+    print(f"VLM features path: {vlm_features_path}")
+
+    from torch.utils.data import DataLoader
+
+    print(f"VLM features zarr path: {vlm_features_path}")
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0)
+
+    # 测试迭代
+    for i, batch in enumerate(dataloader):
+        print(f"Batch {i}:")
+        for k, v in batch.items():
+            print(f"  {k}: {v.shape}")
+        if i >= 2:  # 只测试前3个 batch
+            break

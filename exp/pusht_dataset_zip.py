@@ -13,11 +13,19 @@
 #@markdown  - key `action`: shape (pred_horizon, 2)
 
 import numpy as np
+from PIL import Image
 import torch
 import zarr
 import os
 import zipfile
 import io
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model.vlm_backbone import VLMDriveBackbone
+
+
+
 
 def create_sample_indices(
         episode_ends:np.ndarray, sequence_length:int,
@@ -65,6 +73,7 @@ def sample_sequence(train_data, sequence_length,
                 data[sample_end_idx:] = sample[-1]
             data[sample_start_idx:sample_end_idx] = sample
         result[key] = data
+    
     return result
 
 # normalize data
@@ -137,6 +146,14 @@ class PushTImageDataset(torch.utils.data.Dataset):
         self.action_horizon = action_horizon
         self.obs_horizon = obs_horizon
 
+        # load VLM model
+        vlm_device = 'cuda'  
+        self.vlm_backbone = VLMDriveBackbone(
+            model_type='qwen',
+            checkpoint_path='Qwen/Qwen2.5-VL-3B-Instruct',
+            device=vlm_device
+        )
+
     def __len__(self):
         return len(self.indices)
 
@@ -158,4 +175,89 @@ class PushTImageDataset(torch.utils.data.Dataset):
         # discard unused observations
         nsample['image'] = nsample['image'][:self.obs_horizon,:]
         nsample['agent_pos'] = nsample['agent_pos'][:self.obs_horizon,:]
+        # add vl feature
+        nsample['vl_feature'] = self._generate_vlm_features(
+            image_array=(nsample['image'][-1]*255).astype(np.uint8).transpose(1,2,0)
+        )  # (seq_len, hidden_size)
         return nsample
+
+    def _generate_vlm_features(self, image_array):
+
+        test_image = Image.fromarray(image_array)
+        test_text = "What actions should be taken based on this scene?"
+        messages = [
+                        {
+                            "role": "user", 
+                            "content": [
+                                {"type": "image", "image": test_image},
+                                {"type": "text", "text": test_text}
+                            ]
+                        }
+                    ]
+        text_inputs = self.vlm_backbone.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+        inputs = self.vlm_backbone.tokenizer(
+                        text=[text_inputs],
+                        images=[test_image], 
+                        return_tensors="pt",
+                        padding=True
+                    )
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # if device == 'cuda' and hasattr(self.vlm_backbone, 'model'):
+        #     self.vlm_backbone.model = self.vlm_backbone.model.to(device)
+                    
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.vlm_backbone.model(
+                            **inputs,
+                            output_hidden_states=True,
+                            return_dict=True,
+                        )
+                        
+            # 获取最后一层隐藏状态
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states:
+                hidden_states = outputs.hidden_states[-1]  
+                            
+            # 移除batch维度并转换为float32
+            vlm_feature = hidden_states.squeeze(0).float().cpu()  # (seq_len, hidden_size)
+            self.fixed_seq_len = vlm_feature.shape[0]
+        
+        return vlm_feature
+        
+
+    def remove_vlm_model_from_gpu(self):
+        self.vlm_backbone.model = self.vlm_backbone.model.cpu()
+        del self.vlm_backbone.model
+        self.vlm_backbone.model = None
+        torch.cuda.empty_cache()
+        print("✓ VLM model moved to CPU and GPU memory cleared")
+  
+
+
+       
+def test():
+    dataset_path = '/home/wang/projects/diffusion_policy_z/data/pusht/pusht/pusht_cchi_v7_replay.zarr'
+    pred_horizon = 10
+    obs_horizon = 5
+    action_horizon = 5
+
+    dataset = PushTImageDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon
+    )
+
+    print(f"Dataset length: {len(dataset)}")
+    sample = dataset[0]
+    print("Sample keys:", sample.keys())
+    print("Image shape:", sample['image'].shape)
+    print("Agent pos shape:", sample['agent_pos'].shape)
+    print("Action shape:", sample['action'].shape)
+    print("VL feature shape:", sample['vl_feature'].shape)
+    print("Agent pos stats:", dataset.stats['agent_pos'])
+
+if __name__ == "__main__":
+    test()
