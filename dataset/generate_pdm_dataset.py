@@ -1,8 +1,6 @@
-
 import numpy as np
 from PIL import Image
 import os
-import zipfile
 import io
 import sys
 import pickle
@@ -44,7 +42,6 @@ def create_sample_indices(
 
 def create_sample_indices_no_padding(
         episode_ends: np.ndarray, sequence_length: int):
-    """创建样本索引，不使用填充，只保留完整的序列"""
     indices = list()
     for i in range(len(episode_ends)):
         start_idx = 0
@@ -53,12 +50,11 @@ def create_sample_indices_no_padding(
         end_idx = episode_ends[i]
         episode_length = end_idx - start_idx
 
-        # 只生成完整长度的序列，不进行填充
+        # no padding, only full sequences
         if episode_length >= sequence_length:
             for idx in range(episode_length - sequence_length + 1):
                 buffer_start_idx = start_idx + idx
                 buffer_end_idx = start_idx + idx + sequence_length
-                # 不需要填充，所以sample范围就是整个sequence_length
                 sample_start_idx = 0
                 sample_end_idx = sequence_length
                 indices.append([
@@ -74,9 +70,8 @@ def sample_sequence(train_data, sequence_length,
     result = dict()
     for key, input_arr in train_data.items():
         if key == 'agent_pos':
-            # agent_pos已经是完整的序列，直接返回对应的样本
-            sample_idx = buffer_start_idx  # agent_pos索引对应样本索引
-            result[key] = input_arr[sample_idx]  # 直接取(8, 2)的序列
+            sample_idx = buffer_start_idx  
+            result[key] = input_arr[sample_idx]  
         else:
             sample = input_arr[buffer_start_idx:buffer_end_idx]
             data = sample
@@ -85,28 +80,22 @@ def sample_sequence(train_data, sequence_length,
                 if isinstance(input_arr, list) and key == 'town_name':
                     data = [None] * sequence_length
                     if sample_start_idx > 0:
-                        # Pad beginning with first element
                         for i in range(sample_start_idx):
                             data[i] = sample[0] if len(sample) > 0 else None
                     if sample_end_idx < sequence_length:
-                        # Pad end with last element
                         for i in range(sample_end_idx, sequence_length):
                             data[i] = sample[-1] if len(sample) > 0 else None
-                    # Fill middle with actual data
                     for i, item in enumerate(sample):
                         if sample_start_idx + i < sample_end_idx:
                             data[sample_start_idx + i] = item
                 elif isinstance(input_arr, list) and key == 'rgb_hist_jpg':
                     data = [None] * sequence_length
                     if sample_start_idx > 0:
-                        # Pad beginning with first element
                         for i in range(sample_start_idx):
                             data[i] = sample[0] if len(sample) > 0 else None
                     if sample_end_idx < sequence_length:
-                        # Pad end with last element
                         for i in range(sample_end_idx, sequence_length):
                             data[i] = sample[-1] if len(sample) > 0 else None
-                    # Fill middle with actual data
                     for i, item in enumerate(sample):
                         if sample_start_idx + i < sample_end_idx:
                             data[sample_start_idx + i] = item
@@ -155,7 +144,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             pkl_files = pkl_files[:max_files]
         
         all_data = []
-        all_episode_data = []  # 保存每个episode的原始数据，用于计算episode_ends
+        all_episode_data = []  
         
         for pkl_file in sorted(pkl_files):
             print(f"Loading {os.path.basename(pkl_file)}")
@@ -178,19 +167,16 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             'rgb_hist_jpg': [],
         }
         
-        # 重新建立episode_ends，基于过滤后的数据
         episode_ends = []
         current_length = 0
         
         for episode_data in all_episode_data:
-            # 计算当前episode中有效的数据点数量
             valid_count = 0
             for item in episode_data:
                 if len(item['ego_waypoints']) >= 1:
                     valid_count += 1
             
-            if valid_count >= pred_horizon:  # 只有当episode长度>=pred_horizon时才处理
-                # 处理当前episode的数据点
+            if valid_count >= pred_horizon:  # only keep episodes with enough length
                 for item in episode_data:
                     if len(item['ego_waypoints']) >= 1:
                         processed_data['town_name'].append(item['town_name'])
@@ -208,117 +194,131 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
         print(f"Valid episodes: {len(episode_ends)}, total samples: {current_length}")
         
-        # 重新计算agent_pos - 使用ego_waypoints的真实位置数据
+        # 首先生成agent_pos序列，同时构建对应的其他数据
         if current_length >= pred_horizon:
-            print("Analyzing ego_waypoints structure for agent position data...")
+            agent_pos_sequences = []
+            sequence_data = {
+                'town_name': [],
+                'speed': [],
+                'command': [],
+                'next_command': [],
+                'target_point': [],
+                'ego_waypoints': [],
+                'rgb_hist_jpg': []
+            }
+            episode_ends_for_sequences = []
+            sequence_count = 0
             
-            # 检查第一个episode的数据来理解ego_waypoints结构
-            if all_episode_data:
-                first_episode = all_episode_data[0]
-                print(f"First episode has {len(first_episode)} samples")
+            for ep_idx, ep_data in enumerate(all_episode_data):
+                valid_items = [item for item in ep_data if len(item['ego_waypoints']) >= 1]
+                episode_sequence_count = 0
                 
-                # 详细分析ego_waypoints的结构
-                for i in range(min(3, len(first_episode))):
-                    sample = first_episode[i]
-                    if 'ego_waypoints' in sample:
-                        ego_wp = np.array(sample['ego_waypoints'])
-                        print(f"  Sample {i}: ego_waypoints shape = {ego_wp.shape}")
-                        print(f"    ego_waypoints[0]: {ego_wp[0]} (current position)")
-                        if len(ego_wp) > 1:
-                            print(f"    ego_waypoints[1]: {ego_wp[1]} (next waypoint)")
-                        if len(ego_wp) > 2:
-                            print(f"    ego_waypoints[2]: {ego_wp[2]} (waypoint 2)")
-                        print()
-                
-                # 检查不同时间步的ego_waypoints变化
-                print("Checking ego_waypoints changes across time steps:")
-                for i in range(min(5, len(first_episode))):
-                    sample = first_episode[i]
-                    if 'ego_waypoints' in sample:
-                        ego_wp = np.array(sample['ego_waypoints'])
-                        # 尝试使用不同waypoint作为真实位置
-                        print(f"  Step {i}:")
-                        for wp_idx in range(min(3, len(ego_wp))):
-                            print(f"    waypoint[{wp_idx}]: {ego_wp[wp_idx]}")
-                
-                # 简化方案：正确构建agent_pos轨迹
-                print("\nBuilding correct agent_pos trajectory...")
-                
-                # 正确的agent_pos格式：
-                # - 形状: (pred_horizon, 2) = (8, 2)
-                # - 前obs_horizon个(3个)：观测位置
-                # - 后action_horizon个(5个)：预测位置  
-                # - 以最后一个观测位置为原点，其他位置都是相对距离
-                
-                # 重新处理数据，为每个样本创建正确的agent_pos序列
-                processed_data['agent_pos'] = []
-                
-                for ep_idx, ep_data in enumerate(all_episode_data):
-                    valid_items = [item for item in ep_data if len(item['ego_waypoints']) >= 1]
-                    if len(valid_items) >= pred_horizon:
+                if len(valid_items) >= pred_horizon:
+                    for start_idx in range(len(valid_items) - pred_horizon + 1):
+                        # 生成agent_pos序列（保持原有逻辑）
+                        sequence_positions = []
                         
-                        # 为episode中的每个可能的序列起点创建agent_pos
-                        for start_idx in range(len(valid_items) - pred_horizon + 1):
-                            # 构建长度为pred_horizon的序列
-                            sequence_positions = []
-                            
-                            # 收集序列中每个时间步的ego_waypoints[0]（当前位置）
-                            for seq_step in range(pred_horizon):
-                                step_idx = start_idx + seq_step
-                                if step_idx < len(valid_items):
-                                    item = valid_items[step_idx]
-                                    ego_wp = np.array(item['ego_waypoints'])
-                                    # 使用ego_waypoints[1]作为这个时间步的"实际位置"
-                                    # 因为ego_waypoints[0]总是[0,0]
-                                    if len(ego_wp) > 1:
-                                        current_pos = ego_wp[1].copy()
+                        # 观测部分：构建连续的历史轨迹
+                        for obs_step in range(obs_horizon):
+                            if obs_step == 0:
+                                current_pos = np.array([0.0, 0.0])
+                            else:
+                                prev_step_idx = start_idx + obs_step - 1
+                                if prev_step_idx < len(valid_items):
+                                    prev_item = valid_items[prev_step_idx]
+                                    prev_ego_wp = np.array(prev_item['ego_waypoints'])
+                                    if len(prev_ego_wp) > 1:
+                                        current_pos = prev_ego_wp[1].copy()
                                     else:
                                         current_pos = np.array([0.0, 0.0])
-                                    sequence_positions.append(current_pos)
                                 else:
-                                    # 超出范围，使用最后已知位置
-                                    sequence_positions.append(sequence_positions[-1].copy())
+                                    current_pos = np.array([0.0, 0.0])
+                            sequence_positions.append(current_pos)
+                        
+                        # 预测部分：使用最后观测时间步的ego_waypoints来预测未来
+                        last_obs_idx = start_idx + obs_horizon - 1
+                        if last_obs_idx < len(valid_items):
+                            last_obs_item = valid_items[last_obs_idx]
+                            last_ego_wp = np.array(last_obs_item['ego_waypoints'])
                             
-                            # 以最后一个观测位置(index=obs_horizon-1)为原点，计算相对位置
-                            reference_pos = sequence_positions[obs_horizon - 1]  # 最后一个观测位置
-                            relative_positions = []
+                            for pred_step in range(action_horizon):
+                                waypoint_idx = pred_step + 2
+                                if len(last_ego_wp) > waypoint_idx:
+                                    pred_pos = last_ego_wp[waypoint_idx].copy()
+                                elif len(last_ego_wp) > 1:
+                                    pred_pos = last_ego_wp[-1].copy()
+                                else:
+                                    pred_pos = np.array([0.0, 0.0])
+                                sequence_positions.append(pred_pos)
+                        else:
+                            for pred_step in range(action_horizon):
+                                sequence_positions.append(np.array([0.0, 0.0]))
+                        
+                        # 计算相对位置
+                        reference_pos = sequence_positions[obs_horizon - 1]
+                        relative_positions = []
+                        for pos in sequence_positions:
+                            relative_pos = pos - reference_pos
+                            relative_positions.append(relative_pos)
+                        
+                        agent_pos_sequences.append(np.array(relative_positions))
+                        
+                        # 为这个序列收集对应的数据（使用序列的起始时间步数据）
+                        seq_start_item = valid_items[start_idx]
+                        sequence_data['town_name'].append(seq_start_item['town_name'])
+                        sequence_data['speed'].append(seq_start_item['speed'])
+                        sequence_data['command'].append(seq_start_item['command'])
+                        sequence_data['next_command'].append(seq_start_item['next_command'])
+                        sequence_data['target_point'].append(seq_start_item['target_point'])
+                        sequence_data['ego_waypoints'].append(seq_start_item['ego_waypoints'])
+                        sequence_data['rgb_hist_jpg'].append(seq_start_item['rgb_hist_jpg'][-1])
+                        
+                        episode_sequence_count += 1
+                        sequence_count += 1
+                        
+                        # 显示第一个序列的调试信息
+                        if ep_idx == 0 and start_idx == 0:
+                            print(f"修正后的agent_pos生成逻辑:")
+                            print(f"  参考位置 (obs_horizon-1): {reference_pos}")
+                            for step, rel_pos in enumerate(relative_positions):
+                                label = "obs" if step < obs_horizon else "pred"
+                                print(f"  Step {step} ({label}): {rel_pos}")
                             
-                            for pos in sequence_positions:
-                                relative_pos = pos - reference_pos
-                                relative_positions.append(relative_pos)
+                            print(f"\n连续轨迹构建策略:")
+                            print(f"  观测部分 (历史轨迹):")
+                            print(f"    Time 0: ego_waypoints[0] = [0,0] (当前位置基准)")
+                            for obs_step in range(1, obs_horizon):
+                                prev_time = obs_step - 1
+                                print(f"    Time {obs_step}: 使用Time {prev_time}的ego_waypoints[1] (从{prev_time}到{obs_step}的实际移动)")
                             
-                            processed_data['agent_pos'].append(np.array(relative_positions))
-                            
-                            # 显示第一个序列的调试信息
-                            if ep_idx == 0 and start_idx == 0:
-                                print(f"First sequence agent_pos:")
-                                print(f"  Reference position (obs_horizon-1): {reference_pos}")
-                                for step, rel_pos in enumerate(relative_positions):
-                                    label = "obs" if step < obs_horizon else "pred"
-                                    print(f"  Step {step} ({label}): {rel_pos}")
+                            print(f"  预测部分 (使用Time {obs_horizon-1}的ego_waypoints预测未来):")
+                            if last_obs_idx < len(valid_items):
+                                last_obs_item = valid_items[last_obs_idx]
+                                last_ego_wp = np.array(last_obs_item['ego_waypoints'])
+                                for pred_step in range(action_horizon):
+                                    waypoint_idx = pred_step + 2
+                                    pred_time = obs_horizon + pred_step
+                                    if len(last_ego_wp) > waypoint_idx:
+                                        print(f"    Time {pred_time}: ego_waypoints[{waypoint_idx}] = {last_ego_wp[waypoint_idx]}")
+                                    else:
+                                        print(f"    Time {pred_time}: ego_waypoints[-1] = {last_ego_wp[-1] if len(last_ego_wp) > 0 else 'N/A'}")
+                                print(f"    完整ego_waypoints: {last_ego_wp[:6]}...")
+                            print()
                 
-                print(f"Generated {len(processed_data['agent_pos'])} agent_pos sequences")
+                if episode_sequence_count > 0:
+                    episode_ends_for_sequences.append(sequence_count)
+            
+            print(f"Generated {len(agent_pos_sequences)} agent_pos sequences")
+            
+            # 更新processed_data为序列数据
+            processed_data = sequence_data
+            processed_data['agent_pos'] = agent_pos_sequences
+            episode_ends = episode_ends_for_sequences
                 
-                # 验证形状
-                if len(processed_data['agent_pos']) > 0:
-                    sample_agent_pos = processed_data['agent_pos'][0]
-                    print(f"Agent_pos shape per sample: {sample_agent_pos.shape}")
-                    print(f"Expected shape: ({pred_horizon}, 2)")
-                    
-                    if sample_agent_pos.shape == (pred_horizon, 2):
-                        print("✅ Agent_pos shape is correct!")
-                    else:
-                        print("❌ Agent_pos shape is incorrect!")
-                
-                # 验证最终结果
-                final_positions = np.array(processed_data['agent_pos'])
-                print(f"\nFinal agent_pos summary:")
-                print(f"  Shape: {final_positions.shape}")
-                print(f"  Non-zero positions: {np.sum(np.any(np.abs(final_positions) > 0.01, axis=1))}")
-                print(f"  Max displacement: {np.max(np.linalg.norm(final_positions, axis=1)):.3f}")
+
             
         else:
-            print("Warning: Not enough samples to create relative positions")
+            print("Warning: Not enough samples to create agent_pos sequences")
         
         for key in ['speed', 'command', 'next_command', 'target_point', 'ego_waypoints']:
             processed_data[key] = np.array(processed_data[key])
@@ -402,8 +402,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 def test():
     import random
     dataset_path = '/home/wang/projects/diffusion_policy_z/data/tmp_data'
-    pred_horizon = 8  # 总的序列长度（包含观测+预测）
-    obs_horizon = 3   # 观测的时间步数
+    pred_horizon = 7  # 总的序列长度（包含观测+预测）
+    obs_horizon = 2   # 观测的时间步数
     action_horizon = 5  # 动作预测的时间步数
     dataset = CARLAImageDataset(
             dataset_path=dataset_path,
