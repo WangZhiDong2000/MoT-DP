@@ -194,7 +194,19 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
         print(f"Valid episodes: {len(episode_ends)}, total samples: {current_length}")
         
-        # 首先生成agent_pos序列，同时构建对应的其他数据
+        # 首先生成agent_pos序列
+        '''
+        训练轨迹生成策略：
+        观测部分 (历史轨迹):
+            Time 0: ego_waypoints[0] = [0,0] (当前位置基准)
+            Time 1: 使用Time 0的ego_waypoints[1] (从0到1的实际移动)
+        预测部分 (使用Time 1的ego_waypoints预测未来):
+            Time 2: ego_waypoints[2] 
+            Time 3: ego_waypoints[3] 
+            Time 4: ego_waypoints[4] 
+            Time 5: ego_waypoints[5] 
+            Time 6: ego_waypoints[6] 
+        '''
         if current_length >= pred_horizon:
             agent_pos_sequences = []
             sequence_data = {
@@ -215,10 +227,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 
                 if len(valid_items) >= pred_horizon:
                     for start_idx in range(len(valid_items) - pred_horizon + 1):
-                        # 生成agent_pos序列（保持原有逻辑）
                         sequence_positions = []
                         
-                        # 观测部分：构建连续的历史轨迹
+                        # 观测部分
                         for obs_step in range(obs_horizon):
                             if obs_step == 0:
                                 current_pos = np.array([0.0, 0.0])
@@ -235,7 +246,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                                     current_pos = np.array([0.0, 0.0])
                             sequence_positions.append(current_pos)
                         
-                        # 预测部分：使用最后观测时间步的ego_waypoints来预测未来
+                        # 预测部分
                         last_obs_idx = start_idx + obs_horizon - 1
                         if last_obs_idx < len(valid_items):
                             last_obs_item = valid_items[last_obs_idx]
@@ -263,69 +274,38 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                         
                         agent_pos_sequences.append(np.array(relative_positions))
                         
-                        # 为这个序列收集对应的数据（使用序列的起始时间步数据）
+                        # 转换target_point为相对位置
                         seq_start_item = valid_items[start_idx]
+                        original_target_point = np.array(seq_start_item['target_point'])
+                        relative_target_point = original_target_point - reference_pos
+                        
+                        # 为这个序列收集对应的数据（使用序列的起始时间步数据）
                         sequence_data['town_name'].append(seq_start_item['town_name'])
                         sequence_data['speed'].append(seq_start_item['speed'])
                         sequence_data['command'].append(seq_start_item['command'])
                         sequence_data['next_command'].append(seq_start_item['next_command'])
-                        sequence_data['target_point'].append(seq_start_item['target_point'])
+                        sequence_data['target_point'].append(relative_target_point)  # 使用相对位置
                         sequence_data['ego_waypoints'].append(seq_start_item['ego_waypoints'])
                         sequence_data['rgb_hist_jpg'].append(seq_start_item['rgb_hist_jpg'][-1])
                         
                         episode_sequence_count += 1
                         sequence_count += 1
-                        
-                        # 显示第一个序列的调试信息
-                        if ep_idx == 0 and start_idx == 0:
-                            print(f"修正后的agent_pos生成逻辑:")
-                            print(f"  参考位置 (obs_horizon-1): {reference_pos}")
-                            for step, rel_pos in enumerate(relative_positions):
-                                label = "obs" if step < obs_horizon else "pred"
-                                print(f"  Step {step} ({label}): {rel_pos}")
-                            
-                            print(f"\n连续轨迹构建策略:")
-                            print(f"  观测部分 (历史轨迹):")
-                            print(f"    Time 0: ego_waypoints[0] = [0,0] (当前位置基准)")
-                            for obs_step in range(1, obs_horizon):
-                                prev_time = obs_step - 1
-                                print(f"    Time {obs_step}: 使用Time {prev_time}的ego_waypoints[1] (从{prev_time}到{obs_step}的实际移动)")
-                            
-                            print(f"  预测部分 (使用Time {obs_horizon-1}的ego_waypoints预测未来):")
-                            if last_obs_idx < len(valid_items):
-                                last_obs_item = valid_items[last_obs_idx]
-                                last_ego_wp = np.array(last_obs_item['ego_waypoints'])
-                                for pred_step in range(action_horizon):
-                                    waypoint_idx = pred_step + 2
-                                    pred_time = obs_horizon + pred_step
-                                    if len(last_ego_wp) > waypoint_idx:
-                                        print(f"    Time {pred_time}: ego_waypoints[{waypoint_idx}] = {last_ego_wp[waypoint_idx]}")
-                                    else:
-                                        print(f"    Time {pred_time}: ego_waypoints[-1] = {last_ego_wp[-1] if len(last_ego_wp) > 0 else 'N/A'}")
-                                print(f"    完整ego_waypoints: {last_ego_wp[:6]}...")
-                            print()
                 
                 if episode_sequence_count > 0:
                     episode_ends_for_sequences.append(sequence_count)
             
             print(f"Generated {len(agent_pos_sequences)} agent_pos sequences")
-            
-            # 更新processed_data为序列数据
             processed_data = sequence_data
             processed_data['agent_pos'] = agent_pos_sequences
             episode_ends = episode_ends_for_sequences
-                
-
-            
+                    
         else:
             print("Warning: Not enough samples to create agent_pos sequences")
         
         for key in ['speed', 'command', 'next_command', 'target_point', 'ego_waypoints']:
             processed_data[key] = np.array(processed_data[key])
         
-        # agent_pos 已经是列表格式，转换为numpy数组
         processed_data['agent_pos'] = np.array(processed_data['agent_pos'])  # shape: (N, pred_horizon, 2)
-        
         print("Processing images...")
         image_data = []
         image_orig_shape = []
@@ -343,13 +323,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
 
         episode_ends = np.array(episode_ends)
-
-        # 创建样本索引，不使用填充
         indices = create_sample_indices_no_padding(
             episode_ends=episode_ends,
             sequence_length=pred_horizon)
 
-        # 只对速度做归一化（除以12），其余特征全部保留原始值
+        # 只对速度做归一化（除以12），其余特征全部使用原始值
         processed_data['speed'] = np.array(processed_data['speed']) / 12.0
 
         self.indices = indices
@@ -368,8 +346,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         buffer_start_idx, buffer_end_idx, \
             sample_start_idx, sample_end_idx = self.indices[idx]
 
-
-        # 直接用原始数据（只对速度做了归一化）
         sample = sample_sequence(
             train_data=self.data,
             sequence_length=self.pred_horizon,
@@ -391,8 +367,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         sample['command'] = sample['command'][:self.obs_horizon,:]
         sample['next_command'] = sample['next_command'][:self.obs_horizon,:]
         sample['target_point'] = sample['target_point'][:self.obs_horizon,:]
-
-
         return sample
 
   
@@ -412,9 +386,7 @@ def test():
             action_horizon=action_horizon,
             max_files=20
         )
-        # 只在无填充样本中随机选择
     if True:
-        # 由于现在所有样本都是无填充的，直接使用所有样本
         print(f"\n总样本数: {len(dataset)}")
         all_samples = list(range(len(dataset)))
 
@@ -424,30 +396,59 @@ def test():
             print(f"\n随机选择的样本索引: {rand_idx}")
             # agent_pos 可视化
             agent_pos = rand_sample['agent_pos'] if 'agent_pos' in rand_sample else None
+            target_point = rand_sample['target_point'] if 'target_point' in rand_sample else None
+            
             if agent_pos is not None:
                 if agent_pos.ndim == 3 and agent_pos.shape[1] == 1:
                     agent_pos = agent_pos.squeeze(1)
                 obs_agent_pos = agent_pos[:obs_horizon]
                 pred_agent_pos = agent_pos[obs_horizon:]
-                plt.figure(figsize=(8, 6))
+                
+                plt.figure(figsize=(10, 8))
+                
                 # 绘制观测点
                 if len(obs_agent_pos) > 0:
-                    plt.plot(obs_agent_pos[:, 1], obs_agent_pos[:, 0], 'bo-', label='Observed agent_pos', markersize=6)
+                    plt.plot(obs_agent_pos[:, 1], obs_agent_pos[:, 0], 'bo-', label='Observed agent_pos', markersize=8, linewidth=2)
+                
                 # 绘制预测点
                 if len(pred_agent_pos) > 0:
-                    plt.plot(pred_agent_pos[:, 1], pred_agent_pos[:, 0], 'ro--', label='Predicted agent_pos', markersize=6)
-                plt.xlabel('Y')
-                plt.ylabel('X')
-                plt.title(f'Random Sample {rand_idx}: agent_pos (blue=obs, red=pred)')
+                    plt.plot(pred_agent_pos[:, 1], pred_agent_pos[:, 0], 'ro--', label='Predicted agent_pos', markersize=8, linewidth=2)
+                
+                # 绘制target_point（相对于最后观测位置）
+                if target_point is not None:
+                    if target_point.ndim == 2:  # 如果是序列格式，取第一个
+                        target_point = target_point[0]
+                    plt.plot(target_point[1], target_point[0], 'g*', markersize=15, label='Target point (relative)', markeredgecolor='black', markeredgewidth=1)
+                    
+                    # 从最后观测点到目标点画一条虚线
+                    if len(obs_agent_pos) > 0:
+                        last_obs = obs_agent_pos[-1]
+                        plt.plot([last_obs[1], target_point[1]], [last_obs[0], target_point[0]], 'g--', alpha=0.5, linewidth=1, label='Direction to target')
+                
+                # 标记最后一个观测点（参考原点）
+                if len(obs_agent_pos) > 0:
+                    last_obs = obs_agent_pos[-1]
+                    plt.plot(last_obs[1], last_obs[0], 'ks', markersize=10, label='Reference point (last obs)', markerfacecolor='yellow', markeredgecolor='black')
+                
+                plt.xlabel('Y (relative to last obs)')
+                plt.ylabel('X (relative to last obs)')
+                plt.title(f'Sample {rand_idx}: Trajectory & Target Point\n(All positions relative to last observation)')
                 plt.legend()
                 plt.grid(True, alpha=0.3)
                 plt.axis('equal')
                 plt.tight_layout()
-                plt.savefig(f'/home/wang/projects/diffusion_policy_z/sample_{rand_idx}_agent_pos.png', dpi=150, bbox_inches='tight')
+                plt.savefig(f'/home/wang/projects/diffusion_policy_z/sample_{rand_idx}_agent_pos_with_target.png', dpi=150, bbox_inches='tight')
                 plt.show()
-                print(f"保存agent_pos图像到: sample_{rand_idx}_agent_pos.png")
-
-            # image 可视化（只显示观测部分）
+                print(f"保存agent_pos和target_point图像到: sample_{rand_idx}_agent_pos_with_target.png")
+                print(f"\n样本 {rand_idx} 的详细信息:")
+                print(f"观测位置: {obs_agent_pos}")
+                print(f"预测位置: {pred_agent_pos}")
+                if target_point is not None:
+                    print(f"目标点 (相对): {target_point}")
+                    if len(obs_agent_pos) > 0:
+                        distance_to_target = np.linalg.norm(target_point - obs_agent_pos[-1])
+                        print(f"目标点距离最后观测点的距离: {distance_to_target:.3f}")
+            # image 可视化
             if 'image' in rand_sample:
                 images = rand_sample['image']  # shape: (obs_horizon, C, H, W)
                 for t, img_arr in enumerate(images):
@@ -464,9 +465,6 @@ def test():
                     plt.show()
                     print(f"保存观测图像到: sample_{rand_idx}_obs_image_t{t}.png")
 
-
-            
-
             print(f"Dataset length: {len(dataset)}")
             sample = dataset[0]
             print("Sample keys:", sample.keys())
@@ -480,7 +478,6 @@ def test():
                     print(f"  {key}: shape={getattr(value, 'shape', 'N/A')}, type={type(value)}")
                     if hasattr(value, '__len__') and not isinstance(value, str):
                         print(f"    Length: {len(value)}")
-
 
     
 if __name__ == "__main__":
