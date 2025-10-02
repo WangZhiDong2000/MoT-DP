@@ -6,9 +6,10 @@ from collections import defaultdict
 import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from model.pusht_encoder import create_pusht_encoder
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
+from model.TCP.model import TCP
 import os
+from collections import OrderedDict
 
 VLMDriveBackbone = None
 VLM_AVAILABLE = False
@@ -40,34 +41,63 @@ class DiffusionDiTPushTPolicy(nn.Module):
         shape_meta = config['shape_meta']
         action_shape = shape_meta['action']['shape']
         action_dim = action_shape[0]
-        obs_shape_meta = shape_meta['obs']
-        self.n_obs_steps = policy_cfg.get('n_obs_steps', 2)
-        #   obs encoder
-        obs_encoder = create_pusht_encoder(
-            obs_horizon=self.cfg.get('obs_horizon', 2),
-        )
+        
+        # 从配置文件获取obs_horizon
+        self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
+        
+        # obs encoder - 使用TCP模型
+        from model.TCP.config import GlobalConfig
+        config = GlobalConfig()
+        obs_encoder = TCP(config)
+        ckpt = torch.load('/home/wang/projects/Bench2DriveZoo/tcp_b2d.ckpt', map_location="cuda")
+        ckpt = ckpt["state_dict"]
+        new_state_dict = OrderedDict()
+        for key, value in ckpt.items():
+            new_key = key.replace("model.","")
+            new_state_dict[new_key] = value
+        obs_encoder.load_state_dict(new_state_dict, strict = False)
+        obs_encoder.cuda()
+        obs_encoder.eval()
+            
         self.obs_encoder = obs_encoder
 
         # TODO load vlm and vlm encoder model）
+        self.vlm_backbone = None
+        
+        if VLM_AVAILABLE and VLMDriveBackbone is not None:
+            try:
+                vlm_device = 'cpu'  
+                self.vlm_backbone = VLMDriveBackbone(
+                    model_type='qwen',
+                    checkpoint_path='Qwen/Qwen2.5-VL-3B-Instruct',
+                    device=vlm_device
+                )
+                print("✓ VLM backbone initialized successfully on CPU")
+            except Exception as e:
+                print(f"⚠ VLM backbone initialization failed: {e}")
+                self.vlm_backbone = None
+        else:
+            print("⚠ VLM backbone not available, using simulated features")
         self.feature_encoder = None
         # Initialize fixed VLM features for consistent behavior across train/val/test
         self._init_loaded_vlm_features()
 
 
         # create diffusion model
-        obs_feature_dim = obs_encoder.output_shape()[0]
+        # TCP模型输出特征维度（j_ctrl）为256，修改相应维度
+        obs_feature_dim = 256  # TCP模型的j_ctrl输出维度
         input_dim = action_dim + obs_feature_dim
         global_cond_dim = None
         if obs_as_global_cond:
             input_dim = action_dim
-            global_cond_dim = obs_feature_dim * policy_cfg.get('n_obs_steps', 2)
+            global_cond_dim = obs_feature_dim * self.n_obs_steps  # 使用配置的obs_horizon
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
             output_dim=policy_cfg.get('output_dim', 2),
             horizon=policy_cfg.get('horizon', 16),
-            n_obs_steps=policy_cfg.get('n_obs_steps', 2),
-            cond_dim=policy_cfg.get('cond_dim', 1028),
+            n_obs_steps=self.n_obs_steps,  # 使用配置的obs_horizon
+            cond_dim=256,   # TCP模型输出的j_ctrl特征维度
             n_layer=policy_cfg.get('n_layer', 8),
             n_head=policy_cfg.get('n_head', 8),
             n_emb=policy_cfg.get('n_emb', 512),
@@ -91,7 +121,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
             obs_dim=0 if (obs_as_global_cond) else obs_feature_dim,
-            max_n_obs_steps=policy_cfg.get('n_obs_steps', 2),
+            max_n_obs_steps=self.n_obs_steps,  # 使用配置的obs_horizon
             fix_obs_steps=True,
             action_visible=False
         )
@@ -102,21 +132,81 @@ class DiffusionDiTPushTPolicy(nn.Module):
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
         self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
 
+    def extract_tcp_features(self, obs_dict):
+        """
+        使用TCP模型提取j_ctrl特征
+        """
+        try:
+            # 检查数据维度，判断是单步还是多步
+            front_img = obs_dict['image'].to(device='cuda', dtype=torch.float32)  # 确保是float32类型
+            speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
+            target_point = obs_dict['target_point'].to(dtype=torch.float32)
+            command = obs_dict['next_command'].to(dtype=torch.float32)
+            state = torch.cat([speed, target_point, command], 1).to('cuda')
+            
+            
+            # 使用TCP模型的perception部分提取特征
+            with torch.no_grad():
+                feature_emb, cnn_feature = self.obs_encoder.perception(front_img)
+                measurement_feature = self.obs_encoder.measurements(state)
+                
+                # 计算attention并提取特征
+                # 根据实际cnn_feature的空间维度动态调整init_att的reshape
+                # cnn_feature shape: (B, C, H, W), 我们需要 init_att shape: (B, 1, H, W)
+                batch_size = cnn_feature.shape[0]
+                spatial_h, spatial_w = cnn_feature.shape[2], cnn_feature.shape[3]
+                init_att = self.obs_encoder.init_att(measurement_feature).view(batch_size, 1, spatial_h, spatial_w)
+                feature_emb_att = torch.sum(cnn_feature * init_att, dim=(2, 3))
+                
+                # 计算j_ctrl特征
+                j_ctrl = self.obs_encoder.join_ctrl(torch.cat([feature_emb_att, measurement_feature], 1))
+                
+            return j_ctrl
+        except KeyError as e:
+            raise KeyError(f"Missing required field in obs_dict for TCP feature extraction: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Error in TCP feature extraction: {e}")
+
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
             'image': (B, obs_horizon, C, H, W)
             'agent_pos': (B, obs_horizon, 2)
             'action': (B, action_horizon, action_dim)
+            'speed': (B, obs_horizon)
+            'target_point': (B, obs_horizon, 2)
         }
         """
         device = next(self.parameters()).device
-        nobs = {'image': batch['image'], 'agent_pos': batch['agent_pos']}
-        nobs = dict_apply(nobs, lambda x: x.to(device))
-        # nobs = batch['obs']
-        nactions = batch['action'].to(device)
-        nvl_features = batch['vlm_feature'].to(device)
+        nobs = {}
+        carla_fields = ['image', 'next_command', 'speed', 'target_point','ego_waypoints']
+        for field in carla_fields:
+            if field in batch:
+                if field == 'image':
+                    nobs[field] = batch[field].to(device=device, dtype=torch.float32)
+                else:
+                    nobs[field] = batch[field].to(device)
 
+        # 使用自车实际轨迹点ego_waypoints作为扩散对象
+        raw_ego_waypoints = batch['ego_waypoints'].to(device)
+        
+        # 处理ego_waypoints形状: (B, obs_horizon, n_waypoints, 2) -> (B, horizon, 2)
+        # 取最后一个观测步的waypoints，然后截取到模型期望的horizon
+        if len(raw_ego_waypoints.shape) == 4:
+            # Shape: (B, obs_horizon, n_waypoints, 2)
+            # 取最后一个观测步的waypoints: (B, n_waypoints, 2)
+            last_obs_waypoints = raw_ego_waypoints[:, -1, :, :]
+            # 截取到模型horizon长度: (B, horizon, 2)
+            if last_obs_waypoints.shape[1] >= self.horizon:
+                nactions = last_obs_waypoints[:, :self.horizon, :]
+            else:
+                # 如果waypoints数量不足，需要padding
+                batch_size = last_obs_waypoints.shape[0]
+                nactions = torch.zeros(batch_size, self.horizon, 2, device=device)
+                nactions[:, :last_obs_waypoints.shape[1], :] = last_obs_waypoints
+        else:
+            # 如果形状已经是 (B, horizon, 2)，直接使用
+            nactions = raw_ego_waypoints
 
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
@@ -124,29 +214,26 @@ class DiffusionDiTPushTPolicy(nn.Module):
         To = self.n_obs_steps
 
         cond = None
-        trajectory = nactions
+        trajectory = nactions.float()  # 确保trajectory是float32类型
 
         if self.obs_as_global_cond:
-            # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, 
-                lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, T, Do
-            cond = nobs_features.reshape(batch_size, To, -1)
-            vl = nvl_features[:, -1, :]
-            #if self.pred_action_steps_only:
-            #    start = To - 1
-            #    end = start + self.n_action_steps
-            #    trajectory = nactions[:,start:end]
+            # 为每个时间步生成特征，保持时间维度
+            obs_features_list = []
+            for t in range(To):
+                # 提取第t个时间步的观测数据
+                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
+                # 为这个时间步生成特征
+                step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
+                obs_features_list.append(step_features)
+            
+            # 堆叠所有时间步的特征: (B, To, feature_dim)
+            cond = torch.stack(obs_features_list, dim=1).float()  # 确保cond是float32类型
         else:
-            # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, T, Do
+            nobs_features = self.extract_tcp_features(this_nobs)
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
-            vl = nvl_features[:, -1, :]
-            trajectory = torch.cat([nactions, nobs_features], dim=-1).detach()
-        
+            trajectory = nactions.float()
+
         # generate impainting mask
         # condition_mask = self.mask_generator(trajectory.shape)
         condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
@@ -171,10 +258,9 @@ class DiffusionDiTPushTPolicy(nn.Module):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        # vl_features, vl_mask = self.generate_simulated_vlm_outputs(batch_size, trajectory.device)
-
-        vl_embeds = self.feature_encoder(vl)
-        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond)
+        vl_features, vl_mask = self.generate_simulated_vlm_outputs(batch_size, trajectory.device)
+        vl_embeds = self.feature_encoder(vl_features)
+        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -186,29 +272,14 @@ class DiffusionDiTPushTPolicy(nn.Module):
 
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
+        
+        if loss.shape[-1] > 2:
+            loss = loss[..., :2]  
+            
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         return loss
     
-    def set_normalizer(self, action_stats, pos_stats):
-        self.action_stats_min = action_stats['min']
-        self.action_stats_max = action_stats['max']
-        self.pos_stats_min = pos_stats['min']
-        self.pos_stats_max = pos_stats['max']
-        self.pos_stats = pos_stats
-        self.action_stats = action_stats
-
-    def normalize_data(self, data, stats):
-        # nomalize to [0,1]
-        ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-        # normalize to [-1, 1]
-        ndata = ndata * 2 - 1
-        return ndata
-        
-    def unnormalize_data(self, ndata, stats):
-        ndata = (ndata + 1) / 2
-        data = ndata * (stats['max'] - stats['min']) + stats['min']
-        return data
 
     def conditional_sample(self, 
             condition_data, condition_mask,
@@ -252,16 +323,12 @@ class DiffusionDiTPushTPolicy(nn.Module):
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        obs_dict: must include "obs" key
+        obs_dict: must include CARLA driving data fields
         result: must include "action" key
         """
-        assert 'past_action' not in obs_dict # not implemented yet
-        # normalize input
-        # nobs = self.normalizer.normalize(obs_dict)
         device = next(self.parameters()).device
-        #agent_poses = obs_dict['agent_pos']
-        #nagent_poses = self.normalize_data(agent_poses, self.pos_stats)
-        #obs_dict['agent_pos'] = nagent_poses
+        
+        # 将所有观测数据移到正确的设备上
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
@@ -276,20 +343,34 @@ class DiffusionDiTPushTPolicy(nn.Module):
         cond_data = None
         cond_mask = None
         if self.obs_as_global_cond:
-            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, To, Do
-            cond = nobs_features.reshape(B, To, -1)
+            # 为每个时间步生成特征，保持时间维度
+            obs_features_list = []
+            for t in range(To):
+                # 提取第t个时间步的观测数据
+                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
+                # 为这个时间步生成特征
+                step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
+                obs_features_list.append(step_features)
+            
+            # 堆叠所有时间步的特征: (B, To, feature_dim)
+            cond = torch.stack(obs_features_list, dim=1)
             shape = (B, T, Da)
            
             cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, To, Do
-            nobs_features = nobs_features.reshape(B, To, -1)
+            # 为每个时间步生成特征，保持时间维度
+            obs_features_list = []
+            for t in range(To):
+                # 提取第t个时间步的观测数据
+                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
+                # 为这个时间步生成特征
+                step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
+                obs_features_list.append(step_features)
+            
+            # 堆叠所有时间步的特征: (B, To, feature_dim)
+            nobs_features = torch.stack(obs_features_list, dim=1)
             shape = (B, T, Da+Do)
             cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
@@ -303,16 +384,12 @@ class DiffusionDiTPushTPolicy(nn.Module):
             cond=cond,
             )
         
-        # unnormalize prediction
+        # 直接输出预测结果，无需反归一化
         naction_pred = nsample[...,:Da]
-        action_pred = self.unnormalize_data(naction_pred.detach().cpu().numpy(), self.action_stats)
-        
-
-        # get action
+        action_pred = naction_pred.detach().cpu().numpy()
         start = To - 1
         end = start + self.n_action_steps
         action = action_pred[:,start:end]
-        
         result = {
             'action': action,
             'action_pred': action_pred
@@ -342,7 +419,124 @@ class DiffusionDiTPushTPolicy(nn.Module):
             self._init_fixed_vlm_features()
 
 
-
+    def _init_fixed_vlm_features(self):
+        """
+        初始化真实的VLM特征,从实际的VLM模型中提取隐藏层特征
+        如果VLM模型不可用,则使用固定的随机特征作为备用
+        """
+        print("Initializing VLM features...")
+        
+        # 检查VLM backbone是否可用
+        if self.vlm_backbone is not None:
+            try:
+                print("Attempting to use real VLM model...")
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                # 创建一个简单的图像输入来获取VLM特征
+                # 使用PIL创建一个测试图像，这是Qwen VL模型所期望的格式
+                import numpy as np
+                from PIL import Image
+                
+                # 创建一个固定的测试图像 (224x224 RGB)
+                test_image_array = np.random.RandomState(42).randint(0, 255, (224, 224, 3), dtype=np.uint8)
+                test_image = Image.fromarray(test_image_array)
+                test_text = "What actions should be taken based on this scene?"
+                
+                try:
+                    # 使用VLM的processor来正确处理图像和文本
+                    messages = [
+                        {
+                            "role": "user", 
+                            "content": [
+                                {"type": "image", "image": test_image},
+                                {"type": "text", "text": test_text}
+                            ]
+                        }
+                    ]
+                    
+                    # 应用聊天模板
+                    text_inputs = self.vlm_backbone.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    
+                    # 处理输入
+                    inputs = self.vlm_backbone.tokenizer(
+                        text=[text_inputs],
+                        images=[test_image], 
+                        return_tensors="pt",
+                        padding=True
+                    )
+                    
+                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                    if device == 'cuda' and hasattr(self.vlm_backbone, 'model'):
+                        self.vlm_backbone.model = self.vlm_backbone.model.to(device)
+                    
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    
+                    # 获取VLM模型的隐藏状态
+                    with torch.no_grad():
+                        outputs = self.vlm_backbone.model(
+                            **inputs,
+                            output_hidden_states=True,
+                            return_dict=True,
+                        )
+                        
+                        # 获取最后一层隐藏状态
+                        if hasattr(outputs, 'hidden_states') and outputs.hidden_states:
+                            hidden_states = outputs.hidden_states[-1]  
+                            
+                            # 移除batch维度并转换为float32
+                            self.fixed_vlm_template = hidden_states.squeeze(0).float()  # (seq_len, hidden_size)
+                            self.fixed_seq_len = self.fixed_vlm_template.shape[0]
+                            
+                            print(f"✓ Real VLM features initialized: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
+                            
+                            # 根据实际VLM特征维度创建特征编码器
+                            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度
+                            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
+                            self.feature_encoder.eval()
+                            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
+                            self.fixed_vlm_template = self.fixed_vlm_template.cpu()
+                            
+                            if device == 'cuda':
+                                self.vlm_backbone.model = self.vlm_backbone.model.cpu()
+                                del self.vlm_backbone.model
+                                self.vlm_backbone.model = None
+                                torch.cuda.empty_cache()
+                                print("✓ VLM model moved to CPU and GPU memory cleared")
+                            
+                            return
+                        else:
+                            print("⚠ VLM model output does not contain hidden_states, falling back to simulated features")
+                            
+                except Exception as inner_e:
+                    print(f"⚠ Error in VLM processing: {inner_e}")
+                    
+            except Exception as e:
+                print(f"⚠ Failed to initialize real VLM features: {e}")
+        
+        # 备用方案：使用固定的随机特征
+        print("Using simulated VLM features...")
+        F = 3584  # VLM隐藏层维度
+        self.fixed_seq_len = 25  # 固定序列长度
+        
+        generator = torch.Generator()
+        generator.manual_seed(42)  
+        
+        # 生成单个固定的VLM特征模板 (seq_len, F)
+        self.fixed_vlm_template = torch.randn(
+            self.fixed_seq_len, F, 
+            generator=generator, 
+            dtype=torch.float32
+        )
+        
+        print(f"✓ Simulated VLM features initialized: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
+        
+        # 根据VLM特征维度创建特征编码器
+        if self.feature_encoder is None:
+            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度 
+            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
+            self.feature_encoder.eval()
+            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
     
     def generate_simulated_vlm_outputs(self, batch_size, device, max_seq_len=None):
         """
@@ -404,14 +598,27 @@ def use_dummy_test():
     model = DiffusionDiTPushTPolicy(config)
     # print(model)
 
-    # dummy input
+    # dummy input - 使用CARLA驾驶数据集格式，obs_horizon=1
     obs_dict = {
-        'image': torch.randn(4, 2, 3, 64, 64),
-        'agent_pos': torch.randn(4, 2, 2)
+        'image': torch.randn(4, 1, 3, 96, 96),  # CARLA图像格式
+        'agent_pos': torch.randn(4, 1, 2),      # 代理位置
+        'speed': torch.randn(4, 1),             # 速度
+        'theta': torch.randn(4, 1),             # 朝向角
+        'throttle': torch.randn(4, 1),          # 油门
+        'steer': torch.randn(4, 1),             # 转向
+        'brake': torch.randn(4, 1),             # 刹车
+        'target_point': torch.randn(4, 1, 2),  # 目标点
     }
     batch_input = {
-        'obs': obs_dict,
-        'action': torch.randn(4, 16, 2)
+        'image': obs_dict['image'],
+        'agent_pos': obs_dict['agent_pos'],
+        'speed': obs_dict['speed'],
+        'theta': obs_dict['theta'],
+        'throttle': obs_dict['throttle'],
+        'steer': obs_dict['steer'],
+        'brake': obs_dict['brake'],
+        'target_point': obs_dict['target_point'],
+        'action': torch.randn(4, 16, 2)  
     }
     out = model.compute_loss(batch_input)
     #print(out)
