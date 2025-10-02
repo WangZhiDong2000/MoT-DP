@@ -5,8 +5,11 @@ import io
 import sys
 import pickle
 import glob
+from tqdm import tqdm  
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 
 
@@ -122,7 +125,22 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  action_horizon: int,
                  max_files: int = None,  
                  train_split: float = 0.8,  
-                 mode: str = 'train'):  
+                 mode: str = 'train',
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 use_gpu_processing: bool = True):  
+
+        self.device = device
+        self.use_gpu_processing = use_gpu_processing and torch.cuda.is_available()
+        
+        # 设置图像变换 - 不进行normalize，保持[0,255]范围
+        self.image_transform = transforms.Compose([
+            transforms.Resize((256, 900)),  # 高度x宽度
+            # 不使用ToTensor()，因为它会normalize到[0,1]
+            # 我们将手动转换为tensor并保持[0,255]范围
+        ])
+        
+        print(f"Using device: {self.device}")
+        print(f"GPU image processing: {self.use_gpu_processing}")
 
         pkl_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
         print(f"Found {len(pkl_files)} PKL files")
@@ -221,7 +239,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             episode_ends_for_sequences = []
             sequence_count = 0
             
-            for ep_idx, ep_data in enumerate(all_episode_data):
+            for ep_idx, ep_data in enumerate(tqdm(all_episode_data, desc='Processing episodes')):
                 valid_items = [item for item in ep_data if len(item['ego_waypoints']) >= 1]
                 episode_sequence_count = 0
                 
@@ -306,18 +324,50 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             processed_data[key] = np.array(processed_data[key])
         
         processed_data['agent_pos'] = np.array(processed_data['agent_pos'])  # shape: (N, pred_horizon, 2)
-        print("Processing images...")
+        
+        # GPU加速的图像处理
         image_data = []
         image_orig_shape = []
-        for i, img_bytes in enumerate(processed_data['rgb_hist_jpg']):
-            if i % 100 == 0:
-                print(f"  Processing image {i}/{len(processed_data['rgb_hist_jpg'])}")
-            img = Image.open(io.BytesIO(img_bytes))
-            image_orig_shape.append(img.size)  
-            img_resized = img.resize((900, 256))
-            img_array = np.array(img_resized) / 1.0 
-            img_array = np.moveaxis(img_array, -1, 0)  
-            image_data.append(img_array)
+        
+        if self.use_gpu_processing:
+            print(f"Processing {len(processed_data['rgb_hist_jpg'])} images on GPU...")
+            batch_size = 32  
+            for i in range(0, len(processed_data['rgb_hist_jpg']), batch_size):
+                end_idx = min(i + batch_size, len(processed_data['rgb_hist_jpg']))
+                batch_imgs = []
+                batch_orig_shapes = []
+                
+                for j in range(i, end_idx):
+                    img_bytes = processed_data['rgb_hist_jpg'][j]
+                    img = Image.open(io.BytesIO(img_bytes))
+                    batch_orig_shapes.append(img.size)
+                    
+                    # 使用torchvision变换（只resize，不normalize）
+                    img_resized = self.image_transform(img)  # PIL Image
+                    img_tensor = TF.to_tensor(img_resized) * 255.0  # (C, H, W), [0,255]
+                    batch_imgs.append(img_tensor)
+                
+                if batch_imgs:
+                    batch_tensor = torch.stack(batch_imgs).to(self.device)  # (B, C, H, W)
+                    batch_numpy = batch_tensor.cpu().numpy()
+                    
+                    for k in range(batch_numpy.shape[0]):
+                        image_data.append(batch_numpy[k])
+                    
+                    image_orig_shape.extend(batch_orig_shapes)
+                
+                if (i // batch_size) % 10 == 0:
+                    print(f"  Processed {end_idx}/{len(processed_data['rgb_hist_jpg'])} images")
+        else:
+            print("Processing images on CPU...")
+            for i, img_bytes in enumerate(tqdm(processed_data['rgb_hist_jpg'], desc='Processing images')):
+                img = Image.open(io.BytesIO(img_bytes))
+                image_orig_shape.append(img.size)  
+                
+                img_resized = self.image_transform(img)  
+                img_tensor = TF.to_tensor(img_resized) * 255.0  # (C, H, W), [0,255]
+                image_data.append(img_tensor.numpy())
+        
         processed_data['image'] = np.array(image_data)
         processed_data['image_orig_shape'] = np.array(image_orig_shape)  
         
@@ -384,7 +434,7 @@ def test():
             pred_horizon=pred_horizon,
             obs_horizon=obs_horizon,
             action_horizon=action_horizon,
-            max_files=20
+            max_files=10
         )
     if True:
         print(f"\n总样本数: {len(dataset)}")
@@ -450,7 +500,7 @@ def test():
                         print(f"目标点距离最后观测点的距离: {distance_to_target:.3f}")
             # image 可视化
             if 'image' in rand_sample:
-                images = rand_sample['image']  # shape: (obs_horizon, C, H, W)
+                images = rand_sample['image'] # shape: (obs_horizon, C, H, W)
                 for t, img_arr in enumerate(images):
                     if img_arr.shape[0] == 3:  # (C, H, W)
                         img_vis = np.moveaxis(img_arr, 0, -1).astype(np.uint8)

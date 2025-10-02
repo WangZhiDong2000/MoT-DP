@@ -36,7 +36,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
         policy_cfg = config['policy']
         noise_scheduler_cfg = config['noise_scheduler']
 
-        obs_as_global_cond = policy_cfg.get('obs_as_global_cond', False)
+        obs_as_global_cond = policy_cfg.get('obs_as_global_cond', True)
         self.obs_as_global_cond = obs_as_global_cond
         shape_meta = config['shape_meta']
         action_shape = shape_meta['action']['shape']
@@ -79,25 +79,24 @@ class DiffusionDiTPushTPolicy(nn.Module):
         else:
             print("⚠ VLM backbone not available, using simulated features")
         self.feature_encoder = None
-        # Initialize fixed VLM features for consistent behavior across train/val/test
         self._init_loaded_vlm_features()
 
 
         # create diffusion model
         # TCP模型输出特征维度（j_ctrl）为256，修改相应维度
-        obs_feature_dim = 256  # TCP模型的j_ctrl输出维度
+        obs_feature_dim = 256  
         input_dim = action_dim + obs_feature_dim
         global_cond_dim = None
         if obs_as_global_cond:
             input_dim = action_dim
-            global_cond_dim = obs_feature_dim * self.n_obs_steps  # 使用配置的obs_horizon
+            global_cond_dim = obs_feature_dim * self.n_obs_steps  
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
             output_dim=policy_cfg.get('output_dim', 2),
             horizon=policy_cfg.get('horizon', 16),
-            n_obs_steps=self.n_obs_steps,  # 使用配置的obs_horizon
-            cond_dim=256,   # TCP模型输出的j_ctrl特征维度
+            n_obs_steps=self.n_obs_steps,  
+            cond_dim=256,   
             n_layer=policy_cfg.get('n_layer', 8),
             n_head=policy_cfg.get('n_head', 8),
             n_emb=policy_cfg.get('n_emb', 512),
@@ -121,7 +120,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
             obs_dim=0 if (obs_as_global_cond) else obs_feature_dim,
-            max_n_obs_steps=self.n_obs_steps,  # 使用配置的obs_horizon
+            max_n_obs_steps=self.n_obs_steps,  
             fix_obs_steps=True,
             action_visible=False
         )
@@ -137,28 +136,21 @@ class DiffusionDiTPushTPolicy(nn.Module):
         使用TCP模型提取j_ctrl特征
         """
         try:
-            # 检查数据维度，判断是单步还是多步
-            front_img = obs_dict['image'].to(device='cuda', dtype=torch.float32)  # 确保是float32类型
+            front_img = obs_dict['image'].to(device='cuda', dtype=torch.float32)  
             speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
             target_point = obs_dict['target_point'].to(dtype=torch.float32)
             command = obs_dict['next_command'].to(dtype=torch.float32)
             state = torch.cat([speed, target_point, command], 1).to('cuda')
             
             
-            # 使用TCP模型的perception部分提取特征
             with torch.no_grad():
                 feature_emb, cnn_feature = self.obs_encoder.perception(front_img)
                 measurement_feature = self.obs_encoder.measurements(state)
-                
-                # 计算attention并提取特征
-                # 根据实际cnn_feature的空间维度动态调整init_att的reshape
-                # cnn_feature shape: (B, C, H, W), 我们需要 init_att shape: (B, 1, H, W)
                 batch_size = cnn_feature.shape[0]
                 spatial_h, spatial_w = cnn_feature.shape[2], cnn_feature.shape[3]
                 init_att = self.obs_encoder.init_att(measurement_feature).view(batch_size, 1, spatial_h, spatial_w)
                 feature_emb_att = torch.sum(cnn_feature * init_att, dim=(2, 3))
                 
-                # 计算j_ctrl特征
                 j_ctrl = self.obs_encoder.join_ctrl(torch.cat([feature_emb_att, measurement_feature], 1))
                 
             return j_ctrl
@@ -179,7 +171,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
         """
         device = next(self.parameters()).device
         nobs = {}
-        carla_fields = ['image', 'next_command', 'speed', 'target_point','ego_waypoints']
+        carla_fields = ['image', 'next_command', 'speed', 'target_point','agent_pos']
         for field in carla_fields:
             if field in batch:
                 if field == 'image':
@@ -187,52 +179,29 @@ class DiffusionDiTPushTPolicy(nn.Module):
                 else:
                     nobs[field] = batch[field].to(device)
 
-        # 使用自车实际轨迹点ego_waypoints作为扩散对象
-        raw_ego_waypoints = batch['ego_waypoints'].to(device)
-        
-        # 处理ego_waypoints形状: (B, obs_horizon, n_waypoints, 2) -> (B, horizon, 2)
-        # 取最后一个观测步的waypoints，然后截取到模型期望的horizon
-        if len(raw_ego_waypoints.shape) == 4:
-            # Shape: (B, obs_horizon, n_waypoints, 2)
-            # 取最后一个观测步的waypoints: (B, n_waypoints, 2)
-            last_obs_waypoints = raw_ego_waypoints[:, -1, :, :]
-            # 截取到模型horizon长度: (B, horizon, 2)
-            if last_obs_waypoints.shape[1] >= self.horizon:
-                nactions = last_obs_waypoints[:, :self.horizon, :]
-            else:
-                # 如果waypoints数量不足，需要padding
-                batch_size = last_obs_waypoints.shape[0]
-                nactions = torch.zeros(batch_size, self.horizon, 2, device=device)
-                nactions[:, :last_obs_waypoints.shape[1], :] = last_obs_waypoints
-        else:
-            # 如果形状已经是 (B, horizon, 2)，直接使用
-            nactions = raw_ego_waypoints
+        raw_agent_pos = batch['agent_pos'].to(device)
 
+        # (B, horizon, 2)
+        To = self.n_obs_steps
+        nactions = raw_agent_pos[:, To:, :]
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
-
-        To = self.n_obs_steps
-
         cond = None
-        trajectory = nactions.float()  # 确保trajectory是float32类型
+        trajectory = nactions.float()  
 
         if self.obs_as_global_cond:
-            # 为每个时间步生成特征，保持时间维度
             obs_features_list = []
             for t in range(To):
-                # 提取第t个时间步的观测数据
                 this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
-                # 为这个时间步生成特征
                 step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
                 obs_features_list.append(step_features)
             
             # 堆叠所有时间步的特征: (B, To, feature_dim)
-            cond = torch.stack(obs_features_list, dim=1).float()  # 确保cond是float32类型
+            cond = torch.stack(obs_features_list, dim=1).float()  
         else:
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
             nobs_features = self.extract_tcp_features(this_nobs)
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
-            trajectory = nactions.float()
 
         # generate impainting mask
         # condition_mask = self.mask_generator(trajectory.shape)
@@ -322,13 +291,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
         return trajectory
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        obs_dict: must include CARLA driving data fields
-        result: must include "action" key
-        """
         device = next(self.parameters()).device
-        
-        # 将所有观测数据移到正确的设备上
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
@@ -343,16 +306,11 @@ class DiffusionDiTPushTPolicy(nn.Module):
         cond_data = None
         cond_mask = None
         if self.obs_as_global_cond:
-            # 为每个时间步生成特征，保持时间维度
             obs_features_list = []
             for t in range(To):
-                # 提取第t个时间步的观测数据
                 this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
-                # 为这个时间步生成特征
                 step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
                 obs_features_list.append(step_features)
-            
-            # 堆叠所有时间步的特征: (B, To, feature_dim)
             cond = torch.stack(obs_features_list, dim=1)
             shape = (B, T, Da)
            
@@ -360,12 +318,9 @@ class DiffusionDiTPushTPolicy(nn.Module):
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            # 为每个时间步生成特征，保持时间维度
             obs_features_list = []
             for t in range(To):
-                # 提取第t个时间步的观测数据
                 this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
-                # 为这个时间步生成特征
                 step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
                 obs_features_list.append(step_features)
             
@@ -384,12 +339,10 @@ class DiffusionDiTPushTPolicy(nn.Module):
             cond=cond,
             )
         
-        # 直接输出预测结果，无需反归一化
         naction_pred = nsample[...,:Da]
         action_pred = naction_pred.detach().cpu().numpy()
-        start = To - 1
-        end = start + self.n_action_steps
-        action = action_pred[:,start:end]
+        # 直接返回整个预测序列，因为horizon=action_horizon
+        action = action_pred
         result = {
             'action': action,
             'action_pred': action_pred
