@@ -12,7 +12,7 @@ from collections import defaultdict
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 from dataset.generate_pdm_dataset import CARLAImageDataset
-from policy.diffusion_dit_pusht_policy import DiffusionDiTPushTPolicy
+from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml
 
 def create_carla_config():
@@ -20,6 +20,70 @@ def create_carla_config():
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
+
+def compute_action_stats(train_dataset):
+    """
+    计算训练数据集中action的统计信息，包含outlier过滤
+    """
+    print("Computing action statistics from training dataset...")
+    all_actions = []
+    
+    # 随机采样一部分数据来计算统计信息（避免内存问题）
+    sample_size = min(1000, len(train_dataset))
+    indices = np.random.choice(len(train_dataset), sample_size, replace=False)
+    
+    for i in tqdm(indices, desc="Collecting action samples"):
+        sample = train_dataset[i]
+        agent_pos = sample['agent_pos']  # shape: (sequence_length, 2)
+        
+        # 提取action部分（obs_horizon之后的部分）
+        obs_horizon = train_dataset.obs_horizon
+        actions = agent_pos[obs_horizon:]  # shape: (action_horizon, 2)
+        all_actions.append(actions)
+    
+    # 转换为numpy数组并计算统计信息
+    all_actions = np.concatenate(all_actions, axis=0)  # shape: (N * action_horizon, 2)
+    
+    print(f"Raw action statistics from {len(all_actions)} samples:")
+    raw_min = np.min(all_actions, axis=0)
+    raw_max = np.max(all_actions, axis=0)
+    print(f"  Raw range: X=[{raw_min[0]:.4f}, {raw_max[0]:.4f}], Y=[{raw_min[1]:.4f}, {raw_max[1]:.4f}]")
+    
+    # 使用percentile来过滤极端outliers
+    percentile_low = 1  # 过滤掉最低1%
+    percentile_high = 99  # 过滤掉最高1%
+    
+    action_min = np.percentile(all_actions, percentile_low, axis=0)
+    action_max = np.percentile(all_actions, percentile_high, axis=0)
+    action_mean = np.mean(all_actions, axis=0)
+    action_std = np.std(all_actions, axis=0)
+    
+    print(f"Filtered action statistics (using {percentile_low}-{percentile_high} percentile):")
+    print(f"  Min: {action_min}")
+    print(f"  Max: {action_max}")
+    print(f"  Mean: {action_mean}")
+    print(f"  Std: {action_std}")
+    print(f"  Range: {action_max - action_min}")
+    
+    # 进一步验证：确保范围合理（驾驶任务中相对位移很少超过10米）
+    reasonable_max_range = 10.0
+    if np.any(action_max - action_min > reasonable_max_range):
+        print(f"  ⚠️ Range still seems large, applying conservative clipping...")
+        # 使用更保守的范围
+        conservative_min = np.maximum(action_min, np.array([-3.0, -3.0]))
+        conservative_max = np.minimum(action_max, np.array([8.0, 4.0]))
+        action_min = conservative_min
+        action_max = conservative_max
+        print(f"  Conservative range: X=[{action_min[0]:.4f}, {action_max[0]:.4f}], Y=[{action_min[1]:.4f}, {action_max[1]:.4f}]")
+    
+    action_stats = {
+        'min': torch.from_numpy(action_min).float(),
+        'max': torch.from_numpy(action_max).float(),
+        'mean': torch.from_numpy(action_mean).float(),
+        'std': torch.from_numpy(action_std).float()
+    }
+    
+    return action_stats
 
 def compute_driving_metrics(predicted_trajectories, target_trajectories):
     predicted_trajectories = predicted_trajectories.detach().cpu().numpy()
@@ -133,7 +197,7 @@ def train_carla_policy():
     pred_horizon = config.get('pred_horizon', 6)
     obs_horizon = config.get('obs_horizon', 2)
     action_horizon = config.get('action_horizon', 4)
-    max_files = 20
+    max_files = 5
     print(f"Loading CARLA dataset from {dataset_path}")
     
     # 创建训练和验证数据集
@@ -164,6 +228,23 @@ def train_carla_policy():
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
     
+    # 计算action统计信息（如果启用normalization）
+    action_stats = None
+    if config.get('enable_action_normalization', False):
+        action_stats = compute_action_stats(train_dataset)
+        
+        # 将统计信息添加到wandb配置中
+        wandb.config.update({
+            "action_stats": {
+                "min": action_stats['min'].tolist(),
+                "max": action_stats['max'].tolist(),
+                "mean": action_stats['mean'].tolist(),
+                "std": action_stats['std'].tolist()
+            }
+        })
+    else:
+        print("Action normalization disabled in config")
+    
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
     
@@ -184,7 +265,7 @@ def train_carla_policy():
     )
     
     print("Initializing policy model...")
-    policy = DiffusionDiTPushTPolicy(config).to(device)
+    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
     print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
     
     # 检查数据范围

@@ -134,9 +134,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
         # 设置图像变换 - 不进行normalize，保持[0,255]范围
         self.image_transform = transforms.Compose([
-            transforms.Resize((256, 900)),  # 高度x宽度
+            transforms.Resize((256, 928)),  # 高度x宽度
             # 不使用ToTensor()，因为它会normalize到[0,1]
             # 我们将手动转换为tensor并保持[0,255]范围
+            # 256， 928
         ])
         
         print(f"Using device: {self.device}")

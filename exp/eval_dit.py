@@ -15,7 +15,7 @@ sys.path.append(str(project_root))
 from dataset.pusht_dataset_zip import PushTImageDataset
 from pusht_dataset_zip import PushTImageDataset as PushTImageDataset_ori
 from pusht_env import PushTEnv
-from policy.diffusion_dit_pusht_policy import DiffusionDiTPushTPolicy  # 修正：使用正确的类名
+from policy.diffusion_dit_carla_policy import DiffusionDiTPushTPolicy  # 修正：使用正确的类名
 from pusht_env import PushTImageEnv
 from video_recorder import VideoRecorder
 

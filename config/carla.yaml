@@ -1,7 +1,7 @@
 
 dataloader:
-  batch_size: 32       
-  num_workers: 8       
+  batch_size: 16       
+  num_workers: 4       
   persistent_workers: true
   pin_memory: true
   shuffle: true
@@ -58,6 +58,9 @@ shape_meta:
       shape:
       - 2
       type: low_dim
+
+# Action normalization settings
+enable_action_normalization: true  # 启用action normalization
 
 # Policy configuration for DiT 
 policy:
