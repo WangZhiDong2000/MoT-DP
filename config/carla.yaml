@@ -101,7 +101,7 @@ training:
   max_grad_norm: 1.0        
   dataset_path: "/home/wang/projects/diffusion_policy_z/data/tmp_data"  
   lr_final: 1e-7           
-  validation_freq: 10      # 每10个epoch进行一次验证
+  validation_freq: 5      # 每10个epoch进行一次验证
   save_freq: 5            # 每5个epoch保存一次模型
   early_stopping_patience: 10  # 早停机制
 
