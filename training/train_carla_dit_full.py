@@ -12,7 +12,7 @@ from collections import defaultdict
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 from dataset.generate_pdm_dataset import CARLAImageDataset
-from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
+from policy.diffusion_dit_tcp_policy import DiffusionDiTCarlaPolicy
 import yaml
 
 def create_carla_config():
@@ -197,7 +197,7 @@ def train_carla_policy():
     pred_horizon = config.get('pred_horizon', 6)
     obs_horizon = config.get('obs_horizon', 2)
     action_horizon = config.get('action_horizon', 4)
-    max_files = 5
+    max_files = 10
     print(f"Loading CARLA dataset from {dataset_path}")
     
     # 创建训练和验证数据集
@@ -325,7 +325,7 @@ def train_carla_policy():
             "train/samples_processed": (epoch + 1) * len(train_dataset)
         })
 
-        if (epoch + 1) % 1 == 0:
+        if (epoch + 1) % config.get('validation_freq', 1) == 0:
             print("Validating...")
             val_metrics = validate_model(policy, val_loader, device)
         
