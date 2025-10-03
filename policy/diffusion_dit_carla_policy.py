@@ -27,8 +27,22 @@ def dict_apply(
             result[key] = func(value)
     return result
 
-class DiffusionDiTPushTPolicy(nn.Module):
-    def __init__(self, config: Dict):
+def normalize_data(data, stats):
+    # nomalize to [0,1]
+    ndata = (data - stats['min']) / (stats['max'] - stats['min'])
+    # normalize to [-1, 1]
+    ndata = ndata * 2 - 1
+    return ndata
+
+def unnormalize_data(ndata, stats):
+    # unnormalize from [-1, 1] to [0, 1]
+    ndata = (ndata + 1) / 2
+    # unnormalize to original range
+    data = ndata * (stats['max'] - stats['min']) + stats['min']
+    return data
+
+class DiffusionDiTCarlaPolicy(nn.Module):
+    def __init__(self, config: Dict, action_stats: Optional[Dict[str, torch.Tensor]] = None):
         super().__init__()
         
         # config
@@ -41,6 +55,17 @@ class DiffusionDiTPushTPolicy(nn.Module):
         shape_meta = config['shape_meta']
         action_shape = shape_meta['action']['shape']
         action_dim = action_shape[0]
+        
+        # Action normalization settings
+        self.enable_action_normalization = config.get('enable_action_normalization', False)
+        self.action_stats = action_stats
+        if self.enable_action_normalization and self.action_stats is not None:
+            print(f"✓ Action normalization enabled with stats:")
+            print(f"  Action min: {self.action_stats['min']}")
+            print(f"  Action max: {self.action_stats['max']}")
+        else:
+            print("⚠ Action normalization disabled")
+            self.action_stats = None
         
         # 从配置文件获取obs_horizon
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
@@ -89,7 +114,13 @@ class DiffusionDiTPushTPolicy(nn.Module):
         global_cond_dim = None
         if obs_as_global_cond:
             input_dim = action_dim
-            global_cond_dim = obs_feature_dim * self.n_obs_steps  
+            global_cond_dim = obs_feature_dim * self.n_obs_steps
+        
+        # Optional GroupNorm for j_ctrl features (recommended for training stability)
+        self.use_j_ctrl_norm = policy_cfg.get('use_j_ctrl_norm', False)
+        if self.use_j_ctrl_norm:
+            self.j_ctrl_norm = nn.GroupNorm(num_groups=8, num_channels=256)
+            print("✓ GroupNorm enabled for j_ctrl features")  
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
@@ -131,6 +162,48 @@ class DiffusionDiTPushTPolicy(nn.Module):
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
         self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
 
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize action from original range to [-1, 1]
+        Args:
+            action: tensor of shape (..., action_dim)
+        Returns:
+            normalized action in range [-1, 1]
+        """
+        if not self.enable_action_normalization or self.action_stats is None:
+            return action
+        
+        device = action.device
+        action_min = self.action_stats['min'].to(device)
+        action_max = self.action_stats['max'].to(device)
+        
+        # Normalize to [0, 1]
+        normalized = (action - action_min) / (action_max - action_min + 1e-8)
+        # Normalize to [-1, 1]
+        normalized = normalized * 2 - 1
+        return normalized
+
+    def unnormalize_action(self, normalized_action: torch.Tensor) -> torch.Tensor:
+        """
+        Unnormalize action from [-1, 1] back to original range
+        Args:
+            normalized_action: tensor of shape (..., action_dim) in range [-1, 1]
+        Returns:
+            action in original range
+        """
+        if not self.enable_action_normalization or self.action_stats is None:
+            return normalized_action
+        
+        device = normalized_action.device
+        action_min = self.action_stats['min'].to(device)
+        action_max = self.action_stats['max'].to(device)
+        
+        # Unnormalize from [-1, 1] to [0, 1]
+        unnormalized = (normalized_action + 1) / 2
+        # Unnormalize to original range
+        unnormalized = unnormalized * (action_max - action_min) + action_min
+        return unnormalized
+
     def extract_tcp_features(self, obs_dict):
         """
         使用TCP模型提取j_ctrl特征
@@ -147,11 +220,16 @@ class DiffusionDiTPushTPolicy(nn.Module):
                 feature_emb, cnn_feature = self.obs_encoder.perception(front_img)
                 measurement_feature = self.obs_encoder.measurements(state)
                 batch_size = cnn_feature.shape[0]
-                spatial_h, spatial_w = cnn_feature.shape[2], cnn_feature.shape[3]
-                init_att = self.obs_encoder.init_att(measurement_feature).view(batch_size, 1, spatial_h, spatial_w)
+                
+                # NOTE: This requires input images of size 256x928 (H×W) to produce 8x29 feature maps
+                init_att = self.obs_encoder.init_att(measurement_feature).view(batch_size, 1, 8, 29)
                 feature_emb_att = torch.sum(cnn_feature * init_att, dim=(2, 3))
                 
                 j_ctrl = self.obs_encoder.join_ctrl(torch.cat([feature_emb_att, measurement_feature], 1))
+                
+            # Optional GroupNorm for better training stability
+            if self.use_j_ctrl_norm and self.training:
+                j_ctrl = self.j_ctrl_norm(j_ctrl.unsqueeze(-1)).squeeze(-1)
                 
             return j_ctrl
         except KeyError as e:
@@ -187,7 +265,14 @@ class DiffusionDiTPushTPolicy(nn.Module):
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
         cond = None
-        trajectory = nactions.float()  
+        
+        # Normalize trajectory for training
+        trajectory = nactions.float()
+        if self.enable_action_normalization and self.action_stats is not None:
+            trajectory = self.normalize_action(trajectory)
+            if torch.isnan(trajectory).any() or torch.isinf(trajectory).any():
+                print("Warning: NaN or Inf detected in normalized trajectory")
+                trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
 
         if self.obs_as_global_cond:
             obs_features_list = []
@@ -340,6 +425,27 @@ class DiffusionDiTPushTPolicy(nn.Module):
             )
         
         naction_pred = nsample[...,:Da]
+        
+        # Clamp normalized predictions to [-1, 1] to prevent extreme values
+        naction_pred = torch.clamp(naction_pred, -1.0, 1.0)
+        
+        # Unnormalize action predictions back to original range
+        if self.enable_action_normalization and self.action_stats is not None:
+            naction_pred = self.unnormalize_action(naction_pred)
+            
+            # Additional safety clamp after unnormalization to prevent extreme outliers
+            device = naction_pred.device
+            action_min = self.action_stats['min'].to(device)
+            action_max = self.action_stats['max'].to(device)
+            
+            # Expand to reasonable bounds (20% beyond training range)
+            safety_margin = 0.2
+            range_size = action_max - action_min
+            expanded_min = action_min - safety_margin * range_size
+            expanded_max = action_max + safety_margin * range_size
+            
+            naction_pred = torch.clamp(naction_pred, expanded_min, expanded_max)
+        
         action_pred = naction_pred.detach().cpu().numpy()
         # 直接返回整个预测序列，因为horizon=action_horizon
         action = action_pred
@@ -348,7 +454,7 @@ class DiffusionDiTPushTPolicy(nn.Module):
             'action_pred': action_pred
         }
         return result
-    
+
     # ========= VLM feature simulati, temporary! TODO   ============
 
     def _init_loaded_vlm_features(self):
@@ -544,11 +650,14 @@ class DiffusionDiTPushTPolicy(nn.Module):
 
 def use_dummy_test():
     base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(base_path, "config/pusht_dit.yaml")
+    config_path = os.path.join(base_path, "config/carla.yaml")
     import yaml
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)  
-    model = DiffusionDiTPushTPolicy(config)
+    
+    # 对于测试，禁用action normalization或提供dummy stats
+    config['enable_action_normalization'] = False
+    model = DiffusionDiTCarlaPolicy(config)
     # print(model)
 
     # dummy input - 使用CARLA驾驶数据集格式，obs_horizon=1
