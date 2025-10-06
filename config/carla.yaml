@@ -1,7 +1,7 @@
 
 dataloader:
-  batch_size: 16       
-  num_workers: 4       
+  batch_size: 32       
+  num_workers: 8       
   persistent_workers: true
   pin_memory: true
   shuffle: true
