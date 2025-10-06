@@ -22,26 +22,23 @@ def create_carla_config():
     return config
 
 def compute_action_stats(train_dataset):
-    """
-    计算训练数据集中action的统计信息，包含outlier过滤
-    """
     print("Computing action statistics from training dataset...")
     all_actions = []
     
-    # 随机采样一部分数据来计算统计信息（避免内存问题）
-    sample_size = min(1000, len(train_dataset))
+    sample_size = min(5, len(train_dataset))
     indices = np.random.choice(len(train_dataset), sample_size, replace=False)
     
     for i in tqdm(indices, desc="Collecting action samples"):
         sample = train_dataset[i]
         agent_pos = sample['agent_pos']  # shape: (sequence_length, 2)
         
-        # 提取action部分（obs_horizon之后的部分）
+        if isinstance(agent_pos, torch.Tensor):
+            agent_pos = agent_pos.numpy()
+        
         obs_horizon = train_dataset.obs_horizon
         actions = agent_pos[obs_horizon:]  # shape: (action_horizon, 2)
         all_actions.append(actions)
     
-    # 转换为numpy数组并计算统计信息
     all_actions = np.concatenate(all_actions, axis=0)  # shape: (N * action_horizon, 2)
     
     print(f"Raw action statistics from {len(all_actions)} samples:")
@@ -49,9 +46,8 @@ def compute_action_stats(train_dataset):
     raw_max = np.max(all_actions, axis=0)
     print(f"  Raw range: X=[{raw_min[0]:.4f}, {raw_max[0]:.4f}], Y=[{raw_min[1]:.4f}, {raw_max[1]:.4f}]")
     
-    # 使用percentile来过滤极端outliers
-    percentile_low = 1  # 过滤掉最低1%
-    percentile_high = 99  # 过滤掉最高1%
+    percentile_low = 1  
+    percentile_high = 99  
     
     action_min = np.percentile(all_actions, percentile_low, axis=0)
     action_max = np.percentile(all_actions, percentile_high, axis=0)
@@ -65,11 +61,9 @@ def compute_action_stats(train_dataset):
     print(f"  Std: {action_std}")
     print(f"  Range: {action_max - action_min}")
     
-    # 进一步验证：确保范围合理（驾驶任务中相对位移很少超过10米）
     reasonable_max_range = 10.0
     if np.any(action_max - action_min > reasonable_max_range):
         print(f"  ⚠️ Range still seems large, applying conservative clipping...")
-        # 使用更保守的范围
         conservative_min = np.maximum(action_min, np.array([-3.0, -3.0]))
         conservative_max = np.minimum(action_max, np.array([8.0, 4.0]))
         action_min = conservative_min
@@ -142,10 +136,8 @@ def validate_model(policy, val_loader, device):
             try:
                 result = policy.predict_action(obs_dict)
                 predicted_actions = torch.from_numpy(result['action']).to(device)
-                # 目标动作是观测步之后的位置
                 target_actions = batch['agent_pos'][:, policy.n_obs_steps:policy.n_obs_steps + predicted_actions.shape[1]]
                 
-                # 调试信息：打印数值范围
                 if batch_idx == 0:
                     print(f"\n=== Debug Info ===")
                     print(f"Predicted actions shape: {predicted_actions.shape}")
@@ -197,10 +189,9 @@ def train_carla_policy():
     pred_horizon = config.get('pred_horizon', 6)
     obs_horizon = config.get('obs_horizon', 2)
     action_horizon = config.get('action_horizon', 4)
-    max_files = 10
+    max_files = None # 设置为 None 以加载所有数据文件
     print(f"Loading CARLA dataset from {dataset_path}")
     
-    # 创建训练和验证数据集
     train_dataset = CARLAImageDataset(
         dataset_path=dataset_path,
         pred_horizon=pred_horizon,
@@ -228,12 +219,9 @@ def train_carla_policy():
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
     
-    # 计算action统计信息（如果启用normalization）
     action_stats = None
     if config.get('enable_action_normalization', False):
         action_stats = compute_action_stats(train_dataset)
-        
-        # 将统计信息添加到wandb配置中
         wandb.config.update({
             "action_stats": {
                 "min": action_stats['min'].tolist(),
@@ -268,7 +256,6 @@ def train_carla_policy():
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
     print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
     
-    # 检查数据范围
     print("\n=== Checking data statistics ===")
     sample_batch = next(iter(train_loader))
     print(f"Sample agent_pos shape: {sample_batch['agent_pos'].shape}")
@@ -356,12 +343,10 @@ def train_carla_policy():
             log_dict.update(trajectory_metrics)
             wandb.log(log_dict)
         
-            # 打印验证指标
             print(f"Validation metrics:")
             for key, value in val_metrics.items():
                 print(f"  {key}: {value:.4f}")
         
-            # 保存最佳模型
             val_loss = val_metrics.get('val_loss', float('inf'))
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -379,7 +364,6 @@ def train_carla_policy():
             
                 print(f"✓ New best model saved with val_loss: {val_loss:.4f}")
             
-                # 记录最佳模型信息到wandb
                 wandb.log({
                     "best_model/epoch": epoch,
                     "best_model/val_loss": val_loss,

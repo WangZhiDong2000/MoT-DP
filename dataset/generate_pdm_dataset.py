@@ -131,13 +131,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         self.device = device
         self.use_gpu_processing = use_gpu_processing and torch.cuda.is_available()
+        self.pred_horizon = pred_horizon
+        self.action_horizon = action_horizon
+        self.obs_horizon = obs_horizon
         
-        # 设置图像变换 - 不进行normalize，保持[0,255]范围
+        # 设置图像变换 - 使用ImageNet标准归一化
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),  # 高度x宽度
-            # 不使用ToTensor()，因为它会normalize到[0,1]
-            # 我们将手动转换为tensor并保持[0,255]范围
-            # 256， 928
+            transforms.ToTensor(),  # 转换为[0,1]并变为CHW格式
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],  # ImageNet均值
+                std=[0.229, 0.224, 0.225]    # ImageNet标准差
+            )
         ])
         
         print(f"Using device: {self.device}")
@@ -162,262 +167,179 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             print(f"Limiting to first {max_files} files...")
             pkl_files = pkl_files[:max_files]
         
-        all_data = []
-        all_episode_data = []  
+
+        self.pkl_files = pkl_files
+        self.file_to_sequences = {}  
+        self.sequence_to_file = []   
+        self.sequence_metadata = []  
         
-        for pkl_file in sorted(pkl_files):
-            print(f"Loading {os.path.basename(pkl_file)}")
+        total_sequences = 0
+        print("Scanning files for sequence indexing...")
+        
+        for file_idx, pkl_file in enumerate(tqdm(pkl_files, desc='Indexing files')):
             with open(pkl_file, 'rb') as f:
                 episode_data = pickle.load(f)
             
-            all_data.extend(episode_data)
-            all_episode_data.append(episode_data)
-        
-        print(f"Total samples loaded: {len(all_data)}")
-        print(f"Episodes: {len(all_episode_data)}")
-        
-        processed_data = {
-            'town_name': [],
-            'speed': [],
-            'command': [],
-            'next_command': [],
-            'target_point': [],
-            'ego_waypoints': [],
-            'rgb_hist_jpg': [],
-        }
-        
-        episode_ends = []
-        current_length = 0
-        
-        for episode_data in all_episode_data:
-            valid_count = 0
-            for item in episode_data:
-                if len(item['ego_waypoints']) >= 1:
-                    valid_count += 1
+            valid_items = [item for item in episode_data if len(item['ego_waypoints']) >= 1]
             
-            if valid_count >= pred_horizon:  # only keep episodes with enough length
-                for item in episode_data:
-                    if len(item['ego_waypoints']) >= 1:
-                        processed_data['town_name'].append(item['town_name'])
-                        processed_data['speed'].append(item['speed'])
-                        processed_data['command'].append(item['command'])
-                        processed_data['next_command'].append(item['next_command'])
-                        processed_data['target_point'].append(item['target_point'])
-                        processed_data['ego_waypoints'].append(item['ego_waypoints'])
-                        
-                        # Only keep the most recent frame
-                        processed_data['rgb_hist_jpg'].append(item['rgb_hist_jpg'][-1])
+            if len(valid_items) >= pred_horizon:
+                file_sequence_count = len(valid_items) - pred_horizon + 1
+                self.file_to_sequences[file_idx] = (total_sequences, total_sequences + file_sequence_count)
                 
-                current_length += valid_count
-                episode_ends.append(current_length)
-        
-        print(f"Valid episodes: {len(episode_ends)}, total samples: {current_length}")
-        
-        # 首先生成agent_pos序列
-        '''
-        训练轨迹生成策略：
-        观测部分 (历史轨迹):
-            Time 0: ego_waypoints[0] = [0,0] (当前位置基准)
-            Time 1: 使用Time 0的ego_waypoints[1] (从0到1的实际移动)
-        预测部分 (使用Time 1的ego_waypoints预测未来):
-            Time 2: ego_waypoints[2] 
-            Time 3: ego_waypoints[3] 
-            Time 4: ego_waypoints[4] 
-            Time 5: ego_waypoints[5] 
-            Time 6: ego_waypoints[6] 
-        '''
-        if current_length >= pred_horizon:
-            agent_pos_sequences = []
-            sequence_data = {
-                'town_name': [],
-                'speed': [],
-                'command': [],
-                'next_command': [],
-                'target_point': [],
-                'ego_waypoints': [],
-                'rgb_hist_jpg': []
-            }
-            episode_ends_for_sequences = []
-            sequence_count = 0
-            
-            for ep_idx, ep_data in enumerate(tqdm(all_episode_data, desc='Processing episodes')):
-                valid_items = [item for item in ep_data if len(item['ego_waypoints']) >= 1]
-                episode_sequence_count = 0
+                for seq_idx in range(file_sequence_count):
+                    self.sequence_to_file.append(file_idx)
+                    self.sequence_metadata.append({
+                        'file_idx': file_idx,
+                        'start_idx': seq_idx,
+                        'global_seq_idx': total_sequences + seq_idx
+                    })
                 
-                if len(valid_items) >= pred_horizon:
-                    for start_idx in range(len(valid_items) - pred_horizon + 1):
-                        sequence_positions = []
-                        
-                        # 观测部分
-                        for obs_step in range(obs_horizon):
-                            if obs_step == 0:
-                                current_pos = np.array([0.0, 0.0])
-                            else:
-                                prev_step_idx = start_idx + obs_step - 1
-                                if prev_step_idx < len(valid_items):
-                                    prev_item = valid_items[prev_step_idx]
-                                    prev_ego_wp = np.array(prev_item['ego_waypoints'])
-                                    if len(prev_ego_wp) > 1:
-                                        current_pos = prev_ego_wp[1].copy()
-                                    else:
-                                        current_pos = np.array([0.0, 0.0])
-                                else:
-                                    current_pos = np.array([0.0, 0.0])
-                            sequence_positions.append(current_pos)
-                        
-                        # 预测部分
-                        last_obs_idx = start_idx + obs_horizon - 1
-                        if last_obs_idx < len(valid_items):
-                            last_obs_item = valid_items[last_obs_idx]
-                            last_ego_wp = np.array(last_obs_item['ego_waypoints'])
-                            
-                            for pred_step in range(action_horizon):
-                                waypoint_idx = pred_step + 2
-                                if len(last_ego_wp) > waypoint_idx:
-                                    pred_pos = last_ego_wp[waypoint_idx].copy()
-                                elif len(last_ego_wp) > 1:
-                                    pred_pos = last_ego_wp[-1].copy()
-                                else:
-                                    pred_pos = np.array([0.0, 0.0])
-                                sequence_positions.append(pred_pos)
-                        else:
-                            for pred_step in range(action_horizon):
-                                sequence_positions.append(np.array([0.0, 0.0]))
-                        
-                        # 计算相对位置
-                        reference_pos = sequence_positions[obs_horizon - 1]
-                        relative_positions = []
-                        for pos in sequence_positions:
-                            relative_pos = pos - reference_pos
-                            relative_positions.append(relative_pos)
-                        
-                        agent_pos_sequences.append(np.array(relative_positions))
-                        
-                        # 转换target_point为相对位置
-                        seq_start_item = valid_items[start_idx]
-                        original_target_point = np.array(seq_start_item['target_point'])
-                        relative_target_point = original_target_point - reference_pos
-                        
-                        # 为这个序列收集对应的数据（使用序列的起始时间步数据）
-                        sequence_data['town_name'].append(seq_start_item['town_name'])
-                        sequence_data['speed'].append(seq_start_item['speed'])
-                        sequence_data['command'].append(seq_start_item['command'])
-                        sequence_data['next_command'].append(seq_start_item['next_command'])
-                        sequence_data['target_point'].append(relative_target_point)  # 使用相对位置
-                        sequence_data['ego_waypoints'].append(seq_start_item['ego_waypoints'])
-                        sequence_data['rgb_hist_jpg'].append(seq_start_item['rgb_hist_jpg'][-1])
-                        
-                        episode_sequence_count += 1
-                        sequence_count += 1
-                
-                if episode_sequence_count > 0:
-                    episode_ends_for_sequences.append(sequence_count)
-            
-            print(f"Generated {len(agent_pos_sequences)} agent_pos sequences")
-            processed_data = sequence_data
-            processed_data['agent_pos'] = agent_pos_sequences
-            episode_ends = episode_ends_for_sequences
-                    
-        else:
-            print("Warning: Not enough samples to create agent_pos sequences")
+                total_sequences += file_sequence_count
+                print(f"File {os.path.basename(pkl_file)}: {file_sequence_count} sequences")
         
-        for key in ['speed', 'command', 'next_command', 'target_point', 'ego_waypoints']:
-            processed_data[key] = np.array(processed_data[key])
-        
-        processed_data['agent_pos'] = np.array(processed_data['agent_pos'])  # shape: (N, pred_horizon, 2)
-        
-        # GPU加速的图像处理
-        image_data = []
-        image_orig_shape = []
-        
-        if self.use_gpu_processing:
-            print(f"Processing {len(processed_data['rgb_hist_jpg'])} images on GPU...")
-            batch_size = 32  
-            for i in range(0, len(processed_data['rgb_hist_jpg']), batch_size):
-                end_idx = min(i + batch_size, len(processed_data['rgb_hist_jpg']))
-                batch_imgs = []
-                batch_orig_shapes = []
-                
-                for j in range(i, end_idx):
-                    img_bytes = processed_data['rgb_hist_jpg'][j]
-                    img = Image.open(io.BytesIO(img_bytes))
-                    batch_orig_shapes.append(img.size)
-                    
-                    # 使用torchvision变换（只resize，不normalize）
-                    img_resized = self.image_transform(img)  # PIL Image
-                    img_tensor = TF.to_tensor(img_resized) * 255.0  # (C, H, W), [0,255]
-                    batch_imgs.append(img_tensor)
-                
-                if batch_imgs:
-                    batch_tensor = torch.stack(batch_imgs).to(self.device)  # (B, C, H, W)
-                    batch_numpy = batch_tensor.cpu().numpy()
-                    
-                    for k in range(batch_numpy.shape[0]):
-                        image_data.append(batch_numpy[k])
-                    
-                    image_orig_shape.extend(batch_orig_shapes)
-                
-                if (i // batch_size) % 10 == 0:
-                    print(f"  Processed {end_idx}/{len(processed_data['rgb_hist_jpg'])} images")
-        else:
-            print("Processing images on CPU...")
-            for i, img_bytes in enumerate(tqdm(processed_data['rgb_hist_jpg'], desc='Processing images')):
-                img = Image.open(io.BytesIO(img_bytes))
-                image_orig_shape.append(img.size)  
-                
-                img_resized = self.image_transform(img)  
-                img_tensor = TF.to_tensor(img_resized) * 255.0  # (C, H, W), [0,255]
-                image_data.append(img_tensor.numpy())
-        
-        processed_data['image'] = np.array(image_data)
-        processed_data['image_orig_shape'] = np.array(image_orig_shape)  
+        print(f"Total sequences available: {total_sequences}")
         
 
-        episode_ends = np.array(episode_ends)
-        indices = create_sample_indices_no_padding(
+        self.total_sequences = total_sequences
+        episode_ends = np.array([total_sequences])
+        
+        self.indices = create_sample_indices_no_padding(
             episode_ends=episode_ends,
-            sequence_length=pred_horizon)
+            sequence_length=1)  
 
-        # 只对速度做归一化（除以12），其余特征全部使用原始值
-        processed_data['speed'] = np.array(processed_data['speed']) / 12.0
+        self._file_cache = {}
+        self._cache_size = 3 
 
-        self.indices = indices
-        self.data = processed_data
-        self.pred_horizon = pred_horizon
-        self.action_horizon = action_horizon
-        self.obs_horizon = obs_horizon
+    def _load_file_data(self, file_idx):
 
-      
+        if file_idx in self._file_cache:
+            return self._file_cache[file_idx]
+        
+        if len(self._file_cache) >= self._cache_size:
+            oldest_key = next(iter(self._file_cache))
+            del self._file_cache[oldest_key]
+        
+        pkl_file = self.pkl_files[file_idx]
+        with open(pkl_file, 'rb') as f:
+            episode_data = pickle.load(f)
+        
+        valid_items = [item for item in episode_data if len(item['ego_waypoints']) >= 1]
+        
+        sequences_data = []
+        if len(valid_items) >= self.pred_horizon:
+            for start_idx in range(len(valid_items) - self.pred_horizon + 1):
+                sequence_positions = []
+                
+                # 观测部分
+                for obs_step in range(self.obs_horizon):
+                    if obs_step == 0:
+                        current_pos = np.array([0.0, 0.0])
+                    else:
+                        prev_step_idx = start_idx + obs_step - 1
+                        if prev_step_idx < len(valid_items):
+                            prev_item = valid_items[prev_step_idx]
+                            prev_ego_wp = np.array(prev_item['ego_waypoints'])
+                            if len(prev_ego_wp) > 1:
+                                current_pos = prev_ego_wp[1].copy()
+                            else:
+                                current_pos = np.array([0.0, 0.0])
+                        else:
+                            current_pos = np.array([0.0, 0.0])
+                    sequence_positions.append(current_pos)
+                
+                # 预测部分
+                last_obs_idx = start_idx + self.obs_horizon - 1
+                if last_obs_idx < len(valid_items):
+                    last_obs_item = valid_items[last_obs_idx]
+                    last_ego_wp = np.array(last_obs_item['ego_waypoints'])
+                    
+                    for pred_step in range(self.action_horizon):
+                        waypoint_idx = pred_step + 2
+                        if len(last_ego_wp) > waypoint_idx:
+                            pred_pos = last_ego_wp[waypoint_idx].copy()
+                        elif len(last_ego_wp) > 1:
+                            pred_pos = last_ego_wp[-1].copy()
+                        else:
+                            pred_pos = np.array([0.0, 0.0])
+                        sequence_positions.append(pred_pos)
+                else:
+                    for pred_step in range(self.action_horizon):
+                        sequence_positions.append(np.array([0.0, 0.0]))
+                
+                # 计算相对位置
+                reference_pos = sequence_positions[self.obs_horizon - 1]
+                relative_positions = []
+                for pos in sequence_positions:
+                    relative_pos = pos - reference_pos
+                    relative_positions.append(relative_pos)
+                
+                agent_pos = np.array(relative_positions)
+                
+                # 转换target_point为相对位置
+                seq_start_item = valid_items[start_idx]
+                original_target_point = np.array(seq_start_item['target_point'])
+                relative_target_point = original_target_point - reference_pos
+                
+                # 处理图像 - image_transform已包含Resize + ToTensor + Normalize
+                img_bytes = seq_start_item['rgb_hist_jpg'][-1]
+                img = Image.open(io.BytesIO(img_bytes))
+                img_tensor = self.image_transform(img)  # 返回已归一化的tensor (C, H, W)
+                img_data = img_tensor.numpy()  # 转换为numpy以便缓存
+                
+                # 构建序列数据
+                sequence_data = {
+                    'town_name': seq_start_item['town_name'],
+                    'speed': seq_start_item['speed'] / 12.0,  # 归一化
+                    'command': np.array(seq_start_item['command']),
+                    'next_command': np.array(seq_start_item['next_command']),
+                    'target_point': relative_target_point,
+                    'ego_waypoints': seq_start_item['ego_waypoints'],
+                    'image': img_data,
+                    'image_orig_shape': np.array(img.size),
+                    'agent_pos': agent_pos
+                }
+                
+                sequences_data.append(sequence_data)
+        
+        self._file_cache[file_idx] = sequences_data
+        return sequences_data
+
 
     def __len__(self):
-        return len(self.indices)
+        return self.total_sequences
 
     def __getitem__(self, idx):
-        # get the start/end indices for this datapoint
-        buffer_start_idx, buffer_end_idx, \
-            sample_start_idx, sample_end_idx = self.indices[idx]
 
-        sample = sample_sequence(
-            train_data=self.data,
-            sequence_length=self.pred_horizon,
-            buffer_start_idx=buffer_start_idx,
-            buffer_end_idx=buffer_end_idx,
-            sample_start_idx=sample_start_idx,
-            sample_end_idx=sample_end_idx
-        )
-
-        if 'image_orig_shape' in sample:
-            sample['image_orig_shape'] = torch.tensor(sample['image_orig_shape'], dtype=torch.int32)
+        metadata = self.sequence_metadata[idx]
+        file_idx = metadata['file_idx']
+        start_idx = metadata['start_idx']
+        
+        file_sequences = self._load_file_data(file_idx)
+        
+        if start_idx < len(file_sequences):
+            sequence_data = file_sequences[start_idx]
         else:
-            sample['image_orig_shape'] = torch.zeros((self.obs_horizon, 2), dtype=torch.int32)
-
-        # 对于条件数据，只保留观测部分
-        sample['image'] = sample['image'][:self.obs_horizon,:]
-        sample['image_orig_shape'] = sample['image_orig_shape'][:self.obs_horizon,:]
-        sample['speed'] = sample['speed'][:self.obs_horizon]
-        sample['command'] = sample['command'][:self.obs_horizon,:]
-        sample['next_command'] = sample['next_command'][:self.obs_horizon,:]
-        sample['target_point'] = sample['target_point'][:self.obs_horizon,:]
+            raise IndexError(f"Sequence index {start_idx} out of range for file {file_idx}")
+        
+        sample = {
+            'town_name': sequence_data['town_name'],
+            'speed': np.repeat(sequence_data['speed'], self.obs_horizon),  
+            'command': np.tile(sequence_data['command'], (self.obs_horizon, 1)),
+            'next_command': np.tile(sequence_data['next_command'], (self.obs_horizon, 1)),
+            'target_point': np.tile(sequence_data['target_point'], (self.obs_horizon, 1)),
+            'ego_waypoints': sequence_data['ego_waypoints'],
+            'image': np.tile(sequence_data['image'], (self.obs_horizon, 1, 1, 1)),  
+            'image_orig_shape': np.tile(sequence_data['image_orig_shape'], (self.obs_horizon, 1)),
+            'agent_pos': sequence_data['agent_pos']  
+        }
+        
+        for key in ['speed', 'command', 'next_command', 'target_point', 'image', 'image_orig_shape', 'agent_pos']:
+            if key in sample:
+                if isinstance(sample[key], np.ndarray):
+                    sample[key] = torch.from_numpy(sample[key]).float()
+                    if key == 'image_orig_shape':
+                        sample[key] = sample[key].int()
+        
         return sample
 
   
@@ -445,11 +367,13 @@ def test():
             rand_idx = random.choice(all_samples)
             rand_sample = dataset[rand_idx]
             print(f"\n随机选择的样本索引: {rand_idx}")
-            # agent_pos 可视化
             agent_pos = rand_sample['agent_pos'] if 'agent_pos' in rand_sample else None
             target_point = rand_sample['target_point'] if 'target_point' in rand_sample else None
             
             if agent_pos is not None:
+                if isinstance(agent_pos, torch.Tensor):
+                    agent_pos = agent_pos.numpy()
+                
                 if agent_pos.ndim == 3 and agent_pos.shape[1] == 1:
                     agent_pos = agent_pos.squeeze(1)
                 obs_agent_pos = agent_pos[:obs_horizon]
@@ -457,26 +381,24 @@ def test():
                 
                 plt.figure(figsize=(10, 8))
                 
-                # 绘制观测点
                 if len(obs_agent_pos) > 0:
                     plt.plot(obs_agent_pos[:, 1], obs_agent_pos[:, 0], 'bo-', label='Observed agent_pos', markersize=8, linewidth=2)
-                
-                # 绘制预测点
+
                 if len(pred_agent_pos) > 0:
                     plt.plot(pred_agent_pos[:, 1], pred_agent_pos[:, 0], 'ro--', label='Predicted agent_pos', markersize=8, linewidth=2)
                 
-                # 绘制target_point（相对于最后观测位置）
                 if target_point is not None:
-                    if target_point.ndim == 2:  # 如果是序列格式，取第一个
+                    if isinstance(target_point, torch.Tensor):
+                        target_point = target_point.numpy()
+                    
+                    if target_point.ndim == 2: 
                         target_point = target_point[0]
                     plt.plot(target_point[1], target_point[0], 'g*', markersize=15, label='Target point (relative)', markeredgecolor='black', markeredgewidth=1)
                     
-                    # 从最后观测点到目标点画一条虚线
                     if len(obs_agent_pos) > 0:
                         last_obs = obs_agent_pos[-1]
                         plt.plot([last_obs[1], target_point[1]], [last_obs[0], target_point[0]], 'g--', alpha=0.5, linewidth=1, label='Direction to target')
                 
-                # 标记最后一个观测点（参考原点）
                 if len(obs_agent_pos) > 0:
                     last_obs = obs_agent_pos[-1]
                     plt.plot(last_obs[1], last_obs[0], 'ks', markersize=10, label='Reference point (last obs)', markerfacecolor='yellow', markeredgecolor='black')
@@ -499,17 +421,30 @@ def test():
                     if len(obs_agent_pos) > 0:
                         distance_to_target = np.linalg.norm(target_point - obs_agent_pos[-1])
                         print(f"目标点距离最后观测点的距离: {distance_to_target:.3f}")
-            # image 可视化
+
             if 'image' in rand_sample:
-                images = rand_sample['image'] # shape: (obs_horizon, C, H, W)
+                images = rand_sample['image'] 
+                
+                # ImageNet反归一化
+                mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+                std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+                
                 for t, img_arr in enumerate(images):
-                    if img_arr.shape[0] == 3:  # (C, H, W)
-                        img_vis = np.moveaxis(img_arr, 0, -1).astype(np.uint8)
+                    if isinstance(img_arr, torch.Tensor):
+                        img_arr = img_arr.numpy()
+                    
+                    # 反归一化：denormalized = normalized * std + mean
+                    img_denorm = img_arr * std + mean
+                    img_denorm = np.clip(img_denorm, 0, 1)
+                    
+                    if img_denorm.shape[0] == 3:  # (C, H, W) -> (H, W, C)
+                        img_vis = np.moveaxis(img_denorm, 0, -1)
                     else:
-                        img_vis = img_arr.astype(np.uint8)
+                        img_vis = img_denorm
+                    
                     plt.figure(figsize=(8, 2))
                     plt.imshow(img_vis)
-                    plt.title(f'Random Sample {rand_idx} - Obs Image t={t}')
+                    plt.title(f'Random Sample {rand_idx} - Obs Image t={t} (Denormalized)')
                     plt.axis('off')
                     plt.tight_layout()
                     plt.savefig(f'/home/wang/projects/diffusion_policy_z/sample_{rand_idx}_obs_image_t{t}.png', dpi=150, bbox_inches='tight')
