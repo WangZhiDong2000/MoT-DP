@@ -127,13 +127,17 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  train_split: float = 0.8,  
                  mode: str = 'train',
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-                 use_gpu_processing: bool = True):  
+                 use_gpu_processing: bool = True,
+                 sample_interval: int = 2):  
 
         self.device = device
         self.use_gpu_processing = use_gpu_processing and torch.cuda.is_available()
         self.pred_horizon = pred_horizon
         self.action_horizon = action_horizon
         self.obs_horizon = obs_horizon
+        self.sample_interval = sample_interval  
+        
+        
         
         # 设置图像变换 - 使用ImageNet标准归一化
         self.image_transform = transforms.Compose([
@@ -176,26 +180,42 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         total_sequences = 0
         print("Scanning files for sequence indexing...")
         
+        corrupted_files = []
         for file_idx, pkl_file in enumerate(tqdm(pkl_files, desc='Indexing files')):
-            with open(pkl_file, 'rb') as f:
-                episode_data = pickle.load(f)
-            
-            valid_items = [item for item in episode_data if len(item['ego_waypoints']) >= 1]
-            
-            if len(valid_items) >= pred_horizon:
-                file_sequence_count = len(valid_items) - pred_horizon + 1
-                self.file_to_sequences[file_idx] = (total_sequences, total_sequences + file_sequence_count)
+            try:
+                with open(pkl_file, 'rb') as f:
+                    episode_data = pickle.load(f)
                 
-                for seq_idx in range(file_sequence_count):
-                    self.sequence_to_file.append(file_idx)
-                    self.sequence_metadata.append({
-                        'file_idx': file_idx,
-                        'start_idx': seq_idx,
-                        'global_seq_idx': total_sequences + seq_idx
-                    })
+                # 应用采样间隔进行降采样
+                episode_data = episode_data[::self.sample_interval]
                 
-                total_sequences += file_sequence_count
-                print(f"File {os.path.basename(pkl_file)}: {file_sequence_count} sequences")
+                valid_items = [item for item in episode_data if len(item['ego_waypoints']) >= 1]
+                
+                if len(valid_items) >= pred_horizon:
+                    file_sequence_count = len(valid_items) - pred_horizon + 1
+                    self.file_to_sequences[file_idx] = (total_sequences, total_sequences + file_sequence_count)
+                    
+                    for seq_idx in range(file_sequence_count):
+                        self.sequence_to_file.append(file_idx)
+                        self.sequence_metadata.append({
+                            'file_idx': file_idx,
+                            'start_idx': seq_idx,
+                            'global_seq_idx': total_sequences + seq_idx
+                        })
+                    
+                    total_sequences += file_sequence_count
+                    # print(f"File {os.path.basename(pkl_file)}: {file_sequence_count} sequences")
+            except (pickle.UnpicklingError, EOFError, Exception) as e:
+                print(f"Warning: Skipping corrupted file {os.path.basename(pkl_file)}: {e}")
+                corrupted_files.append(pkl_file)
+                continue
+        
+        if corrupted_files:
+            print(f"\n⚠️ Skipped {len(corrupted_files)} corrupted files:")
+            for f in corrupted_files[:5]:  # 只显示前5个
+                print(f"  - {os.path.basename(f)}")
+            if len(corrupted_files) > 5:
+                print(f"  ... and {len(corrupted_files) - 5} more")
         
         print(f"Total sequences available: {total_sequences}")
         
@@ -220,10 +240,19 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             del self._file_cache[oldest_key]
         
         pkl_file = self.pkl_files[file_idx]
-        with open(pkl_file, 'rb') as f:
-            episode_data = pickle.load(f)
-        
-        valid_items = [item for item in episode_data if len(item['ego_waypoints']) >= 1]
+        try:
+            with open(pkl_file, 'rb') as f:
+                episode_data = pickle.load(f)
+            
+            # 应用采样间隔进行降采样
+            episode_data = episode_data[::self.sample_interval]
+            
+            valid_items = [item for item in episode_data if len(item['ego_waypoints']) >= 1]
+        except (pickle.UnpicklingError, EOFError, Exception) as e:
+            print(f"Error loading file {os.path.basename(pkl_file)}: {e}")
+            # 返回空列表，避免崩溃
+            self._file_cache[file_idx] = []
+            return []
         
         sequences_data = []
         if len(valid_items) >= self.pred_horizon:
@@ -348,16 +377,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
        
 def test():
     import random
-    dataset_path = '/home/wang/projects/diffusion_policy_z/data/tmp_data'
+    dataset_path = '/home/wang/dataset/pkl/tmp_data'
     pred_horizon = 7  # 总的序列长度（包含观测+预测）
     obs_horizon = 2   # 观测的时间步数
     action_horizon = 5  # 动作预测的时间步数
+    sample_interval = 2  #
     dataset = CARLAImageDataset(
             dataset_path=dataset_path,
             pred_horizon=pred_horizon,
             obs_horizon=obs_horizon,
             action_horizon=action_horizon,
-            max_files=10
+            max_files=10,
+            sample_interval=sample_interval
         )
     if True:
         print(f"\n总样本数: {len(dataset)}")

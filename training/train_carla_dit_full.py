@@ -25,19 +25,43 @@ def compute_action_stats(train_dataset):
     print("Computing action statistics from training dataset...")
     all_actions = []
     
-    sample_size = min(5, len(train_dataset))
+    if len(train_dataset) == 0:
+        print("Warning: Dataset is empty! Using default statistics.")
+        return {
+            'min': np.array([-10.0, -10.0]),
+            'max': np.array([10.0, 10.0]),
+            'mean': np.array([0.0, 0.0]),
+            'std': np.array([1.0, 1.0])
+        }
+    
+    sample_size = min(50, len(train_dataset))
     indices = np.random.choice(len(train_dataset), sample_size, replace=False)
     
+    print(f"Sampling {sample_size} trajectories from {len(train_dataset)} total samples...")
+    
     for i in tqdm(indices, desc="Collecting action samples"):
-        sample = train_dataset[i]
-        agent_pos = sample['agent_pos']  # shape: (sequence_length, 2)
-        
-        if isinstance(agent_pos, torch.Tensor):
-            agent_pos = agent_pos.numpy()
-        
-        obs_horizon = train_dataset.obs_horizon
-        actions = agent_pos[obs_horizon:]  # shape: (action_horizon, 2)
-        all_actions.append(actions)
+        try:
+            sample = train_dataset[i]
+            agent_pos = sample['agent_pos']  # shape: (sequence_length, 2)
+            
+            if isinstance(agent_pos, torch.Tensor):
+                agent_pos = agent_pos.numpy()
+            
+            obs_horizon = train_dataset.obs_horizon
+            actions = agent_pos[obs_horizon:]  # shape: (action_horizon, 2)
+            all_actions.append(actions)
+        except Exception as e:
+            print(f"Warning: Failed to load sample {i}: {e}")
+            continue
+    
+    if len(all_actions) == 0:
+        print("Warning: No valid actions collected! Using default statistics.")
+        return {
+            'min': np.array([-10.0, -10.0]),
+            'max': np.array([10.0, 10.0]),
+            'mean': np.array([0.0, 0.0]),
+            'std': np.array([1.0, 1.0])
+        }
     
     all_actions = np.concatenate(all_actions, axis=0)  # shape: (N * action_horizon, 2)
     
@@ -185,12 +209,14 @@ def train_carla_policy():
         }
     )
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset_path = config.get('training', {}).get('dataset_path', "/home/wang/projects/diffusion_policy_z/data/tmp_data")
+    dataset_path = config.get('training', {}).get('dataset_path', "/home/wang/dataset/pkl/tmp_data")
     pred_horizon = config.get('pred_horizon', 6)
     obs_horizon = config.get('obs_horizon', 2)
     action_horizon = config.get('action_horizon', 4)
+    sample_interval = config.get('training', {}).get('sample_interval', 5)  # 新增：从配置读取采样间隔
     max_files = None # 设置为 None 以加载所有数据文件
     print(f"Loading CARLA dataset from {dataset_path}")
+    print(f"Sample interval: {sample_interval}")
     
     train_dataset = CARLAImageDataset(
         dataset_path=dataset_path,
@@ -201,7 +227,8 @@ def train_carla_policy():
         train_split=0.8,
         mode='train',
         device=device,
-        use_gpu_processing=True
+        use_gpu_processing=True,
+        sample_interval=sample_interval  # 新增：传入采样间隔
     )
     
     val_dataset = CARLAImageDataset(
@@ -213,11 +240,13 @@ def train_carla_policy():
         train_split=0.8,
         mode='val',
         device=device,
-        use_gpu_processing=True
+        use_gpu_processing=True,
+        sample_interval=sample_interval  # 新增：传入采样间隔
     )
     
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
+    
     
     action_stats = None
     if config.get('enable_action_normalization', False):
@@ -244,13 +273,15 @@ def train_carla_policy():
         pin_memory=True
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    val_loader = None
+    if len(val_dataset) > 0:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True
+        )
     
     print("Initializing policy model...")
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
