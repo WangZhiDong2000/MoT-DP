@@ -1,6 +1,6 @@
 
 dataloader:
-  batch_size: 16       
+  batch_size: 32       
   num_workers: 4       
   persistent_workers: true
   pin_memory: true
@@ -99,7 +99,8 @@ noise_scheduler:
 training:
   num_epochs: 300            
   max_grad_norm: 1.0        
-  dataset_path: "/home/wang/projects/diffusion_policy_z/data/tmp_data"  
+  dataset_path: '/home/wang/dataset/pkl/tmp_data'
+  sample_interval: 2         
   lr_final: 1e-7           
   validation_freq: 5      # 每10个epoch进行一次验证
   save_freq: 5            # 每5个epoch保存一次模型
