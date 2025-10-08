@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch.nn.functional as F
 from collections import defaultdict
+import time
+import psutil
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 from dataset.generate_pdm_dataset import CARLAImageDataset
@@ -34,7 +36,7 @@ def compute_action_stats(train_dataset):
             'std': np.array([1.0, 1.0])
         }
     
-    sample_size = min(50, len(train_dataset))
+    sample_size = min(30, len(train_dataset))
     indices = np.random.choice(len(train_dataset), sample_size, replace=False)
     
     print(f"Sampling {sample_size} trajectories from {len(train_dataset)} total samples...")
@@ -189,7 +191,29 @@ def validate_model(policy, val_loader, device):
     return averaged_metrics
 
 def train_carla_policy():
+    print("="*80)
     print("Initializing CARLA driving policy training...")
+    print("="*80)
+    
+    # 获取初始内存状态
+    process = psutil.Process(os.getpid())
+    initial_memory = process.memory_info().rss / 1024 / 1024 / 1024  # GB
+    
+    # 检查系统总内存
+    system_memory = psutil.virtual_memory()
+    total_memory_gb = system_memory.total / 1024 / 1024 / 1024
+    available_memory_gb = system_memory.available / 1024 / 1024 / 1024
+    
+    print(f"System total memory: {total_memory_gb:.2f} GB")
+    print(f"Available memory: {available_memory_gb:.2f} GB")
+    print(f"Initial process memory: {initial_memory:.2f} GB")
+    
+    if available_memory_gb < 20:
+        print(f"\n⚠️⚠️⚠️  CRITICAL MEMORY WARNING  ⚠️⚠️⚠️")
+        print(f"Available memory is low ({available_memory_gb:.1f} GB)")
+        print(f"Training with large datasets may fail!")
+        print(f"Please free up memory or reduce dataset size.")
+    
     config = create_carla_config()
     wandb.init(
         project=config.get('logging', {}).get('wandb_project', "carla-diffusion-policy"),
@@ -215,8 +239,20 @@ def train_carla_policy():
     action_horizon = config.get('action_horizon', 4)
     sample_interval = config.get('training', {}).get('sample_interval', 5)  # 新增：从配置读取采样间隔
     max_files = None # 设置为 None 以加载所有数据文件
-    print(f"Loading CARLA dataset from {dataset_path}")
-    print(f"Sample interval: {sample_interval}")
+    
+    print(f"\n{'='*80}")
+    print(f"DATASET CONFIGURATION:")
+    print(f"  Dataset path: {dataset_path}")
+    print(f"  Sample interval: {sample_interval}")
+    print(f"  Max files: {max_files if max_files else 'ALL (no limit)'}")
+    print(f"  Pred horizon: {pred_horizon}")
+    print(f"  Obs horizon: {obs_horizon}")
+    print(f"  Action horizon: {action_horizon}")
+    print(f"{'='*80}\n")
+    
+    # 开始加载训练数据集
+    print(f"[{time.strftime('%H:%M:%S')}] Loading training dataset...")
+    dataset_load_start = time.time()
     
     train_dataset = CARLAImageDataset(
         dataset_path=dataset_path,
@@ -231,6 +267,14 @@ def train_carla_policy():
         sample_interval=sample_interval  # 新增：传入采样间隔
     )
     
+    dataset_load_time = time.time() - dataset_load_start
+    current_memory = process.memory_info().rss / 1024 / 1024 / 1024
+    print(f"\n[{time.strftime('%H:%M:%S')}] Training dataset loaded in {dataset_load_time:.1f} seconds")
+    print(f"Memory usage after loading train dataset: {current_memory:.2f} GB (Δ {current_memory - initial_memory:.2f} GB)")
+    
+    print(f"\n[{time.strftime('%H:%M:%S')}] Loading validation dataset...")
+    val_load_start = time.time()
+    
     val_dataset = CARLAImageDataset(
         dataset_path=dataset_path,
         pred_horizon=pred_horizon,
@@ -244,8 +288,14 @@ def train_carla_policy():
         sample_interval=sample_interval  # 新增：传入采样间隔
     )
     
-    print(f"Training samples: {len(train_dataset)}")
+    val_load_time = time.time() - val_load_start
+    current_memory = process.memory_info().rss / 1024 / 1024 / 1024
+    print(f"[{time.strftime('%H:%M:%S')}] Validation dataset loaded in {val_load_time:.1f} seconds")
+    print(f"Memory usage after loading val dataset: {current_memory:.2f} GB (Δ {current_memory - initial_memory:.2f} GB)")
+    
+    print(f"\nTraining samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
+
     
     
     action_stats = None
@@ -265,6 +315,50 @@ def train_carla_policy():
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
     
+    print(f"\n{'='*80}")
+    print(f"DATALOADER CONFIGURATION:")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Num workers: {num_workers}")
+    
+    # 计算预估内存占用
+    estimated_worker_memory = current_memory * num_workers  # 每个worker会fork主进程
+    print(f"\n  ⚠️  IMPORTANT: DataLoader Memory Warning")
+    print(f"  Current process memory: {current_memory:.2f} GB")
+    print(f"  Each worker will fork the main process")
+    print(f"  Estimated peak memory (worst case): ~{current_memory + estimated_worker_memory:.1f} GB")
+    
+    if num_workers > 2 and current_memory > 10:
+        print(f"\n  ⚠️⚠️⚠️  CRITICAL WARNING  ⚠️⚠️⚠️")
+        print(f"  High memory usage ({current_memory:.1f} GB) + multiple workers ({num_workers})")
+        print(f"  This may cause:")
+        print(f"    1. System running out of memory")
+        print(f"    2. Workers killed by OOM (Out Of Memory) killer")
+        print(f"    3. RuntimeError: DataLoader worker is killed by signal")
+        print(f"    4. Very slow DataLoader initialization (5-30 minutes)")
+        print(f"    5. Training startup hanging/freezing")
+        print(f"  ")
+        print(f"  RECOMMENDATIONS:")
+        print(f"    - Set num_workers=0 in config (MOST IMPORTANT!)")
+        print(f"    - Reduce batch_size (current: {batch_size})")
+        print(f"    - Use smaller dataset (increase sample_interval or set max_files)")
+        print(f"  ")
+        print(f"  🔴 High probability of worker being killed!")
+        print(f"  🔴 Change num_workers to 0 and restart training!")
+    elif num_workers > 0 and current_memory > 5:
+        print(f"\n  ⚠️  WARNING: Memory usage is moderate ({current_memory:.1f} GB)")
+        print(f"  With {num_workers} workers, peak memory may reach ~{current_memory * (1 + num_workers):.1f} GB")
+        print(f"  If you see 'DataLoader worker killed' errors:")
+        print(f"    - Set num_workers=0 in config")
+        print(f"    - This will solve the OOM issue")
+    elif num_workers > 0:
+        print(f"\n  Note: Worker initialization may take 1-5 minutes with large datasets")
+        print(f"        Please be patient during first batch loading...")
+    
+    print(f"{'='*80}\n")
+    
+    print(f"[{time.strftime('%H:%M:%S')}] Creating DataLoader for training...")
+    dataloader_create_start = time.time()
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
@@ -273,8 +367,12 @@ def train_carla_policy():
         pin_memory=True
     )
     
+    dataloader_create_time = time.time() - dataloader_create_start
+    print(f"[{time.strftime('%H:%M:%S')}] DataLoader created in {dataloader_create_time:.1f} seconds")
+    
     val_loader = None
     if len(val_dataset) > 0:
+        print(f"[{time.strftime('%H:%M:%S')}] Creating DataLoader for validation...")
         val_loader = DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -282,56 +380,116 @@ def train_carla_policy():
             num_workers=num_workers,
             pin_memory=True
         )
+        print(f"[{time.strftime('%H:%M:%S')}] Validation DataLoader created")
     
-    print("Initializing policy model...")
+    print(f"\n[{time.strftime('%H:%M:%S')}] Initializing policy model...")
+    model_init_start = time.time()
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
-    print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
     
-    print("\n=== Checking data statistics ===")
-    sample_batch = next(iter(train_loader))
-    print(f"Sample agent_pos shape: {sample_batch['agent_pos'].shape}")
-    print(f"Sample agent_pos range: [{sample_batch['agent_pos'].min():.4f}, {sample_batch['agent_pos'].max():.4f}]")
-    print(f"Sample agent_pos mean: {sample_batch['agent_pos'].mean():.4f}, std: {sample_batch['agent_pos'].std():.4f}")
-    print(f"First sample agent_pos:\n{sample_batch['agent_pos'][0]}")
-    print("===================================\n")
+    model_init_time = time.time() - model_init_start
+    current_memory = process.memory_info().rss / 1024 / 1024 / 1024
+    print(f"[{time.strftime('%H:%M:%S')}] Policy model initialized in {model_init_time:.1f} seconds")
+    print(f"Memory usage after model init: {current_memory:.2f} GB")
+    print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
+
+    
+    # print("\n=== Checking data statistics ===")
+    # sample_batch = next(iter(train_loader))
+    # print(f"Sample agent_pos shape: {sample_batch['agent_pos'].shape}")
+    # print(f"Sample agent_pos range: [{sample_batch['agent_pos'].min():.4f}, {sample_batch['agent_pos'].max():.4f}]")
+    # print(f"Sample agent_pos mean: {sample_batch['agent_pos'].mean():.4f}, std: {sample_batch['agent_pos'].std():.4f}")
+    # print(f"First sample agent_pos:\n{sample_batch['agent_pos'][0]}")
+    # print("===================================\n")
     
     lr = config.get('optimizer', {}).get('lr', 5e-5)
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
-    print("Starting training loop...")
+    
+    print(f"\n{'='*80}")
+    print(f"[{time.strftime('%H:%M:%S')}] STARTING TRAINING LOOP")
+    print(f"{'='*80}")
+    print(f"\n⏳ Loading first batch from DataLoader...")
+    print(f"   This is where the training often gets stuck with large datasets!")
+    print(f"   Worker processes are being initialized and forked...")
+    print(f"   Expected time: {num_workers * 30 if num_workers > 0 else 5}-{num_workers * 120 if num_workers > 0 else 30} seconds")
+    print(f"   Please be patient...\n")
     
 
     num_epochs = config.get('training', {}).get('num_epochs', 50)
-    best_val_loss = float('inf') 
+    best_val_loss = float('inf')
+    
+    first_batch_loaded = False
+    first_batch_time = None
+    
     for epoch in range(num_epochs):
         policy.train()
         train_losses = []
 
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
-        print("Training...")
+        print(f"\n{'='*80}")
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        print(f"{'='*80}")
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device)
-            
-            optimizer.zero_grad()
-            loss = policy.compute_loss(batch)
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-            
-            if batch_idx % 10 == 0:
-                step = epoch * len(train_loader) + batch_idx
-                wandb.log({
-                    "train/loss_step": loss.item(),
-                    "train/epoch": epoch,
-                    "train/step": step,
-                    "train/learning_rate": optimizer.param_groups[0]['lr'],
-                    "train/batch_idx": batch_idx
-                })
+        if not first_batch_loaded:
+            print(f"[{time.strftime('%H:%M:%S')}] ⏳ Initializing DataLoader iterator...")
+            print(f"   (This will spawn {num_workers} worker processes)")
+            iter_start_time = time.time()
+        
+        try:
+            for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
+                if not first_batch_loaded:
+                    first_batch_time = time.time() - iter_start_time
+                    current_memory = process.memory_info().rss / 1024 / 1024 / 1024
+                    print(f"\n✓ First batch loaded successfully!")
+                    print(f"   Time taken: {first_batch_time:.1f} seconds")
+                    print(f"   Memory usage: {current_memory:.2f} GB")
+                    print(f"   Training will now proceed normally...\n")
+                    first_batch_loaded = True
                 
-                print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(device)
+                
+                optimizer.zero_grad()
+                loss = policy.compute_loss(batch)
+                loss.backward()
+                optimizer.step()
+                train_losses.append(loss.item())
+                
+                if batch_idx % 10 == 0:
+                    step = epoch * len(train_loader) + batch_idx
+                    wandb.log({
+                        "train/loss_step": loss.item(),
+                        "train/epoch": epoch,
+                        "train/step": step,
+                        "train/learning_rate": optimizer.param_groups[0]['lr'],
+                        "train/batch_idx": batch_idx
+                    })
+                    
+                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+        
+        except RuntimeError as e:
+            if "DataLoader worker" in str(e) and "killed" in str(e):
+                print(f"\n{'='*80}")
+                print(f"❌ ERROR: DataLoader worker was killed!")
+                print(f"{'='*80}")
+                print(f"\n🔴 This is an Out-Of-Memory (OOM) error!")
+                print(f"The system killed the worker process because it ran out of memory.\n")
+                print(f"SOLUTION:")
+                print(f"1. Open config/carla.yaml")
+                print(f"2. Find the 'dataloader' section")
+                print(f"3. Change 'num_workers' to 0:")
+                print(f"   dataloader:")
+                print(f"     batch_size: {batch_size}")
+                print(f"     num_workers: 0  # <- Change this!\n")
+                print(f"4. Restart training\n")
+                print(f"Alternative solutions:")
+                print(f"  - Increase sample_interval to reduce dataset size")
+                print(f"  - Set max_files to limit number of files loaded")
+                print(f"  - Reduce batch_size")
+                print(f"{'='*80}\n")
+                raise
+            else:
+                raise
         
 
         avg_train_loss = np.mean(train_losses)

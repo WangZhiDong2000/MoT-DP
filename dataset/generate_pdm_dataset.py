@@ -11,7 +11,7 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
-
+import time
 
 
 def create_sample_indices(
@@ -128,14 +128,16 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                  mode: str = 'train',
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
                  use_gpu_processing: bool = True,
-                 sample_interval: int = 2):  
+                 sample_interval: int = 2,
+                 image_base_path: str = None):  # 新增：图像文件的基础路径
 
         self.device = device
         self.use_gpu_processing = use_gpu_processing and torch.cuda.is_available()
         self.pred_horizon = pred_horizon
         self.action_horizon = action_horizon
         self.obs_horizon = obs_horizon
-        self.sample_interval = sample_interval  
+        self.sample_interval = sample_interval
+        self.image_base_path = image_base_path  # 保存图像基础路径
         
         
         
@@ -153,7 +155,16 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         print(f"GPU image processing: {self.use_gpu_processing}")
 
         pkl_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
+        print(f"\n{'='*60}")
         print(f"Found {len(pkl_files)} PKL files")
+        
+        # 警告：文件数量过多可能导致初始化时间很长
+        if len(pkl_files) > 100:
+            print(f"\n⚠️  WARNING: Large number of files detected!")
+            print(f"   - Indexing {len(pkl_files)} files may take several minutes")
+            print(f"   - Consider using max_files parameter to limit dataset size")
+            print(f"   - Recommended: max_files=50-100 for initial testing")
+        
         pkl_files = sorted(pkl_files)
         
         # Split files for train/validation 
@@ -179,8 +190,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
         total_sequences = 0
         print("Scanning files for sequence indexing...")
-        
         corrupted_files = []
+
+        # TODO : 并行化文件加载和索引
         for file_idx, pkl_file in enumerate(tqdm(pkl_files, desc='Indexing files')):
             try:
                 with open(pkl_file, 'rb') as f:
@@ -209,6 +221,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 print(f"Warning: Skipping corrupted file {os.path.basename(pkl_file)}: {e}")
                 corrupted_files.append(pkl_file)
                 continue
+            # break
         
         if corrupted_files:
             print(f"\n⚠️ Skipped {len(corrupted_files)} corrupted files:")
@@ -217,7 +230,41 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             if len(corrupted_files) > 5:
                 print(f"  ... and {len(corrupted_files) - 5} more")
         
-        print(f"Total sequences available: {total_sequences}")
+        print(f"\n{'='*60}")
+        print(f"DATASET STATISTICS:")
+        print(f"  Total sequences available: {total_sequences}")
+        print(f"  Files loaded: {len([f for f in pkl_files if f not in corrupted_files])}")
+        print(f"  Sequence length (pred_horizon): {pred_horizon}")
+        print(f"  Observation steps (obs_horizon): {obs_horizon}")
+        print(f"  Sample interval: {sample_interval}")
+        
+        # 估计内存占用
+        estimated_memory_per_seq_mb = 4.0
+        estimated_total_memory_gb = (total_sequences * estimated_memory_per_seq_mb) / 1024
+        
+        print(f"\nMEMORY ESTIMATES:")
+        print(f"  ~{estimated_memory_per_seq_mb} MB per sequence")
+        print(f"  ~{estimated_total_memory_gb:.2f} GB total dataset size")
+        
+        if estimated_total_memory_gb > 50:
+            print(f"\n⚠️⚠️⚠️  CRITICAL WARNING  ⚠️⚠️⚠️")
+            print(f"Dataset is VERY LARGE (~{estimated_total_memory_gb:.1f} GB)!")
+            print(f"This will cause:")
+            print(f"  1. Long initialization time (5-30 minutes)")
+            print(f"  2. High memory usage during training")
+            print(f"  3. DataLoader worker processes may hang/freeze")
+            print(f"  4. First batch loading may take 10-30 minutes")
+            print(f"\nRECOMMENDATIONS:")
+            print(f"  - Reduce max_files (current: unlimited)")
+            print(f"  - Increase sample_interval (current: {sample_interval})")
+            print(f"  - Set num_workers=0 or 1 in DataLoader config")
+        elif estimated_total_memory_gb > 20:
+            print(f"\n⚠️  WARNING: Large dataset (~{estimated_total_memory_gb:.1f} GB)")
+            print(f"  - Initialization may take 2-5 minutes")
+            print(f"  - First batch loading may take 2-5 minutes")
+            print(f"  - Consider reducing num_workers in DataLoader")
+        
+        print(f"{'='*60}\n")
         
 
         self.total_sequences = total_sequences
@@ -250,16 +297,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             valid_items = [item for item in episode_data if len(item['ego_waypoints']) >= 1]
         except (pickle.UnpicklingError, EOFError, Exception) as e:
             print(f"Error loading file {os.path.basename(pkl_file)}: {e}")
-            # 返回空列表，避免崩溃
             self._file_cache[file_idx] = []
             return []
         
         sequences_data = []
+        time1=time.time()
         if len(valid_items) >= self.pred_horizon:
             for start_idx in range(len(valid_items) - self.pred_horizon + 1):
                 sequence_positions = []
                 
-                # 观测部分
                 for obs_step in range(self.obs_horizon):
                     if obs_step == 0:
                         current_pos = np.array([0.0, 0.0])
@@ -276,14 +322,14 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                             current_pos = np.array([0.0, 0.0])
                     sequence_positions.append(current_pos)
                 
-                # 预测部分
                 last_obs_idx = start_idx + self.obs_horizon - 1
                 if last_obs_idx < len(valid_items):
                     last_obs_item = valid_items[last_obs_idx]
                     last_ego_wp = np.array(last_obs_item['ego_waypoints'])
                     
+                    base_waypoint_offset = 1  
                     for pred_step in range(self.action_horizon):
-                        waypoint_idx = pred_step + 2
+                        waypoint_idx = base_waypoint_offset + (pred_step + 1) * self.sample_interval
                         if len(last_ego_wp) > waypoint_idx:
                             pred_pos = last_ego_wp[waypoint_idx].copy()
                         elif len(last_ego_wp) > 1:
@@ -295,7 +341,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     for pred_step in range(self.action_horizon):
                         sequence_positions.append(np.array([0.0, 0.0]))
                 
-                # 计算相对位置
                 reference_pos = sequence_positions[self.obs_horizon - 1]
                 relative_positions = []
                 for pos in sequence_positions:
@@ -303,17 +348,51 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     relative_positions.append(relative_pos)
                 
                 agent_pos = np.array(relative_positions)
-                
-                # 转换target_point为相对位置
                 seq_start_item = valid_items[start_idx]
                 original_target_point = np.array(seq_start_item['target_point'])
                 relative_target_point = original_target_point - reference_pos
                 
                 # 处理图像 - image_transform已包含Resize + ToTensor + Normalize
                 img_bytes = seq_start_item['rgb_hist_jpg'][-1]
-                img = Image.open(io.BytesIO(img_bytes))
-                img_tensor = self.image_transform(img)  # 返回已归一化的tensor (C, H, W)
-                img_data = img_tensor.numpy()  # 转换为numpy以便缓存
+                
+                try:
+                    if isinstance(img_bytes, str):
+                        # 如果是文件路径字符串，需要拼接完整路径
+                        if self.image_base_path is not None:
+                            # 使用提供的基础路径
+                            img_path = os.path.join(self.image_base_path, img_bytes)
+                        else:
+                            # 尝试使用相对于PKL文件的路径
+                            pkl_dir = os.path.dirname(pkl_file)
+                            img_path = os.path.join(pkl_dir, img_bytes)
+                        
+                        # 从文件读取
+                        with open(img_path, 'rb') as f:
+                            img_bytes = f.read()
+                    elif isinstance(img_bytes, bytes):
+                        # 如果已经是字节数据，直接使用
+                        pass
+                    else:
+                        # 其他类型，尝试转换
+                        raise ValueError(f"Unexpected image data type: {type(img_bytes)}")
+                    
+                    img = Image.open(io.BytesIO(img_bytes))
+                    img_tensor = self.image_transform(img)  # 返回已归一化的tensor (C, H, W)
+                    img_data = img_tensor.numpy()  # 转换为numpy以便缓存
+                    
+                except Exception as e:
+                    print(f"Warning: Failed to load image for sequence {start_idx} in file {os.path.basename(pkl_file)}: {e}")
+                    print(f"  Image data type: {type(seq_start_item['rgb_hist_jpg'][-1])}")
+                    if isinstance(seq_start_item['rgb_hist_jpg'][-1], str):
+                        print(f"  Image relative path: {seq_start_item['rgb_hist_jpg'][-1]}")
+                        if self.image_base_path:
+                            attempted_path = os.path.join(self.image_base_path, seq_start_item['rgb_hist_jpg'][-1])
+                        else:
+                            attempted_path = os.path.join(os.path.dirname(pkl_file), seq_start_item['rgb_hist_jpg'][-1])
+                        print(f"  Attempted full path: {attempted_path}")
+                        print(f"  Path exists: {os.path.exists(attempted_path)}")
+                    # 使用默认的空图像
+                    img_data = np.zeros((3, 256, 928), dtype=np.float32)
                 
                 # 构建序列数据
                 sequence_data = {
@@ -324,13 +403,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     'target_point': relative_target_point,
                     'ego_waypoints': seq_start_item['ego_waypoints'],
                     'image': img_data,
-                    'image_orig_shape': np.array(img.size),
+                    'image_orig_shape': np.array([928, 256]) if isinstance(img_bytes, str) else np.array(img.size),
                     'agent_pos': agent_pos
                 }
                 
                 sequences_data.append(sequence_data)
         
         self._file_cache[file_idx] = sequences_data
+        time2=time.time()
+        print(f"Loaded file {os.path.basename(pkl_file)} with {len(sequences_data)} sequences in {time2-time1:.2f} seconds")
         return sequences_data
 
 
@@ -338,7 +419,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         return self.total_sequences
 
     def __getitem__(self, idx):
-
+        # duandian
         metadata = self.sequence_metadata[idx]
         file_idx = metadata['file_idx']
         start_idx = metadata['start_idx']
@@ -377,10 +458,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
        
 def test():
     import random
-    dataset_path = '/home/wang/dataset/pkl/tmp_data'
+    dataset_path = '/home/wang/dataset/output/tmp_data'
+    actual_dataset_path = '/home/wang/dataset/data'  # 图像文件的实际位置
     pred_horizon = 7  # 总的序列长度（包含观测+预测）
     obs_horizon = 2   # 观测的时间步数
-    action_horizon = 5  # 动作预测的时间步数
+    action_horizon = 4  # 动作预测的时间步数
     sample_interval = 2  #
     dataset = CARLAImageDataset(
             dataset_path=dataset_path,
@@ -388,7 +470,8 @@ def test():
             obs_horizon=obs_horizon,
             action_horizon=action_horizon,
             max_files=10,
-            sample_interval=sample_interval
+            sample_interval=sample_interval,
+            image_base_path=actual_dataset_path  # 传入图像基础路径
         )
     if True:
         print(f"\n总样本数: {len(dataset)}")
