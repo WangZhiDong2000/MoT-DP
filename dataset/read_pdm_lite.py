@@ -3,7 +3,7 @@ import pickle
 import numpy as np
 import cv2
 
-OUT_DIR = "/home/wang/projects/diffusion_policy_z/data/tmp_data"
+OUT_DIR = "/home/wang/dataset/tmp_data/tmp_data"
 
 def inspect_pkl(pkl_path, show_img=False, max_frames=3):
     print(f"\n=== Inspect {os.path.basename(pkl_path)} ===")
@@ -35,10 +35,13 @@ def inspect_pkl(pkl_path, show_img=False, max_frames=3):
                         print(f"{k}: ndarray shape={v.shape}, dtype={v.dtype}")
                     else:
                         print(f"{k}: {v}")
+                else:
+                    print(v)
+                    breakpoint()
         print("===")
 
 
 if __name__ == "__main__":
     for fname in os.listdir(OUT_DIR):
         if fname.endswith(".pkl"):
-            inspect_pkl(os.path.join(OUT_DIR, fname), show_img=True, max_frames=2)
+            inspect_pkl(os.path.join(OUT_DIR, fname), show_img=False, max_frames=2)

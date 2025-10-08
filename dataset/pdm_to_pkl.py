@@ -14,7 +14,7 @@ import argparse
 # consistent with the nuscenes dataset.
 
 DATAROOT = '/home/wang/dataset/data'  # Bench2Drive raw data root
-OUT_DIR = '/home/wang/dataset/pkl'
+OUT_DIR = '/home/czz/e2e_driving/bagel_data/dp_data/'
 
 MAX_DISTANCE = 75              # Filter bounding boxes that are too far from the vehicle
 FILTER_Z_SHRESHOLD = 10        # Filter bounding boxes that are too high/low from the vehicle
@@ -144,8 +144,7 @@ def preprocess(folder_list, idx, tmp_dir, train_or_val):
     for folder in folder_list:
         all_scenes = os.listdir(join(data_root, folder))
         for scene in all_scenes:
-            if 'Town12' in scene or 'Town13' in scene:
-                folder_list_new.append(join(folder, scene))
+            folder_list_new.append(join(folder, scene))
 
     if idx == 0:
         folders = tqdm(folder_list_new)
@@ -158,7 +157,7 @@ def preprocess(folder_list, idx, tmp_dir, train_or_val):
         last_frame = num_seq - (seq_len - 1) - pred_len
 
         scene_data = []
-        STORE_BYTES = True # Whether to store image bytes or image paths
+        STORE_BYTES = False # Whether to store image bytes or image paths
         rgb_dir = join(folder_path, 'rgb')
 
         for ii in range(0, last_frame):
@@ -203,7 +202,7 @@ def preprocess(folder_list, idx, tmp_dir, train_or_val):
                     except FileNotFoundError:
                         rgb_hist.append(b"")
                 else:
-                    rgb_hist.append(img_path)
+                    rgb_hist.append(join(folder_name, 'rgb', f"{j:04d}.jpg"))
             frame_data['rgb_hist_jpg'] = rgb_hist
 
             scene_data.append(frame_data)
@@ -248,7 +247,7 @@ if __name__ == "__main__":
 
     os.makedirs(OUT_DIR,exist_ok=True)
     argparser = argparse.ArgumentParser(description=__doc__)
-    argparser.add_argument('--workers',type=int, default=4, help='num of workers to prepare dataset')
+    argparser.add_argument('--workers',type=int, default= 4, help='num of workers to prepare dataset')
     argparser.add_argument('--tmp_dir', default="tmp_data", )
     args = argparser.parse_args()    
     workers = args.workers
