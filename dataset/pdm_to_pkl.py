@@ -14,7 +14,7 @@ import argparse
 # consistent with the nuscenes dataset.
 
 DATAROOT = '/home/wang/dataset/data'  # Bench2Drive raw data root
-OUT_DIR = '/home/czz/e2e_driving/bagel_data/dp_data/'
+OUT_DIR = '/home/wang/dataset/output1'
 
 MAX_DISTANCE = 75              # Filter bounding boxes that are too far from the vehicle
 FILTER_Z_SHRESHOLD = 10        # Filter bounding boxes that are too high/low from the vehicle
