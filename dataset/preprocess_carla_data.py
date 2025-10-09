@@ -190,40 +190,33 @@ def process_and_save_data(
             obs_headings_array = np.array(obs_headings) # Shape: (obs_horizon, 2)
 
             # 2. 提取 agent_pos (未来轨迹) 和 target_point (导航目标)
-            # 这部分逻辑与之前类似，但我们只关心序列起点和终点的信息
+            # agent_pos: 前 obs_horizon 个为 [0,0], 后 action_horizon 个从 ego_waypoints 截取
             
             sequence_positions = []
-            # 观测部分
+            
+            # 观测部分: 全部为 [0, 0]
             for obs_step in range(obs_horizon):
-                if obs_step == 0:
-                    current_pos = np.array([0.0, 0.0])
-                else:
-                    prev_item = valid_items[start_idx + obs_step - 1]
-                    prev_ego_wp = np.array(prev_item['ego_waypoints'])
-                    current_pos = prev_ego_wp[1].copy() if len(prev_ego_wp) > 1 else np.array([0.0, 0.0])
-                sequence_positions.append(current_pos)
+                sequence_positions.append(np.array([0.0, 0.0]))
             
-            # 预测部分
-            last_obs_item = valid_items[start_idx + obs_horizon - 1]
-            last_ego_wp = np.array(last_obs_item['ego_waypoints'])
+            # 预测部分: 从当前帧的 ego_waypoints 中截取
+            seq_start_item = valid_items[start_idx]
+            ego_waypoints = np.array(seq_start_item['ego_waypoints'])
             
-            for pred_step in range(action_horizon):
-                waypoint_idx = pred_step + 2
-                if len(last_ego_wp) > waypoint_idx:
-                    pred_pos = last_ego_wp[waypoint_idx].copy()
-                elif len(last_ego_wp) > 1:
-                    pred_pos = last_ego_wp[-1].copy()
+            # 从 ego_waypoints[1] 开始取 action_horizon 个点
+            for action_step in range(action_horizon):
+                waypoint_idx = action_step + 1
+                if len(ego_waypoints) > waypoint_idx:
+                    action_pos = ego_waypoints[waypoint_idx].copy()
+                elif len(ego_waypoints) > 0:
+                    action_pos = ego_waypoints[-1].copy()
                 else:
-                    pred_pos = np.array([0.0, 0.0])
-                sequence_positions.append(pred_pos)
-
-            reference_pos = sequence_positions[obs_horizon - 1]
-            agent_pos = np.array([pos - reference_pos for pos in sequence_positions])
+                    action_pos = np.array([0.0, 0.0])
+                sequence_positions.append(action_pos)
+            
+            agent_pos = np.array(sequence_positions)
             
             # target_point 和 command 来自于观测序列的起点
-            seq_start_item = valid_items[start_idx]
             original_target_point = np.array(seq_start_item['target_point'])
-            relative_target_point = original_target_point - reference_pos
 
             # 3. 构建更完整的样本字典
             sample_data = {
@@ -241,7 +234,7 @@ def process_and_save_data(
                 'next_command': np.tile(np.array(seq_start_item['next_command']), (obs_horizon, 1)),
                 
                 # 标签和目标
-                'target_point': np.tile(np.array(relative_target_point), ( obs_horizon, 1)),
+                'target_point': np.tile(original_target_point, (obs_horizon, 1)),
                 'agent_pos': agent_pos,
             }
 
@@ -321,6 +314,6 @@ if __name__ == "__main__":
     parser.add_argument('--obs-horizon', type=int, default=2, help='Observation horizon length.')
     parser.add_argument('--action-horizon', type=int, default=4, help='Action horizon length.')
     parser.add_argument('--train-split', type=float, default=0.8, help='Ratio of files to use for training.')
-    parser.add_argument('--sample-interval', type=int, default=2, help='Interval for downsampling episode data.')
+    parser.add_argument('--sample-interval', type=int, default=4, help='Interval for downsampling episode data.')
     args = parser.parse_args()
     main(args)
