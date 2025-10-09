@@ -157,8 +157,8 @@ def process_and_save_data(
         for start_idx in range(len(valid_items) - pred_horizon + 1):
             
             # ==================== 核心修改点 ====================
-            # 1. 收集多帧观测数据 (图像, 速度等)
-            obs_images = []
+            # 1. 收集多帧观测数据 (图像路径, 速度等)
+            obs_image_paths = []  # 改为存储图像路径而不是图像tensor
             obs_speeds = []
             obs_headings = []
             # ... 可以根据需要添加其他需要观测历史的状态 ...
@@ -167,27 +167,25 @@ def process_and_save_data(
                 obs_item_idx = start_idx + i
                 obs_item = valid_items[obs_item_idx]
                 
-                # 处理图像
+                # 存储图像路径而不是加载图像
                 img_data = obs_item['rgb_hist_jpg'][-1]
                 # Check if img_data is bytes or a file path
                 if isinstance(img_data, bytes):
-                    img = Image.open(io.BytesIO(img_data))
+                    # 如果是bytes，我们需要先保存为文件（或者跳过这种情况）
+                    print(f"Warning: Found bytes image data in {pkl_file}, skipping this type")
+                    obs_image_paths.append(None)
                 else:
-                    # img_data is a relative path, need to join with base path
-                    img_path = os.path.join('/home/wang/dataset/data', img_data)
-                    img = Image.open(img_path)
-                img_tensor = image_transform(img)
-                obs_images.append(img_tensor)
+                    # img_data is a relative path
+                    obs_image_paths.append(img_data)
                 
                 # low dimension states
                 obs_speeds.append(obs_item['speed'] / 12.0) # 归一化
                 obs_headings.append(obs_item['theta'])
                 #
 
-            # 将列表堆叠成一个Tensor/Array
-            obs_images_tensor = torch.stack(obs_images) # Shape: (obs_horizon, C, H, W)
-            obs_speeds_array = np.array(obs_speeds)     # Shape: (obs_horizon, 2)
-            obs_headings_array = np.array(obs_headings) # Shape: (obs_horizon, 2)
+            # 将列表转换为Array
+            obs_speeds_array = np.array(obs_speeds)     # Shape: (obs_horizon,)
+            obs_headings_array = np.array(obs_headings) # Shape: (obs_horizon,)
 
             # 2. 提取 agent_pos (未来轨迹) 和 target_point (导航目标)
             # agent_pos: 前 obs_horizon 个为 [0,0], 后 action_horizon 个从 ego_waypoints 截取
@@ -224,7 +222,7 @@ def process_and_save_data(
                 'source_scene': source_scene_name,
                 
                 # 多帧观测数据
-                'image': obs_images_tensor,      # Shape: (obs_horizon, C, H, W)
+                'image_paths': obs_image_paths,  # 存储图像路径列表而不是tensor
                 'speed': obs_speeds_array,       # Shape: (obs_horizon,)  
                 'heading': obs_headings_array,   # Shape: (obs_horizon,)  
                 # ... 其他观测历史状态 ...
@@ -270,16 +268,6 @@ def main(args):
 
     print(f"Splitting into {len(train_files)} training files and {len(val_files)} validation files.")
 
-    # 定义图像变换
-    image_transform = transforms.Compose([
-        transforms.Resize((256, 928)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
-
     # 处理训练集
     process_and_save_data(
         train_files,
@@ -287,7 +275,7 @@ def main(args):
         args.pred_horizon,
         args.obs_horizon,
         args.action_horizon,
-        image_transform,
+        None,  # image_transform不再需要
         args.sample_interval
     )
 
@@ -298,7 +286,7 @@ def main(args):
         args.pred_horizon,
         args.obs_horizon,
         args.action_horizon,
-        image_transform,
+        None,  # image_transform不再需要
         args.sample_interval
     )
 
@@ -308,7 +296,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess CARLA pkl dataset into individual samples.")
-    parser.add_argument('--input-dir', type=str, default='/home/wang/dataset/output1/tmp_data', help='Directory containing raw .pkl files.')
+    parser.add_argument('--input-dir', type=str, default='/home/wang/dataset/output/tmp_data', help='Directory containing raw .pkl files.')
     parser.add_argument('--output-dir', type=str, default='/home/wang/projects/diffusion_policy_z/data', help='Directory to save processed sample files.')
     parser.add_argument('--pred-horizon', type=int, default=6, help='Total prediction horizon length.')
     parser.add_argument('--obs-horizon', type=int, default=2, help='Observation horizon length.')
