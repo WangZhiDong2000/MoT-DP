@@ -16,12 +16,25 @@ import matplotlib.pyplot as plt
 class CARLAImageDataset(torch.utils.data.Dataset):
     """
     一个为预处理好的、单个样本文件设计的高效Dataset类。
+    图像路径存储在pkl中，在__getitem__时动态加载。
     """
     def __init__(self,
                  dataset_path: str, # 指向处理好的数据根目录 (包含 train/val)
-                 mode: str = 'train',):
+                 mode: str = 'train',
+                 image_base_path: str = '/home/wang/dataset/data'):
 
         self.mode = mode
+        self.image_base_path = image_base_path
+        
+        # 定义图像变换
+        self.image_transform = transforms.Compose([
+            transforms.Resize((256, 928)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
     
         data_dir = os.path.join(dataset_path, self.mode)
         if not os.path.isdir(data_dir):
@@ -42,11 +55,37 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         with open(sample_path, 'rb') as f:
             sample = pickle.load(f)
 
-        # 2. 数据已经基本处理好，只需做最后的tensor转换和数据复制
-        # 注意：图像已经是Tensor了
+        # 2. 动态加载图像
+        image_paths = sample.get('image_paths', [])
+        images = []
+        for img_path in image_paths:
+            if img_path is None:
+                # 如果路径为None，创建一个黑色图像
+                images.append(torch.zeros(3, 256, 928))
+                print(f"Warning: Image path is None in sample {sample_path}. Using black image.")
+            else:
+                full_img_path = os.path.join(self.image_base_path, img_path)
+                try:
+                    img = Image.open(full_img_path)
+                    img_tensor = self.image_transform(img)
+                    images.append(img_tensor)
+                except Exception as e:
+                    print(f"Error loading image {full_img_path}: {e}")
+                    images.append(torch.zeros(3, 256, 928))
+        
+        # 堆叠图像
+        if len(images) > 0:
+            images_tensor = torch.stack(images)
+        else:
+            images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
+        
+        # 3. 转换其他数据
         final_sample = dict()
         for key, value in sample.items():
-            if isinstance(value, np.ndarray):
+            if key == 'image_paths':
+                # 将image_paths替换为加载的images
+                final_sample['image'] = images_tensor
+            elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
                 final_sample[key] = value

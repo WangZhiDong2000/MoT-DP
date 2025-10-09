@@ -1,7 +1,7 @@
 
 dataloader:
-  batch_size: 32       # 减少以降低内存占用
-  num_workers: 2       # 设为0以避免OOM错误
+  batch_size: 64       # 减少以降低内存占用
+  num_workers: 4       # 设为0以避免OOM错误
   persistent_workers: True  # num_workers=0时必须为false
   pin_memory: true
   shuffle: true
