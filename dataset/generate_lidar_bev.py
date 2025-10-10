@@ -91,12 +91,12 @@ def makeBVFeature(PointCloud_, BoundaryCond, img_height, img_width, Discretizati
 
     return RGB_Map
 
-def draw_centerpoint_bev(bev_image, centerpoints):
+def draw_centerpoint_bev(bev_image, centerpoints, img_size=448):
     centerpoints[:, [0, 1]] = centerpoints[:, [1, 0]]
     centerpoints[:, 1] = centerpoints[:, 1] * -1
     centerpoints[:, 0] = centerpoints[:, 0] + BOUNDARY["maxX"]
     centerpoints[:, 1] = centerpoints[:, 1] + BOUNDARY["maxY"]
-    discretization = (BOUNDARY["maxX"] - BOUNDARY["minX"]) / 448
+    discretization = (BOUNDARY["maxX"] - BOUNDARY["minX"]) / img_size
     
     centerpoints[:, 0] = centerpoints[:, 0] / discretization
     centerpoints[:, 1] = centerpoints[:, 1] / discretization
@@ -281,7 +281,7 @@ def attach_debugger():
     debugpy.wait_for_client()
     print("Attached!")
 
-def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, scenario_filter=None, save_in_place=False):
+def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, scenario_filter=None, save_in_place=False, img_size=448):
     """
     Process all scenes in PDM Lite dataset to generate BEV images
     
@@ -291,6 +291,7 @@ def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, sce
         process_all: If False, only process the first scenario (for debugging)
         scenario_filter: List of scenario names to process (e.g., ['Accident', 'ControlLoss'])
         save_in_place: If True, save BEV images in the same directory structure as lidar files
+        img_size: BEV image size (height and width)
     """
     # Get all scenario directories
     if scenario_filter:
@@ -350,26 +351,26 @@ def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, sce
                 output_scene_dir = os.path.join(output_dir, scenario_name, scene_name)
                 bev_image_dir = os.path.join(output_scene_dir, 'bev_images')
             
-            # Check if BEV images already exist and are complete
-            if os.path.exists(bev_image_dir):
-                existing_bev_files = sorted(glob.glob(os.path.join(bev_image_dir, '*.png')))
-                if len(existing_bev_files) == len(lidar_files):
-                    # Check if all corresponding BEV images exist
-                    all_exist = True
-                    for lidar_file in lidar_files:
-                        frame_id = os.path.basename(lidar_file).split('.')[0]
-                        bev_file = os.path.join(bev_image_dir, f'{frame_id}.png')
-                        if not os.path.exists(bev_file):
-                            all_exist = False
-                            break
+            # # Check if BEV images already exist and are complete
+            # if os.path.exists(bev_image_dir):
+            #     existing_bev_files = sorted(glob.glob(os.path.join(bev_image_dir, '*.png')))
+            #     if len(existing_bev_files) == len(lidar_files):
+            #         # Check if all corresponding BEV images exist
+            #         all_exist = True
+            #         for lidar_file in lidar_files:
+            #             frame_id = os.path.basename(lidar_file).split('.')[0]
+            #             bev_file = os.path.join(bev_image_dir, f'{frame_id}.png')
+            #             if not os.path.exists(bev_file):
+            #                 all_exist = False
+            #                 break
                     
-                    if all_exist:
-                        print(f"    ✓ Scene already processed ({len(existing_bev_files)} BEV images), skipping...")
-                        continue
-                    else:
-                        print(f"    ⚠ Incomplete BEV sequence found ({len(existing_bev_files)}/{len(lidar_files)}), reprocessing...")
-                else:
-                    print(f"    ⚠ Incomplete BEV sequence found ({len(existing_bev_files)}/{len(lidar_files)}), reprocessing...")
+            #         if all_exist:
+            #             print(f"    ✓ Scene already processed ({len(existing_bev_files)} BEV images), skipping...")
+            #             continue
+            #         else:
+            #             print(f"    ⚠ Incomplete BEV sequence found ({len(existing_bev_files)}/{len(lidar_files)}), reprocessing...")
+            #     else:
+            #         print(f"    ⚠ Incomplete BEV sequence found ({len(existing_bev_files)}/{len(lidar_files)}), reprocessing...")
             
             os.makedirs(bev_image_dir, exist_ok=True)
             
@@ -396,8 +397,8 @@ def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, sce
                     bev_image = generate_lidar_bev_images(
                         lidar_points, 
                         saving_bev_image, 
-                        img_height=448,  # Standard size for PDM Lite
-                        img_width=448
+                        img_height=img_size,
+                        img_width=img_size
                     )
                     
                     # Process bounding boxes if available
@@ -515,5 +516,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         process_all=args.process_all,
         scenario_filter=args.scenarios,
-        save_in_place=args.save_in_place
+        save_in_place=args.save_in_place,
+        img_size=args.img_size
     )
