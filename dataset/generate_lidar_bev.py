@@ -96,7 +96,7 @@ def draw_centerpoint_bev(bev_image, centerpoints):
     centerpoints[:, 1] = centerpoints[:, 1] * -1
     centerpoints[:, 0] = centerpoints[:, 0] + BOUNDARY["maxX"]
     centerpoints[:, 1] = centerpoints[:, 1] + BOUNDARY["maxY"]
-    discretization = (BOUNDARY["maxX"] - BOUNDARY["minX"]) / 336
+    discretization = (BOUNDARY["maxX"] - BOUNDARY["minX"]) / 448
     
     centerpoints[:, 0] = centerpoints[:, 0] / discretization
     centerpoints[:, 1] = centerpoints[:, 1] / discretization
@@ -104,7 +104,7 @@ def draw_centerpoint_bev(bev_image, centerpoints):
     bev_image[np.int_(centerpoints[:, 1]), np.int_(centerpoints[:, 0])] = 255
     imageio.imwrite('bev_centerpoints.png', bev_image)
 
-def generate_lidar_bev_images(lidar_pc, saving_name=None, img_height=336, img_width=336):
+def generate_lidar_bev_images(lidar_pc, saving_name=None, img_height=448, img_width=448):
     # Coordinate transform
     lidar_pc[:, 0] = lidar_pc[:, 0] * -1
     
@@ -396,8 +396,8 @@ def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, sce
                     bev_image = generate_lidar_bev_images(
                         lidar_points, 
                         saving_bev_image, 
-                        img_height=336,  # Standard size for PDM Lite
-                        img_width=336
+                        img_height=448,  # Standard size for PDM Lite
+                        img_width=448
                     )
                     
                     # Process bounding boxes if available
@@ -477,7 +477,7 @@ if __name__ == "__main__":
                        help='Specific scenario names to process (e.g., Accident ControlLoss)')
     parser.add_argument('--debug', action='store_true', 
                        help='Enable debugger')
-    parser.add_argument('--img_size', type=int, default=336,
+    parser.add_argument('--img_size', type=int, default=448,
                        help='BEV image size (height and width)')
     
     args = parser.parse_args()

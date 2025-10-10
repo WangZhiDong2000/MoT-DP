@@ -159,6 +159,7 @@ def process_and_save_data(
             # ==================== 核心修改点 ====================
             # 1. 收集多帧观测数据 (图像路径, 速度等)
             obs_image_paths = []  # 改为存储图像路径而不是图像tensor
+            obs_lidar_bev_paths = []  # 存储lidar BEV图像路径
             obs_speeds = []
             obs_headings = []
             # ... 可以根据需要添加其他需要观测历史的状态 ...
@@ -177,6 +178,19 @@ def process_and_save_data(
                 else:
                     # img_data is a relative path
                     obs_image_paths.append(img_data)
+                
+                # 存储lidar BEV图像路径（处理方式与RGB图像相同）
+                if 'lidar_bev_hist' in obs_item and obs_item['lidar_bev_hist']:
+                    bev_data = obs_item['lidar_bev_hist'][-1]
+                    if isinstance(bev_data, bytes):
+                        print(f"Warning: Found bytes BEV image data in {pkl_file}, skipping this type")
+                        obs_lidar_bev_paths.append(None)
+                    else:
+                        # bev_data is a relative path or None
+                        obs_lidar_bev_paths.append(bev_data)
+                else:
+                    # 如果没有lidar_bev_hist字段，则添加None
+                    obs_lidar_bev_paths.append(None)
                 
                 # low dimension states
                 obs_speeds.append(obs_item['speed'] / 12.0) # 归一化
@@ -223,6 +237,7 @@ def process_and_save_data(
                 
                 # 多帧观测数据
                 'image_paths': obs_image_paths,  # 存储图像路径列表而不是tensor
+                'lidar_bev_paths': obs_lidar_bev_paths,  # 存储lidar BEV图像路径列表
                 'speed': obs_speeds_array,       # Shape: (obs_horizon,)  
                 'heading': obs_headings_array,   # Shape: (obs_horizon,)  
                 # ... 其他观测历史状态 ...

@@ -7,7 +7,7 @@ import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
-from model.TCP.model import TCP
+from model.tcp_bev_encoder import SimplifiedTCPEncoder
 import os
 from collections import OrderedDict
 
@@ -70,17 +70,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # 从配置文件获取obs_horizon
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
         
-        # obs encoder - 使用TCP模型
-        from model.TCP.config import GlobalConfig
-        config = GlobalConfig()
-        obs_encoder = TCP(config)
-        ckpt = torch.load('/home/wang/projects/Bench2DriveZoo/tcp_b2d.ckpt', map_location="cuda")
-        ckpt = ckpt["state_dict"]
-        new_state_dict = OrderedDict()
-        for key, value in ckpt.items():
-            new_key = key.replace("model.","")
-            new_state_dict[new_key] = value
-        obs_encoder.load_state_dict(new_state_dict, strict = False)
+        # obs encoder - 使用SimplifiedTCPEncoder模型（适配LiDAR BEV输入）
+        obs_encoder = SimplifiedTCPEncoder(
+            perception_backbone=None,  # 自动创建ResNet34
+            state_dim=9,  # speed(1) + target_point(2) + command(6)
+            feature_dim=256,
+            use_group_norm=True,
+            freeze_backbone=True,
+            bev_input_size=(336, 336)  # LiDAR BEV图像尺寸
+        )
         obs_encoder.cuda()
         obs_encoder.eval()
             
@@ -206,26 +204,20 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def extract_tcp_features(self, obs_dict):
         """
-        使用TCP模型提取j_ctrl特征
+        使用SimplifiedTCPEncoder提取特征
+        现在使用lidar_bev作为视觉输入
         """
         try:
-            front_img = obs_dict['image'].to(device='cuda', dtype=torch.float32)  
+            # 使用lidar_bev替代原来的front_img (RGB image)
+            lidar_bev_img = obs_dict['lidar_bev'].to(device='cuda', dtype=torch.float32)  
             speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
             target_point = obs_dict['target_point'].to(dtype=torch.float32)
             command = obs_dict['next_command'].to(dtype=torch.float32)
             state = torch.cat([speed, target_point, command], 1).to('cuda')
             
-            
+            # 使用SimplifiedTCPEncoder的forward方法
             with torch.no_grad():
-                feature_emb, cnn_feature = self.obs_encoder.perception(front_img)
-                measurement_feature = self.obs_encoder.measurements(state)
-                batch_size = cnn_feature.shape[0]
-                
-                # NOTE: This requires input images of size 256x928 (H×W) to produce 8x29 feature maps
-                init_att = self.obs_encoder.init_att(measurement_feature).view(batch_size, 1, 8, 29)
-                feature_emb_att = torch.sum(cnn_feature * init_att, dim=(2, 3))
-                
-                j_ctrl = self.obs_encoder.join_ctrl(torch.cat([feature_emb_att, measurement_feature], 1))
+                j_ctrl = self.obs_encoder(lidar_bev_img, state, normalize=True)
                 
             # Optional GroupNorm for better training stability
             if self.use_j_ctrl_norm and self.training:
@@ -240,7 +232,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
-            'image': (B, obs_horizon, C, H, W)
+            'lidar_bev': (B, obs_horizon, 3, 336, 336) - LiDAR BEV图像
             'agent_pos': (B, obs_horizon, 2)
             'action': (B, action_horizon, action_dim)
             'speed': (B, obs_horizon)
@@ -249,10 +241,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         device = next(self.parameters()).device
         nobs = {}
-        carla_fields = ['image', 'next_command', 'speed', 'target_point','agent_pos']
+        carla_fields = ['lidar_bev', 'next_command', 'speed', 'target_point','agent_pos']
         for field in carla_fields:
             if field in batch:
-                if field == 'image':
+                if field == 'lidar_bev':
                     nobs[field] = batch[field].to(device=device, dtype=torch.float32)
                 else:
                     nobs[field] = batch[field].to(device)
@@ -662,7 +654,7 @@ def use_dummy_test():
 
     # dummy input - 使用CARLA驾驶数据集格式，obs_horizon=1
     obs_dict = {
-        'image': torch.randn(4, 1, 3, 96, 96),  # CARLA图像格式
+        'lidar_bev': torch.randn(4, 1, 3, 336, 336),  # LiDAR BEV图像格式 (336x336)
         'agent_pos': torch.randn(4, 1, 2),      # 代理位置
         'speed': torch.randn(4, 1),             # 速度
         'theta': torch.randn(4, 1),             # 朝向角
@@ -670,9 +662,10 @@ def use_dummy_test():
         'steer': torch.randn(4, 1),             # 转向
         'brake': torch.randn(4, 1),             # 刹车
         'target_point': torch.randn(4, 1, 2),  # 目标点
+        'next_command': torch.randn(4, 1, 6),  # 指令
     }
     batch_input = {
-        'image': obs_dict['image'],
+        'lidar_bev': obs_dict['lidar_bev'],
         'agent_pos': obs_dict['agent_pos'],
         'speed': obs_dict['speed'],
         'theta': obs_dict['theta'],
@@ -680,6 +673,7 @@ def use_dummy_test():
         'steer': obs_dict['steer'],
         'brake': obs_dict['brake'],
         'target_point': obs_dict['target_point'],
+        'next_command': obs_dict['next_command'],
         'action': torch.randn(4, 16, 2)  
     }
     out = model.compute_loss(batch_input)

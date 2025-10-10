@@ -266,7 +266,7 @@ def test_model(policy, test_dataset, config, num_samples=10, visualize_samples=5
             # 提取观测数据
             obs_horizon = config.get('obs_horizon', 2)
             obs_dict = {
-                'image': batch['image'][:, :obs_horizon],
+                'lidar_bev': batch['lidar_bev'][:, :obs_horizon],
                 'agent_pos': batch['agent_pos'][:, :obs_horizon],
                 'speed': batch['speed'][:, :obs_horizon],
                 'target_point': batch['target_point'][:, :obs_horizon],

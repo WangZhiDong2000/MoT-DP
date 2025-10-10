@@ -14,7 +14,7 @@ import argparse
 # consistent with the nuscenes dataset.
 
 DATAROOT = '/home/wang/dataset/data'  # Bench2Drive raw data root
-OUT_DIR = '/home/wang/dataset/output1'
+OUT_DIR = '/home/wang/dataset/output'
 
 MAX_DISTANCE = 75              # Filter bounding boxes that are too far from the vehicle
 FILTER_Z_SHRESHOLD = 10        # Filter bounding boxes that are too high/low from the vehicle
@@ -204,6 +204,28 @@ def preprocess(folder_list, idx, tmp_dir, train_or_val):
                 else:
                     rgb_hist.append(join(folder_name, 'rgb', f"{j:04d}.jpg"))
             frame_data['rgb_hist_jpg'] = rgb_hist
+            
+            # Process lidar BEV images (same as rgb_hist_jpg)
+            lidar_bev_dir = join(folder_path, 'lidar_bev')
+            lidar_bev_hist = []
+            if os.path.exists(lidar_bev_dir):
+                for j in range(ii, ii + seq_len):
+                    bev_path = join(lidar_bev_dir, f"{j:04d}.png")
+                    if STORE_BYTES:
+                        try:
+                            with open(bev_path, 'rb') as f:
+                                lidar_bev_hist.append(f.read())
+                        except FileNotFoundError:
+                            lidar_bev_hist.append(b"")
+                    else:
+                        if os.path.exists(bev_path):
+                            lidar_bev_hist.append(join(folder_name, 'lidar_bev', f"{j:04d}.png"))
+                        else:
+                            lidar_bev_hist.append(None)  # Mark missing BEV image
+            else:
+                # If lidar_bev directory doesn't exist, fill with None
+                lidar_bev_hist = [None] * seq_len
+            frame_data['lidar_bev_hist'] = lidar_bev_hist
 
             scene_data.append(frame_data)
             
