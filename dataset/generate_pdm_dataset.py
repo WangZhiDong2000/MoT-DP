@@ -26,9 +26,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self.mode = mode
         self.image_base_path = image_base_path
         
-        # 定义图像变换
+        # 定义RGB图像变换
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        # 定义LiDAR BEV图像变换（不裁剪，只转换为tensor和归一化）
+        self.lidar_bev_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -79,12 +88,39 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         else:
             images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
         
+        # 2.5 动态加载LiDAR BEV图像（处理方式和image相同，但不裁剪）
+        lidar_bev_paths = sample.get('lidar_bev_paths', [])
+        lidar_bev_images = []
+        for bev_path in lidar_bev_paths:
+            if bev_path is None:
+                # 如果路径为None，创建一个黑色BEV图像（336x336）
+                lidar_bev_images.append(torch.zeros(3, 336, 336))
+                print(f"Warning: LiDAR BEV path is None in sample {sample_path}. Using black BEV image.")
+            else:
+                full_bev_path = os.path.join(self.image_base_path, bev_path)
+                try:
+                    bev_img = Image.open(full_bev_path)
+                    bev_tensor = self.lidar_bev_transform(bev_img)
+                    lidar_bev_images.append(bev_tensor)
+                except Exception as e:
+                    print(f"Warning: Error loading BEV image {full_bev_path}: {e}")
+                    lidar_bev_images.append(torch.zeros(3, 336, 336))
+        
+        # 堆叠LiDAR BEV图像
+        if len(lidar_bev_images) > 0:
+            lidar_bev_tensor = torch.stack(lidar_bev_images)
+        else:
+            lidar_bev_tensor = torch.zeros(2, 3, 336, 336)  # 默认obs_horizon=2, BEV尺寸336x336
+        
         # 3. 转换其他数据
         final_sample = dict()
         for key, value in sample.items():
             if key == 'image_paths':
                 # 将image_paths替换为加载的images
                 final_sample['image'] = images_tensor
+            elif key == 'lidar_bev_paths':
+                # 将lidar_bev_paths替换为加载的lidar_bev图像
+                final_sample['lidar_bev'] = lidar_bev_tensor
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:

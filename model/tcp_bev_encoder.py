@@ -15,7 +15,7 @@ class SimplifiedTCPEncoder(nn.Module):
     简化版TCP编码器，专门用于扩散策略的观测编码
     
     输入:
-        - image: (B, 3, H, W) - RGB图像，推荐尺寸 256x928
+        - image: (B, 3, H, W) - LiDAR BEV图像，推荐尺寸 336x336
         - state: (B, state_dim) - 状态信息 [speed(1), target_point(2), command(6)]
     
     输出:
@@ -27,6 +27,7 @@ class SimplifiedTCPEncoder(nn.Module):
         3. 移除了动作预测头 (policy_head, action_head等)
         4. 移除了价值估计分支 (value_branch)
         5. 只保留核心的视觉感知 + 测量融合 + 空间注意力机制
+        6. 适配LiDAR BEV图像输入 (336x336)，对应的ResNet34特征图为11x11
     """
     
     def __init__(
@@ -35,7 +36,8 @@ class SimplifiedTCPEncoder(nn.Module):
         state_dim: int = 9,  # speed(1) + target_point(2) + command(6)
         feature_dim: int = 256,
         use_group_norm: bool = True,
-        freeze_backbone: bool = True
+        freeze_backbone: bool = True,
+        bev_input_size: Tuple[int, int] = (336, 336)  # LiDAR BEV图像尺寸
     ):
         """
         Args:
@@ -44,12 +46,14 @@ class SimplifiedTCPEncoder(nn.Module):
             feature_dim: 输出特征维度
             use_group_norm: 是否使用GroupNorm标准化输出特征
             freeze_backbone: 是否冻结backbone参数
+            bev_input_size: BEV图像输入尺寸，默认(336, 336)
         """
         super().__init__()
         
         self.state_dim = state_dim
         self.feature_dim = feature_dim
         self.freeze_backbone = freeze_backbone
+        self.bev_input_size = bev_input_size
         
         if perception_backbone is None:
             self.perception = resnet34(pretrained=True)
@@ -65,10 +69,28 @@ class SimplifiedTCPEncoder(nn.Module):
         )
         
         # 3. 空间注意力模块
+        # 计算ResNet34输出特征图尺寸: 对于336x336输入 -> 11x11特征图
+        # ResNet34: conv1(stride=2) -> maxpool(stride=2) -> layer2(stride=2) -> layer3(stride=2) -> layer4(stride=2)
+        # 336 -> 168 -> 84 -> 42 -> 21 -> 11
+        feat_h = bev_input_size[0] // 32  # 336 // 32 = 10.5 ≈ 11
+        feat_w = bev_input_size[1] // 32  # 336 // 32 = 10.5 ≈ 11
+        
+        # 更精确的计算
+        if bev_input_size == (336, 336):
+            feat_h, feat_w = 11, 11  # 实际输出为11x11
+        else:
+            # 通用计算: input_size -> (input_size // 32)
+            feat_h = (bev_input_size[0] + 31) // 32
+            feat_w = (bev_input_size[1] + 31) // 32
+        
+        self.feat_h = feat_h
+        self.feat_w = feat_w
+        spatial_size = feat_h * feat_w
+        
         self.init_att = nn.Sequential(
             nn.Linear(128, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 8 * 29),  
+            nn.Linear(256, spatial_size),  # 11 * 11 = 121 for 336x336 input
             nn.Softmax(dim=1)
         )
         
@@ -124,8 +146,9 @@ class SimplifiedTCPEncoder(nn.Module):
         measurement_feature = self.measurements(state)
         
         # Step 3: 空间注意力
+        # 使用动态计算的特征图尺寸
         init_att_flat = self.init_att(measurement_feature)
-        init_att = init_att_flat.view(batch_size, 1, 8, 29)
+        init_att = init_att_flat.view(batch_size, 1, self.feat_h, self.feat_w)
         feature_emb_att = torch.sum(cnn_feature * init_att, dim=(2, 3))
         
         # Step 4: 特征融合

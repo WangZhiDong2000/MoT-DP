@@ -14,7 +14,6 @@ import psutil
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 from dataset.generate_pdm_dataset import CARLAImageDataset
-from policy.diffusion_dit_tcp_policy import DiffusionDiTCarlaPolicy as DiffusionDiTTCPPolicy
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml
 
@@ -72,7 +71,7 @@ def validate_model(policy, val_loader, device):
             val_metrics['loss'].append(loss.item())
             
             obs_dict = {
-                'image': batch['image'][:, :policy.n_obs_steps],  # (B, obs_horizon, C, H, W)
+                'lidar_bev': batch['lidar_bev'][:, :policy.n_obs_steps],  # (B, obs_horizon, 3, 336, 336)
                 'agent_pos': batch['agent_pos'][:, :policy.n_obs_steps],  # (B, obs_horizon, 2) - 观测步的agent_pos
                 'speed': batch['speed'][:, :policy.n_obs_steps],
                 'target_point': batch['target_point'][:, :policy.n_obs_steps],
@@ -212,8 +211,15 @@ def train_carla_policy():
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
+    # 设置 checkpoint 目录
+    checkpoint_dir = "/home/wang/projects/diffusion_policy_z/checkpoints/carla_dit"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
+    val_loss = None  # 初始化验证损失
+    val_metrics = {}  # 初始化验证指标
+    
     for epoch in range(num_epochs):
         policy.train()
         train_losses = []
@@ -298,8 +304,6 @@ def train_carla_policy():
             val_loss = val_metrics.get('val_loss', float('inf'))
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                checkpoint_dir = "/home/wang/projects/diffusion_policy_z/checkpoints/carla_dit"
-                os.makedirs(checkpoint_dir, exist_ok=True)
             
                 torch.save({
                     'model_state_dict': policy.state_dict(),
