@@ -77,7 +77,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             feature_dim=256,
             use_group_norm=True,
             freeze_backbone=True,
-            bev_input_size=(336, 336)  # LiDAR BEV图像尺寸
+            bev_input_size=(448, 448)  # LiDAR BEV图像尺寸
         )
         obs_encoder.cuda()
         obs_encoder.eval()
@@ -232,7 +232,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
-            'lidar_bev': (B, obs_horizon, 3, 336, 336) - LiDAR BEV图像
+            'lidar_bev': (B, obs_horizon, 3, 448, 448) - LiDAR BEV图像
             'agent_pos': (B, obs_horizon, 2)
             'action': (B, action_horizon, action_dim)
             'speed': (B, obs_horizon)
@@ -654,7 +654,7 @@ def use_dummy_test():
 
     # dummy input - 使用CARLA驾驶数据集格式，obs_horizon=1
     obs_dict = {
-        'lidar_bev': torch.randn(4, 1, 3, 336, 336),  # LiDAR BEV图像格式 (336x336)
+        'lidar_bev': torch.randn(4, 1, 3, 448, 448),  # LiDAR BEV图像格式 (448x448)
         'agent_pos': torch.randn(4, 1, 2),      # 代理位置
         'speed': torch.randn(4, 1),             # 速度
         'theta': torch.randn(4, 1),             # 朝向角
