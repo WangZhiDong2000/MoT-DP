@@ -317,6 +317,6 @@ if __name__ == "__main__":
     parser.add_argument('--obs-horizon', type=int, default=2, help='Observation horizon length.')
     parser.add_argument('--action-horizon', type=int, default=4, help='Action horizon length.')
     parser.add_argument('--train-split', type=float, default=0.8, help='Ratio of files to use for training.')
-    parser.add_argument('--sample-interval', type=int, default=4, help='Interval for downsampling episode data.')
+    parser.add_argument('--sample-interval', type=int, default=2, help='Interval for downsampling episode data.')
     args = parser.parse_args()
     main(args)
