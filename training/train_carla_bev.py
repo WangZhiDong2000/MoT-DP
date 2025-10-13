@@ -24,6 +24,18 @@ def create_carla_config():
     return config
 
 
+def safe_wandb_log(data, use_wandb=True):
+    """安全地记录wandb日志，处理断网情况"""
+    if use_wandb:
+        try:
+            wandb.log(data)
+        except Exception as e:
+            # 断网或其他错误时，只打印警告但不中断训练
+            if "ConnectionError" in str(e) or "timeout" in str(e).lower():
+                print(f"⚠ WandB connection lost, continuing training without logging...")
+            # 静默处理，不打印过多错误信息
+
+
 def compute_driving_metrics(predicted_trajectories, target_trajectories):
     predicted_trajectories = predicted_trajectories.detach().cpu().numpy()
     target_trajectories = target_trajectories.detach().cpu().numpy()
@@ -112,23 +124,40 @@ def validate_model(policy, val_loader, device):
 def train_carla_policy():
     print("Initializing CARLA driving policy training...")
     config = create_carla_config()
-    wandb.init(
-        project=config.get('logging', {}).get('wandb_project', "carla-diffusion-policy"),
-        name=config.get('logging', {}).get('run_name', "carla_dit_full_validation"),
-        config={
-            "learning_rate": config.get('optimizer', {}).get('lr', 5e-5),
-            "epochs": config.get('training', {}).get('num_epochs', 50),
-            "batch_size": config.get('dataloader', {}).get('batch_size', 16),
-            "obs_horizon": config.get('obs_horizon', 2),
-            "action_horizon": config.get('action_horizon', 4),
-            "pred_horizon": config.get('pred_horizon', 8),
-            "dataset_path": config.get('training', {}).get('dataset_path', ""),
-            "max_files": None,
-            "train_split": 0.8,
-            "weight_decay": config.get('optimizer', {}).get('weight_decay', 1e-5),
-            "num_workers": config.get('dataloader', {}).get('num_workers', 4)
-        }
-    )
+    
+    # 支持wandb离线模式和断网恢复
+    wandb_mode = os.environ.get('WANDB_MODE', 'online')  # 可通过环境变量设置: export WANDB_MODE=offline
+    use_wandb = config.get('logging', {}).get('use_wandb', True)
+    
+    if use_wandb:
+        try:
+            wandb.init(
+                project=config.get('logging', {}).get('wandb_project', "carla-diffusion-policy"),
+                name=config.get('logging', {}).get('run_name', "carla_dit_full_validation"),
+                mode=wandb_mode,  # online, offline, or disabled
+                resume='allow',  # 允许断点续传
+                config={
+                    "learning_rate": config.get('optimizer', {}).get('lr', 5e-5),
+                    "epochs": config.get('training', {}).get('num_epochs', 50),
+                    "batch_size": config.get('dataloader', {}).get('batch_size', 16),
+                    "obs_horizon": config.get('obs_horizon', 2),
+                    "action_horizon": config.get('action_horizon', 4),
+                    "pred_horizon": config.get('pred_horizon', 8),
+                    "dataset_path": config.get('training', {}).get('dataset_path', ""),
+                    "max_files": None,
+                    "train_split": 0.8,
+                    "weight_decay": config.get('optimizer', {}).get('weight_decay', 1e-5),
+                    "num_workers": config.get('dataloader', {}).get('num_workers', 4)
+                }
+            )
+            print(f"✓ WandB initialized in {wandb_mode} mode")
+        except Exception as e:
+            print(f"⚠ WandB initialization failed: {e}")
+            print("  Continuing training without WandB logging...")
+            use_wandb = False
+    else:
+        print("⚠ WandB disabled in config")
+        use_wandb = False
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dataset_path = config.get('training', {}).get('dataset_path', "/media/z/data/dataset/carla/processed_mini_data")
     pred_horizon = config.get('pred_horizon', 6)
@@ -238,13 +267,13 @@ def train_carla_policy():
             
             if batch_idx % 10 == 0:
                 step = epoch * len(train_loader) + batch_idx
-                wandb.log({
+                safe_wandb_log({
                     "train/loss_step": loss.item(),
                     "train/epoch": epoch,
                     "train/step": step,
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/batch_idx": batch_idx
-                })
+                }, use_wandb)
                 
                 #print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
         
@@ -260,11 +289,11 @@ def train_carla_policy():
                     'val_metrics': val_metrics
                     }, os.path.join(checkpoint_dir, "carla_policy.pt"))
         
-        wandb.log({
+        safe_wandb_log({
             "train/loss_epoch": avg_train_loss,
             "train/epoch": epoch,
             "train/samples_processed": (epoch + 1) * len(train_dataset)
-        })
+        }, use_wandb)
 
         if (epoch + 1) % config.get('validation_freq', 1) == 0:
             print("Validating...")
@@ -295,7 +324,7 @@ def train_carla_policy():
                     trajectory_metrics[new_key] = value
         
             log_dict.update(trajectory_metrics)
-            wandb.log(log_dict)
+            safe_wandb_log(log_dict, use_wandb)
         
             print(f"Validation metrics:")
             for key, value in val_metrics.items():
@@ -316,21 +345,24 @@ def train_carla_policy():
             
                 print(f"✓ New best model saved with val_loss: {val_loss:.4f}")
             
-                wandb.log({
+                safe_wandb_log({
                     "best_model/epoch": epoch,
                     "best_model/val_loss": val_loss,
                     "best_model/train_loss": avg_train_loss
-                })
+                }, use_wandb)
     
     print("Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
-    wandb.log({
+    safe_wandb_log({
         "training/completed": True,
         "training/total_epochs": num_epochs,
         "training/best_val_loss": best_val_loss,
         "training/final_train_loss": avg_train_loss
-    })
-    wandb.finish()
+    }, use_wandb)
+    
+    if use_wandb:
+        wandb.finish()
+        print("✓ WandB session finished")
 
 if __name__ == "__main__":
     train_carla_policy()
