@@ -7,7 +7,9 @@ import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
-from model.tcp_bev_encoder import SimplifiedTCPEncoder
+# from model.tcp_bev_encoder import SimplifiedTCPEncoder
+from model.interfuser_bev_encoder import InterfuserBEVEncoder
+from model.interfuser_bev_encoder import load_lidar_submodules
 import os
 from collections import OrderedDict
 
@@ -70,19 +72,30 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # 从配置文件获取obs_horizon
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
         
-        # obs encoder - 使用SimplifiedTCPEncoder模型（适配LiDAR BEV输入）
-        obs_encoder = SimplifiedTCPEncoder(
-            perception_backbone=None,  # 自动创建ResNet34
-            state_dim=9,  # speed(1) + target_point(2) + command(6)
+        # obs encoder 
+        # obs_encoder = SimplifiedTCPEncoder(
+        #     perception_backbone=None,  # 自动创建ResNet34
+        #     state_dim=9,  # speed(1) + target_point(2) + command(6)
+        #     feature_dim=256,
+        #     use_group_norm=True,
+        #     freeze_backbone=True,
+        #     bev_input_size=(448, 448)  # LiDAR BEV图像尺寸
+        # )
+        obs_encoder = InterfuserBEVEncoder(
+            perception_backbone=None,
+            state_dim=9,
             feature_dim=256,
             use_group_norm=True,
-            freeze_backbone=True,
-            bev_input_size=(448, 448)  # LiDAR BEV图像尺寸
+            freeze_backbone=True,  # 设为False以便加载权重
+            bev_input_size=(448, 448)
         )
-        obs_encoder.cuda()
-        obs_encoder.eval()
-            
+        pretrained_path = os.path.join(
+        os.path.dirname(__file__), 
+        'interfuser/lidar_bev_encoder_only.pth'
+    )
+        load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
         self.obs_encoder = obs_encoder
+        self.obs_encoder.cuda()
 
         # TODO load vlm and vlm encoder model）
         self.vlm_backbone = None
