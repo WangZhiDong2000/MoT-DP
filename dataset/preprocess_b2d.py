@@ -102,14 +102,14 @@ def command_to_one_hot(command):
 
 def direction_cmd_to_one_hot(direction_cmd):
     """
-    Convert direction command string to one-hot encoding.
+    Convert direction command string to index (no longer one-hot encoding).
     
     Args:
         direction_cmd: String, one of ['FOLLOW_LANE', 'CHANGE_LANE_LEFT', 'CHANGE_LANE_RIGHT', 
                                        'GO_STRAIGHT', 'TURN_LEFT', 'TURN_RIGHT']
     
     Returns:
-        np.array: One-hot encoded vector of length 6
+        int: Index value (0-5) representing the direction command
     """
     direction_map = {
         'FOLLOW_LANE': 0,
@@ -120,24 +120,21 @@ def direction_cmd_to_one_hot(direction_cmd):
         'TURN_RIGHT': 5
     }
     
-    one_hot = np.zeros(6, dtype=np.float32)
     if direction_cmd in direction_map:
-        one_hot[direction_map[direction_cmd]] = 1.0
+        return direction_map[direction_cmd]
     else:
         # Default to FOLLOW_LANE if unknown
-        one_hot[0] = 1.0
-    
-    return one_hot
+        return 0
 
 def speed_cmd_to_one_hot(speed_cmd):
     """
-    Convert speed command string to one-hot encoding.
+    Convert speed command string to index (no longer one-hot encoding).
     
     Args:
         speed_cmd: String, one of ['KEEP', 'ACCELERATE', 'DECELERATE', 'STOP']
     
     Returns:
-        np.array: One-hot encoded vector of length 4
+        int: Index value (0-3) representing the speed command
     """
     speed_map = {
         'KEEP': 0,
@@ -146,14 +143,11 @@ def speed_cmd_to_one_hot(speed_cmd):
         'STOP': 3
     }
     
-    one_hot = np.zeros(4, dtype=np.float32)
     if speed_cmd in speed_map:
-        one_hot[speed_map[speed_cmd]] = 1.0
+        return speed_map[speed_cmd]
     else:
         # Default to KEEP if unknown
-        one_hot[0] = 1.0
-    
-    return one_hot
+        return 0
 
 def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmentation=0.0):
     """
@@ -624,26 +618,24 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                     if idx == 0 and last_valid_vqa is None:
                         print(f"\nWarning: No VQA data found for frame {ii} within search range and no previous VQA to use as fallback")
                 
-                # Extract meta actions from VQA extra_flags and convert to one-hot encoding
+                # Extract meta actions from VQA extra_flags (now as string values)
                 if frame_data['vqa'] is not None and 'extra_flags' in frame_data['vqa']:
                     extra_flags = frame_data['vqa']['extra_flags']
                     
-                    # Direction command (6 classes)
-                    direction_cmd = extra_flags.get('direction_cmd', 'FOLLOW_LANE')
-                    frame_data['meta_action_direction'] = direction_cmd_to_one_hot(direction_cmd)
+                    # Direction command (string: 'FOLLOW_LANE', 'TURN_LEFT', etc.)
+                    frame_data['meta_action_direction'] = extra_flags.get('direction_cmd', 'FOLLOW_LANE')
                     
-                    # Speed command (4 classes)
-                    speed_cmd = extra_flags.get('speed_cmd', 'KEEP')
-                    frame_data['meta_action_speed'] = speed_cmd_to_one_hot(speed_cmd)
+                    # Speed command (string: 'KEEP', 'ACCELERATE', etc.)
+                    frame_data['meta_action_speed'] = extra_flags.get('speed_cmd', 'KEEP')
                 else:
                     # Default values if no VQA data
-                    frame_data['meta_action_direction'] = direction_cmd_to_one_hot('FOLLOW_LANE')
-                    frame_data['meta_action_speed'] = speed_cmd_to_one_hot('KEEP')
+                    frame_data['meta_action_direction'] = 'FOLLOW_LANE'
+                    frame_data['meta_action_speed'] = 'KEEP'
             else:
                 frame_data['vqa'] = None
                 # Default values if no VQA root provided
-                frame_data['meta_action_direction'] = direction_cmd_to_one_hot('FOLLOW_LANE')
-                frame_data['meta_action_speed'] = speed_cmd_to_one_hot('KEEP')
+                frame_data['meta_action_direction'] = 'FOLLOW_LANE'
+                frame_data['meta_action_speed'] = 'KEEP'
 
             scene_data.append(frame_data)
             

@@ -153,9 +153,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
     def hard_process(self, final_sample, obs_horizon):
         '''
-        repeat command, target_point, and meta_actions to match obs_horizon
+        repeat command, target_point to match obs_horizon
+        meta_actions are now strings, so they don't need repeating
         '''
-        for key in ['command', 'next_command', 'target_point', 'meta_action_direction', 'meta_action_speed']:
+        for key in ['command', 'next_command', 'target_point']:
             if key in final_sample:
                 data = final_sample[key]
                 if isinstance(data, torch.Tensor):
@@ -170,6 +171,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample[key] = torch.from_numpy(repeated_data).float()
                 else:
                     print(f"Warning: Unsupported data type for key '{key}' during hard_process.")
+        
+        
         return final_sample
 
 def visualize_trajectory(sample, obs_horizon, rand_idx):
@@ -346,51 +349,73 @@ def visualize_vqa_on_image(sample, obs_horizon, rand_idx, max_qa_pairs=5):
     draw.text((text_x, text_y), "═══ META ACTIONS ═══", fill=(150, 50, 50), font=font_title)
     text_y += 25
     
-    # Display meta_action_direction
+    # Display meta_action_direction (now stored as string)
     if 'meta_action_direction' in sample:
         meta_dir = sample['meta_action_direction']
-        if isinstance(meta_dir, torch.Tensor):
-            meta_dir = meta_dir[0].cpu().numpy()  # Use first obs frame
-        elif isinstance(meta_dir, np.ndarray) and meta_dir.ndim > 1:
-            meta_dir = meta_dir[0]
         
-        # Convert to string representation
-        direction_labels = ['Left', 'Straight', 'Right']
-        if len(meta_dir) == 3:
-            direction_idx = np.argmax(meta_dir)
-            direction_str = direction_labels[direction_idx]
-            confidence = meta_dir[direction_idx]
-            draw.text((text_x, text_y), f"Direction: {direction_str} (confidence: {confidence:.3f})", 
-                     fill=(0, 0, 150), font=font_text)
-            text_y += 20
-            
-            # Show all probabilities
-            prob_str = f"  Probabilities: L={meta_dir[0]:.3f}, S={meta_dir[1]:.3f}, R={meta_dir[2]:.3f}"
-            draw.text((text_x + 10, text_y), prob_str, fill=(80, 80, 80), font=font_small)
-            text_y += 15
+        # Handle different data types - extract string value
+        if isinstance(meta_dir, str):
+            # Already a string, use directly
+            direction_value = meta_dir
+        elif isinstance(meta_dir, (list, np.ndarray)):
+            # If it's an array, take the first element
+            direction_value = meta_dir[0]
+        elif isinstance(meta_dir, torch.Tensor):
+            # If it's a tensor, extract the value
+            if meta_dir.numel() == 1:
+                direction_value = meta_dir.item()
+            else:
+                direction_value = meta_dir[0].item() if meta_dir[0].numel() == 1 else str(meta_dir[0])
+        else:
+            direction_value = str(meta_dir)
+        
+        # Convert string to readable format
+        direction_map = {
+            'FOLLOW_LANE': 'Follow Lane',
+            'CHANGE_LANE_LEFT': 'Change Lane Left',
+            'CHANGE_LANE_RIGHT': 'Change Lane Right',
+            'GO_STRAIGHT': 'Go Straight',
+            'TURN_LEFT': 'Turn Left',
+            'TURN_RIGHT': 'Turn Right'
+        }
+        direction_str = direction_map.get(direction_value, str(direction_value))
+        
+        draw.text((text_x, text_y), f"Direction: {direction_str}", 
+                 fill=(0, 0, 150), font=font_text)
+        text_y += 20
     
-    # Display meta_action_speed
+    # Display meta_action_speed (now stored as string)
     if 'meta_action_speed' in sample:
         meta_speed = sample['meta_action_speed']
-        if isinstance(meta_speed, torch.Tensor):
-            meta_speed = meta_speed[0].cpu().numpy()  # Use first obs frame
-        elif isinstance(meta_speed, np.ndarray) and meta_speed.ndim > 1:
-            meta_speed = meta_speed[0]
         
-        # Convert to string representation
-        speed_labels = ['Slow', 'Normal', 'Fast']
-        if len(meta_speed) == 3:
-            speed_idx = np.argmax(meta_speed)
-            speed_str = speed_labels[speed_idx]
-            confidence = meta_speed[speed_idx]
-            draw.text((text_x, text_y), f"Speed: {speed_str} (confidence: {confidence:.3f})", 
-                     fill=(0, 150, 0), font=font_text)
-            text_y += 20
-            
-            # Show all probabilities
-            prob_str = f"  Probabilities: Slow={meta_speed[0]:.3f}, Normal={meta_speed[1]:.3f}, Fast={meta_speed[2]:.3f}"
-            draw.text((text_x + 10, text_y), prob_str, fill=(80, 80, 80), font=font_small)
-            text_y += 15
+        # Handle different data types - extract string value
+        if isinstance(meta_speed, str):
+            # Already a string, use directly
+            speed_value = meta_speed
+        elif isinstance(meta_speed, (list, np.ndarray)):
+            # If it's an array, take the first element
+            speed_value = meta_speed[0]
+        elif isinstance(meta_speed, torch.Tensor):
+            # If it's a tensor, extract the value
+            if meta_speed.numel() == 1:
+                speed_value = meta_speed.item()
+            else:
+                speed_value = meta_speed[0].item() if meta_speed[0].numel() == 1 else str(meta_speed[0])
+        else:
+            speed_value = str(meta_speed)
+        
+        # Convert string to readable format
+        speed_map = {
+            'KEEP': 'Keep Speed',
+            'ACCELERATE': 'Accelerate',
+            'DECELERATE': 'Decelerate',
+            'STOP': 'Stop'
+        }
+        speed_str = speed_map.get(speed_value, str(speed_value))
+        
+        draw.text((text_x, text_y), f"Speed: {speed_str}", 
+                 fill=(0, 150, 0), font=font_text)
+        text_y += 20
     
     # Convert back to numpy for matplotlib
     canvas_np = np.array(canvas)
