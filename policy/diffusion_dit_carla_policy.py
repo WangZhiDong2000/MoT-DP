@@ -109,10 +109,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         obs_feature_dim = 256  
         
         # Optional GroupNorm for j_ctrl features (recommended for training stability)
-        self.use_j_ctrl_norm = policy_cfg.get('use_j_ctrl_norm', False)
-        if self.use_j_ctrl_norm:
-            self.j_ctrl_norm = nn.GroupNorm(num_groups=8, num_channels=256)
-            print("✓ GroupNorm enabled for j_ctrl features")  
+        # self.use_j_ctrl_norm = policy_cfg.get('use_j_ctrl_norm', False)
+        # if self.use_j_ctrl_norm:
+        #     self.j_ctrl_norm = nn.GroupNorm(num_groups=8, num_channels=256)
+        #     print("✓ GroupNorm enabled for j_ctrl features")  
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
@@ -217,17 +217,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             command = obs_dict['next_command'].to(dtype=torch.float32)
             state = torch.cat([speed, target_point, command], 1).to('cuda')
             
-            # 使用SimplifiedTCPEncoder的forward方法
-            with torch.no_grad():
-                if return_attention:
-                    j_ctrl, attention_map = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=True)
-                else:
-                    j_ctrl = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=False)
-                    attention_map = None
+            if return_attention:
+                j_ctrl, attention_map = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=True)
+            else:
+                j_ctrl = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=False)
+                attention_map = None
                 
             # Optional GroupNorm for better training stability
-            if self.use_j_ctrl_norm and self.training:
-                j_ctrl = self.j_ctrl_norm(j_ctrl.unsqueeze(-1)).squeeze(-1)
+            # if self.use_j_ctrl_norm and self.training:
+            #     j_ctrl = self.j_ctrl_norm(j_ctrl.unsqueeze(-1)).squeeze(-1)
             
             if return_attention:
                 return j_ctrl, attention_map

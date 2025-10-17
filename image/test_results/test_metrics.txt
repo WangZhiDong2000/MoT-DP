@@ -5,46 +5,46 @@ Test Results Summary
 Number of samples: 21428
 
 Basic Metrics:
-  MSE: 65.307765 ± 117.919321
-  MAE: 3.800825 ± 3.473347
-  ADE: 6.902926 ± 6.407026  (Average Displacement Error)
-  FDE: 14.493804 ± 13.103919  (Final Displacement Error)
-  L2 Distance (mean): 6.902926 ± 9.108520
-  L2 Distance (median): 3.379936
-  L2 Distance (max): 73.964214
-  L2 Distance (min): 0.000008
+  MSE: 922.633789 ± 718.320713
+  MAE: 18.191086 ± 9.390787
+  ADE: 32.903981 ± 16.386637  (Average Displacement Error)
+  FDE: 53.788770 ± 30.124522  (Final Displacement Error)
+  L2 Distance (mean): 32.903981 ± 27.615134
+  L2 Distance (median): 21.992325
+  L2 Distance (max): 114.817346
+  L2 Distance (min): 0.025688
 
 Driving Metrics (from train_carla_bev.py):
-  Trajectory Error (mean): 6.901660
-  Trajectory Error (step 1): 2.142334
-  Trajectory Error (step 2): 5.371148
-  Trajectory Error (step 3): 9.432645
-  Trajectory Error (step 4): 14.490120
-  X Coordinate MAE: 6.523843
-  Y Coordinate MAE: 1.076688
-  Trajectory Smoothness Error: 2.608077
+  Trajectory Error (mean): 32.904231
+  Trajectory Error (step 1): 13.634851
+  Trajectory Error (step 2): 30.055164
+  Trajectory Error (step 3): 47.044817
+  Trajectory Error (step 4): 53.788933
+  X Coordinate MAE: 31.601340
+  Y Coordinate MAE: 4.782440
+  Trajectory Smoothness Error: 10.570735
 
 ============================================================
 All Metrics (key-value pairs):
 ============================================================
-ADE: 6.902926
-ADE_std: 6.407026
-FDE: 14.493804
-FDE_std: 13.103919
-L2_max: 73.964214
-L2_mean: 6.902926
-L2_median: 3.379936
-L2_min: 0.000008
-L2_std: 9.108520
-MAE: 3.800825
-MAE_std: 3.473347
-MSE: 65.307765
-MSE_std: 117.919321
-trajectory_error_mean: 6.901660
-trajectory_error_step_1: 2.142334
-trajectory_error_step_2: 5.371148
-trajectory_error_step_3: 9.432645
-trajectory_error_step_4: 14.490120
-trajectory_smoothness_error: 2.608077
-x_coordinate_mae: 6.523843
-y_coordinate_mae: 1.076688
+ADE: 32.903981
+ADE_std: 16.386637
+FDE: 53.788770
+FDE_std: 30.124522
+L2_max: 114.817346
+L2_mean: 32.903981
+L2_median: 21.992325
+L2_min: 0.025688
+L2_std: 27.615134
+MAE: 18.191086
+MAE_std: 9.390787
+MSE: 922.633789
+MSE_std: 718.320713
+trajectory_error_mean: 32.904231
+trajectory_error_step_1: 13.634851
+trajectory_error_step_2: 30.055164
+trajectory_error_step_3: 47.044817
+trajectory_error_step_4: 53.788933
+trajectory_smoothness_error: 10.570735
+x_coordinate_mae: 31.601340
+y_coordinate_mae: 4.782440
