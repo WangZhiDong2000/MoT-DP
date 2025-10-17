@@ -189,31 +189,33 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
     
     plt.figure(figsize=(10, 8))
     
-    # Plot observed and predicted points
+    # Plot predicted agent positions (future waypoints)
     if len(pred_agent_pos) > 0:
         plt.plot(pred_agent_pos[:, 1], pred_agent_pos[:, 0], 'ro--', label='Predicted agent_pos', markersize=8, linewidth=2)
     
-    # Plot target point
-    if target_point is not None:
-        if target_point.ndim == 2:
-            target_point = target_point[0]
-        plt.plot(target_point[1], target_point[0], 'g*', markersize=15, label='Target point (relative)', markeredgecolor='black', markeredgewidth=1)
+    # Target point visualization is removed as requested
+    # if target_point is not None:
+    #     ...
         
 
 
     
-    plt.xlabel('Y (relative to last obs)')
-    plt.ylabel('X (relative to last obs)')
-    plt.title(f'Sample {rand_idx}: Trajectory & Target Point\n(All positions relative to last observation)')
-    plt.legend()
+    plt.xlabel('Y (ego frame, lateral)', fontsize=12)
+    plt.ylabel('X (ego frame, longitudinal)', fontsize=12)
+    plt.title(f'Sample {rand_idx}: Predicted Trajectory\n(Ego coordinate frame, origin at current position)', fontsize=14)
+    plt.legend(fontsize=10, loc='best')
     plt.grid(True, alpha=0.3)
     plt.axis('equal')
+    
+    # Add origin marker
+    plt.plot(0, 0, 'ko', markersize=10, label='Current position (origin)', zorder=5)
+    plt.legend(fontsize=10, loc='best')  # Update legend after adding origin
     plt.tight_layout()
     
-    save_path = f'/home/wang/Project/MoT-DP/image/sample_{rand_idx}_agent_pos_with_target.png'
+    save_path = f'/home/wang/Project/MoT-DP/image/sample_{rand_idx}_agent_pos.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
-    print(f"保存agent_pos和target_point图像到: {save_path}")
+    print(f"保存agent_pos图像到: {save_path}")
 
 def visualize_observation_images(sample, obs_horizon, rand_idx):
     """
@@ -295,13 +297,13 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon):
 def test():
     import random
     # 重要：现在路径应该指向预处理好的数据集的根目录
-    dataset_path = '/home/wang/Project/carla_garage/tmp_data'  # 预处理数据集路径
+    dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data'  # 预处理数据集路径
     obs_horizon = 2
     
     # 使用新的Dataset类
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        image_data_root='/home/wang/Project/carla_garage/data'  # 图像的根目录
+        image_data_root='/home/wang/Dataset/b2d_10scene'  # 图像的根目录
     )
     
     print(f"\n总样本数: {len(dataset)}")

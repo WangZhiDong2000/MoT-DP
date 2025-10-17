@@ -9,7 +9,7 @@ import multiprocessing
 import argparse
 
 # All data in the Bench2Drive dataset are in the left-handed coordinate system.
-# This code converts all coordinate systems (world coordinate system, vehicle coordinate system,
+# This code converts all the data (world coordinate system, vehicle coordinate system,
 # camera coordinate system, and lidar coordinate system) to the right-handed coordinate system
 # consistent with the nuscenes dataset.
 
@@ -188,8 +188,8 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
     folder_list_new = []
     for folder in folder_list:
         folder_path = join(data_root, folder)
-        # Check if this folder directly contains 'measurements' or 'lidar'
-        if os.path.exists(join(folder_path, 'measurements')) or os.path.exists(join(folder_path, 'lidar')):
+        # Check if this folder directly contains 'measurements'/'anno' or 'lidar'
+        if os.path.exists(join(folder_path, 'measurements')) or os.path.exists(join(folder_path, 'anno')) or os.path.exists(join(folder_path, 'lidar')):
             # This is already a route folder with data
             folder_list_new.append(folder)
         else:
@@ -198,7 +198,7 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                 all_scenes = os.listdir(folder_path)
                 for scene in all_scenes:
                     scene_path = join(folder_path, scene)
-                    if os.path.exists(join(scene_path, 'measurements')) or os.path.exists(join(scene_path, 'lidar')):
+                    if os.path.exists(join(scene_path, 'measurements')) or os.path.exists(join(scene_path, 'anno')) or os.path.exists(join(scene_path, 'lidar')):
                         folder_list_new.append(join(folder, scene))
 
     if idx == 0:
@@ -209,12 +209,14 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
     for folder_name in folders:
         folder_path = join(data_root, folder_name)
         
-        # Check if measurements directory exists
+        # Check if measurements directory exists (support both 'measurements' and 'anno')
         measurements_dir = join(folder_path, 'measurements')
         if not os.path.exists(measurements_dir):
-            if idx == 0:
-                print(f"\nWarning: measurements directory not found in {folder_path}, skipping...")
-            continue
+            measurements_dir = join(folder_path, 'anno')
+            if not os.path.exists(measurements_dir):
+                if idx == 0:
+                    print(f"\nWarning: measurements/anno directory not found in {folder_path}, skipping...")
+                continue
             
         measurements_files = sorted(os.listdir(measurements_dir))
         num_seq = len(measurements_files)
@@ -245,7 +247,7 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                     continue
                 try:
                     measurement_file = measurements_files[i]
-                    with gzip.open(join(folder_path, 'measurements', measurement_file), 'rt', encoding='utf-8') as gz_file:
+                    with gzip.open(join(measurements_dir, measurement_file), 'rt', encoding='utf-8') as gz_file:
                         anno = json.load(gz_file)
                     # Inject frame_id from filename for consistency
                     anno['frame_id'] = int(measurement_file.split('.')[0])
@@ -278,26 +280,130 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             frame_data['steer'] = current_anno_in_list['steer']
             frame_data['brake'] = current_anno_in_list['brake']
             # frame_data['theta'] = current_anno_in_list['theta']       # need history for theta
-            frame_data['command'] = command_to_one_hot(current_anno_in_list['command'])
-            frame_data['next_command'] = command_to_one_hot(current_anno_in_list['next_command'])
-            frame_data['target_point'] = np.array(current_anno_in_list['target_point'])
+            
+            # Command handling - following TCP's approach
+            # TCP uses next_command as the main command
+            command = current_anno_in_list.get('next_command', current_anno_in_list.get('command_near', 4))
+            next_command = current_anno_in_list.get('next_command', 4)
+            
+            frame_data['command'] = command_to_one_hot(command)
+            frame_data['next_command'] = command_to_one_hot(next_command)
+            
+            # Target point - following TCP's approach: convert to ego frame
+            # TCP uses x_target, y_target in world coordinates and converts to ego frame
+            origin_x = current_anno_in_list['x']
+            origin_y = current_anno_in_list['y']
+            origin_theta = current_anno_in_list['theta']
+            
+            target_x_world = current_anno_in_list.get('x_target', origin_x)
+            target_y_world = current_anno_in_list.get('y_target', origin_y)
+            
+            # Convert target to ego frame (rotate by -theta)
+            # In CARLA: theta=0 means facing +Y (North), theta increases CCW
+            # Vehicle frame: x=forward, y=left
+            # So vehicle heading angle from +X axis is: theta - 90 degrees
+            heading_angle = origin_theta - np.pi/2  # Convert from CARLA theta to standard heading
+            cos_theta = np.cos(-heading_angle)
+            sin_theta = np.sin(-heading_angle)
+            dx = target_x_world - origin_x
+            dy = target_y_world - origin_y
+            target_x_ego = cos_theta * dx - sin_theta * dy
+            target_y_ego = sin_theta * dx + cos_theta * dy
+            
+            frame_data['target_point'] = np.array([target_x_ego, target_y_ego])
 
             # --- future waypoints and route ---
-            # Waypoints: Pass the down-sampled future measurements to get_waypoints
-            # The list starts from the current frame
-            future_measurements = loaded_measurements[current_idx_in_list:]       
-            waypoints = get_waypoints(future_measurements, action_horizon=action_horizon)
+            future_measurements = loaded_measurements[current_idx_in_list:]
+            
+            # Construct waypoints from x, y positions (TCP's approach)
+            waypoints = []
+            origin_x = future_measurements[0]['x']
+            origin_y = future_measurements[0]['y']
+            origin_theta = future_measurements[0]['theta']
+            
+            # Create rotation matrix for current frame
+            # In vehicle frame: x is forward, y is left
+            # In CARLA: theta=0 means facing +Y (North), theta increases CCW
+            # So vehicle heading angle from +X axis is: theta - 90 degrees
+            heading_angle = origin_theta - np.pi/2  # Convert from CARLA theta to standard heading
+            cos_theta = np.cos(-heading_angle)
+            sin_theta = np.sin(-heading_angle)
+            
+            # First waypoint is always [0, 0] (current position in ego frame)
+            waypoints.append(np.array([0.0, 0.0]))
+            
+            # Transform future positions to ego frame
+            for index in range(1, action_horizon + 1):
+                if index < len(future_measurements):
+                    world_x = future_measurements[index]['x']
+                    world_y = future_measurements[index]['y']
+                    
+                    # Transform to ego frame (rotate by -theta)
+                    dx = world_x - origin_x
+                    dy = world_y - origin_y
+                    ego_x = cos_theta * dx - sin_theta * dy
+                    ego_y = sin_theta * dx + cos_theta * dy
+                    waypoints.append(np.array([ego_x, ego_y]))
+                else:
+                    # Pad with last waypoint if we run out of measurements
+                    if len(waypoints) > 1:
+                        waypoints.append(waypoints[-1].copy())
+                    else:
+                        waypoints.append(np.array([0.0, 0.0]))
+            
+            # Final check to ensure correct length
+            while len(waypoints) < action_horizon + 1:
+                if len(waypoints) > 1:
+                    waypoints.append(waypoints[-1].copy())
+                else:
+                    waypoints.append(np.array([0.0, 0.0]))
+            
             frame_data['ego_waypoints'] = np.array(waypoints)
             assert frame_data['ego_waypoints'].shape == (action_horizon + 1, 2)
             
-            # Route information
-            route = current_anno_in_list['route']
+            
+            # Convert all route points to ego frame
+            route = []
+            
+            # Add current position (always [0, 0] in ego frame)
+            route.append([0.0, 0.0])
+            
+            # Use the same heading_angle computed earlier for target_point
+            heading_angle = origin_theta - np.pi/2
+            cos_theta_route = np.cos(-heading_angle)
+            sin_theta_route = np.sin(-heading_angle)
+            
+            # Add command_near target in ego frame
+            if 'x_command_near' in current_anno_in_list:
+                cmd_near_x_world = current_anno_in_list['x_command_near']
+                cmd_near_y_world = current_anno_in_list['y_command_near']
+                dx = cmd_near_x_world - origin_x
+                dy = cmd_near_y_world - origin_y
+                cmd_near_x_ego = cos_theta_route * dx - sin_theta_route * dy
+                cmd_near_y_ego = sin_theta_route * dx + cos_theta_route * dy
+                route.append([cmd_near_x_ego, cmd_near_y_ego])
+            
+            # Add command_far target in ego frame
+            if 'x_command_far' in current_anno_in_list:
+                cmd_far_x_world = current_anno_in_list['x_command_far']
+                cmd_far_y_world = current_anno_in_list['y_command_far']
+                dx = cmd_far_x_world - origin_x
+                dy = cmd_far_y_world - origin_y
+                cmd_far_x_ego = cos_theta_route * dx - sin_theta_route * dy
+                cmd_far_y_ego = sin_theta_route * dx + cos_theta_route * dy
+                route.append([cmd_far_x_ego, cmd_far_y_ego])
+            
+            # Add target point (already in ego frame)
+            route.append([target_x_ego, target_y_ego])
+            
+            # Pad to 20 waypoints
+            route = np.array(route)
             if len(route) < 20:
                 num_missing = 20 - len(route)
-                route = np.array(route)
                 route = np.vstack((route, np.tile(route[-1], (num_missing, 1))))
             else:
-                route = np.array(route[:20])
+                route = route[:20]
+            
             frame_data['route'] = route
 
             # --- Low dimensional state History ---
@@ -325,18 +431,40 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             # --- Image History ---
             rgb_hist = []
             obs_start_idx = ii - (obs_horizon - 1) * hz_interval
+            
+            # Support both 'rgb' and 'camera/rgb_front' directory structures
+            rgb_dir_options = [
+                join(folder_path, 'rgb'),
+                join(folder_path, 'camera', 'rgb_front')
+            ]
+            rgb_dir = None
+            for option in rgb_dir_options:
+                if os.path.exists(option):
+                    rgb_dir = option
+                    break
+            
+            if rgb_dir is None:
+                if idx == 0:
+                    print(f"\nWarning: rgb directory not found in {folder_path}, skipping frame {ii}...")
+                continue
+            
+            use_5digit = 'camera/rgb_front' in rgb_dir
+                
             for j in range(obs_start_idx, ii + 1, hz_interval):
                 if j < 0: continue
-                img_path = join(rgb_dir, f"{j:04d}.jpg")
                 if STORE_BYTES:
+                    img_path = join(rgb_dir, f"{j:05d}.jpg" if use_5digit else f"{j:04d}.jpg")
                     try:
                         with open(img_path, 'rb') as f:
                             rgb_hist.append(f.read())
                     except FileNotFoundError:
                         rgb_hist.append(b"") # Placeholder for missing image
                 else:
-                    # Store relative path
-                    rgb_hist.append(join(folder_name, 'rgb', f"{j:04d}.jpg"))
+                    # Store relative path (following gen_tcp_data.py format)
+                    if use_5digit:
+                        rgb_hist.append(join(folder_name, 'camera', 'rgb_front', f"{j:05d}.jpg"))
+                    else:
+                        rgb_hist.append(join(folder_name, 'rgb', f"{j:04d}.jpg"))
             
             # Pad if we don't have enough history frames (e.g., at the start of a scene)
             while len(rgb_hist) < obs_horizon:
@@ -344,7 +472,10 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                     rgb_hist.insert(0, rgb_hist[0])
                 else:
                     # This should not happen if scen_start_frame_offset is correct, but as a fallback:
-                    rgb_hist.insert(0, join(folder_name, 'rgb', f"{obs_start_idx:04d}.jpg"))
+                    if use_5digit:
+                        rgb_hist.insert(0, join(folder_name, 'camera', 'rgb_front', f"{obs_start_idx:05d}.jpg"))
+                    else:
+                        rgb_hist.insert(0, join(folder_name, 'rgb', f"{obs_start_idx:04d}.jpg"))
                     
             frame_data['rgb_hist_jpg'] = rgb_hist
             
@@ -354,7 +485,8 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             if os.path.exists(lidar_bev_dir):
                 for j in range(obs_start_idx, ii + 1, hz_interval):
                     if j < 0: continue
-                    bev_path = join(lidar_bev_dir, f"{j:04d}.png")
+                    # Use 5-digit format for b2d dataset
+                    bev_path = join(lidar_bev_dir, f"{j:05d}.png" if use_5digit else f"{j:04d}.png")
                     if STORE_BYTES:
                         try:
                             with open(bev_path, 'rb') as f:
@@ -363,7 +495,10 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                             lidar_bev_hist.append(b"")
                     else:
                         if os.path.exists(bev_path):
-                            lidar_bev_hist.append(join(folder_name, 'lidar_bev', f"{j:04d}.png"))
+                            if use_5digit:
+                                lidar_bev_hist.append(join(folder_name, 'lidar_bev', f"{j:05d}.png"))
+                            else:
+                                lidar_bev_hist.append(join(folder_name, 'lidar_bev', f"{j:04d}.png"))
                         else:
                             lidar_bev_hist.append(None) # Mark missing BEV image
                 
@@ -407,10 +542,7 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
         else:
             raise ValueError(f"Invalid save_mode: {save_mode}. Must be 'scene' or 'frame'.")
 
-    # This part is not used for creating final info files anymore
-    # os.makedirs(join(out_dir, tmp_dir), exist_ok=True)
-    # with open(join(out_dir, tmp_dir, 'b2d_infos_' + train_or_val + '_' + str(idx) + '.pkl'), 'wb') as f:
-    #    pickle.dump(final_data, f)
+    
 
 def generate_infos(folder_list, workers, tmp_dir, data_root, out_dir,
                    obs_horizon, action_horizon, sample_interval, hz_interval, save_mode):
@@ -469,8 +601,8 @@ def split_train_val(in_dir, out_dir, val_ratio=0.1):
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
-    argparser.add_argument('--data-root', type=str, default='/home/wang/Project/carla_garage/data/' , help='Root directory of raw PDM Lite data')
-    argparser.add_argument('--out-dir', type=str, default='/home/wang/Project/carla_garage/tmp_data', help='Output directory for processed data')
+    argparser.add_argument('--data-root', type=str, default='/home/wang/Dataset/b2d_10scene' , help='Root directory of raw PDM Lite data')
+    argparser.add_argument('--out-dir', type=str, default='/home/wang/Dataset/b2d_10scene/tmp_data', help='Output directory for processed data')
     argparser.add_argument('--obs-horizon', type=int, default=2, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=8, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
     argparser.add_argument('--sample-interval', type=int, default=2, help='Interval between training samples (e.g., 10 frames)')
@@ -504,28 +636,36 @@ if __name__ == "__main__":
                     relative_route_path = join(town_folder, 'data', route_folder)
                     train_list.append(relative_route_path)
     else:
-        # Try Structure 2: <ScenarioName>/<route_folder> (where route_folder contains 'lidar' or 'measurements')
+        # Try Structure 2: <ScenarioName>/<route_folder> (where route_folder contains 'lidar' or 'measurements' or 'anno')
         print(f"No Town folders found, trying Structure 2: <ScenarioName>/<RouteFolder>/...")
         all_scenarios = [d for d in os.listdir(args.data_root) 
-                        if os.path.isdir(join(args.data_root, d))]
+                        if os.path.isdir(join(args.data_root, d)) and d != 'tmp_data']
         
         for scenario_folder in all_scenarios:
             scenario_path = join(args.data_root, scenario_folder)
-            route_folders = [d for d in os.listdir(scenario_path) 
-                           if os.path.isdir(join(scenario_path, d))]
-            
-            for route_folder in route_folders:
-                route_path = join(scenario_path, route_folder)
-                # Check if this folder contains required data (lidar or measurements)
-                if (os.path.exists(join(route_path, 'lidar')) or 
-                    os.path.exists(join(route_path, 'measurements'))):
-                    relative_route_path = join(scenario_folder, route_folder)
-                    train_list.append(relative_route_path)
+            # Check if this folder contains required data (lidar or measurements or anno)
+            if (os.path.exists(join(scenario_path, 'lidar')) or 
+                os.path.exists(join(scenario_path, 'measurements')) or
+                os.path.exists(join(scenario_path, 'anno'))):
+                train_list.append(scenario_folder)
+            else:
+                # Maybe there are route folders inside
+                route_folders = [d for d in os.listdir(scenario_path) 
+                               if os.path.isdir(join(scenario_path, d))]
+                
+                for route_folder in route_folders:
+                    route_path = join(scenario_path, route_folder)
+                    # Check if this folder contains required data (lidar or measurements or anno)
+                    if (os.path.exists(join(route_path, 'lidar')) or 
+                        os.path.exists(join(route_path, 'measurements')) or
+                        os.path.exists(join(route_path, 'anno'))):
+                        relative_route_path = join(scenario_folder, route_folder)
+                        train_list.append(relative_route_path)
 
     if not train_list:
         print(f"Warning: No route folders found in {args.data_root}. Please check the directory structure.")
         print("Expected structure 1: --data-root/TownXX/data/route_folder_name")
-        print("Expected structure 2: --data-root/<ScenarioName>/<RouteFolder>/ (with lidar/ or measurements/ subdirectory)")
+        print("Expected structure 2: --data-root/<ScenarioName>/ (with lidar/ or measurements/ or anno/ subdirectory)")
     else:
         print(f"Found {len(train_list)} route folders to process.")
     

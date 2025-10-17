@@ -13,7 +13,7 @@ import time
 import psutil
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-from dataset.generate_pdm_dataset import CARLAImageDataset
+from dataset.generate_b2d_dataset import CARLAImageDataset
 from policy.diffusion_dit_tcp_policy import DiffusionDiTCarlaPolicy as DiffusionDiTTCPPolicy
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml

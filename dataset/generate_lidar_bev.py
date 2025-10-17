@@ -321,25 +321,34 @@ def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, sce
                     else:
                         all_scenes.extend(repetition_folders)
     else:
-        # Try Structure 2: <dataset_root>/<ScenarioName>/<RouteFolder>/lidar/
-        print(f"No Town folders found, trying Structure 2: <ScenarioName>/<RouteFolder>/...")
+        # Try Structure 2: <dataset_root>/<ScenarioName>/lidar/ or <dataset_root>/<ScenarioName>/<RouteFolder>/lidar/
+        print(f"No Town folders found, trying Structure 2: <ScenarioName>/lidar/ or <ScenarioName>/<RouteFolder>/lidar/...")
         scenario_folders = [d for d in glob.glob(os.path.join(dataset_root, '*')) if os.path.isdir(d)]
+        
+        # Filter out processed_data and other non-scenario folders
+        scenario_folders = [d for d in scenario_folders if not os.path.basename(d).startswith('.') 
+                           and os.path.basename(d) not in ['processed_data', 'tmp_data', 'test_output']]
         
         if scenario_filter:
             scenario_folders = [d for d in scenario_folders if os.path.basename(d) in scenario_filter]
         
         for scenario_path in scenario_folders:
-            # Find all route folders within each scenario
-            route_folders = [d for d in glob.glob(os.path.join(scenario_path, '*')) if os.path.isdir(d)]
-            for route_path in route_folders:
-                # Check if this folder contains a 'lidar' subdirectory
-                if os.path.isdir(os.path.join(route_path, 'lidar')):
-                    all_scenes.append(route_path)
+            # First check if lidar is directly under scenario folder (b2d_10scene structure)
+            if os.path.isdir(os.path.join(scenario_path, 'lidar')):
+                all_scenes.append(scenario_path)
+            else:
+                # Otherwise, find all route folders within each scenario
+                route_folders = [d for d in glob.glob(os.path.join(scenario_path, '*')) if os.path.isdir(d)]
+                for route_path in route_folders:
+                    # Check if this folder contains a 'lidar' subdirectory
+                    if os.path.isdir(os.path.join(route_path, 'lidar')):
+                        all_scenes.append(route_path)
     
     if not all_scenes:
         print(f"Error: No valid scenes found in {dataset_root}.")
         print(f"Tried Structure 1: <dataset_root>/TownXX/data/<RouteName>/<Repetition>/lidar/")
-        print(f"Tried Structure 2: <dataset_root>/<ScenarioName>/<RouteFolder>/lidar/")
+        print(f"Tried Structure 2: <dataset_root>/<ScenarioName>/lidar/")
+        print(f"Tried Structure 3: <dataset_root>/<ScenarioName>/<RouteFolder>/lidar/")
         print(f"\nPlease check your directory structure.")
         return
     
@@ -462,10 +471,10 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Generate LiDAR BEV images from PDM Lite dataset')
     parser.add_argument('--input_dir', type=str, 
-                       default='/home/wang/Project/carla_garage/data',
+                       default='/home/wang/Dataset/b2d_10scene',
                        help='Input directory containing the PDM Lite dataset')
     parser.add_argument('--output_dir', type=str, 
-                       default='/home/wang/projects/diffusion_policy_z/data/pdm_lite_bev',
+                       default='/home/wang/Dataset/b2d_10scene',
                        help='Output directory for BEV images (only used if --save_in_place is not set)')
     parser.add_argument('--save_in_place', action='store_true', default=True,
                        help='Save BEV images in the original dataset structure (creates lidar_bev folder alongside lidar folder)')

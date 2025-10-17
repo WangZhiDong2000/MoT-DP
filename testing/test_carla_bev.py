@@ -18,7 +18,7 @@ from scipy.ndimage import zoom
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
-from dataset.generate_pdm_dataset import CARLAImageDataset
+from dataset.generate_b2d_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 
 
@@ -38,10 +38,10 @@ def load_best_model(checkpoint_path, config, device):
     
     # 提取action统计信息
     action_stats = {
-    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    'mean': torch.tensor([10.975193977355957, 0.04004639387130737]),
-    'std': torch.tensor([14.96833324432373, 3.419595956802368]),
+    'min': torch.tensor([-2.7400121688842773, -4.734850883483887]),
+    'max': torch.tensor([20.197893142700195, 9.115757942199707]),
+    'mean': torch.tensor([4.428925037384033, 0.18523629009723663]),
+    'std': torch.tensor([4.4664106369018555, 1.0404058694839478]),
 }
     
     # 初始化模型
@@ -602,7 +602,7 @@ def main():
     config = load_config(config_path)
     
     # 加载最优模型
-    checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_policy_best.pt"
+    checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_policy_best1.pt"
     policy = load_best_model(checkpoint_path, config, device)
     
     # 加载测试数据集
