@@ -18,7 +18,7 @@ from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml
 
 def create_carla_config():
-    config_path = "/home/wang/projects/diffusion_policy_z/config/carla.yaml"
+    config_path = "/home/wang/Project/MoT-DP/config/carla.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
@@ -45,7 +45,7 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories):
 
     # 不同时间步的L2误差（仿照TCP的0.5s, 1s, 1.5s, 2s评估）
     metrics = {}
-    time_steps = [0, 1, 2, 3]  
+    time_steps = [1, 3, 5, 7]  
     time_labels = ['step_1', 'step_2', 'step_3', 'step_4']
     
     for i, (step, label) in enumerate(zip(time_steps, time_labels)):
@@ -93,7 +93,7 @@ def validate_model(policy, val_loader, device):
             try:
                 result = policy.predict_action(obs_dict)
                 predicted_actions = torch.from_numpy(result['action']).to(device)
-                target_actions = batch['agent_pos'][:, policy.n_obs_steps:policy.n_obs_steps + predicted_actions.shape[1]]
+                target_actions = batch['agent_pos'][:, :predicted_actions.shape[1]]
                 
                 if batch_idx == 0:
                     print(f"\n=== Debug Info ===")
@@ -159,37 +159,15 @@ def train_carla_policy():
         print("⚠ WandB disabled in config")
         use_wandb = False
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset_path = config.get('training', {}).get('dataset_path', "/media/z/data/dataset/carla/processed_mini_data")
-    pred_horizon = config.get('pred_horizon', 6)
-    obs_horizon = config.get('obs_horizon', 2)
-    action_horizon = config.get('action_horizon', 4)
-    sample_interval = config.get('training', {}).get('sample_interval', 5)  # 新增：从配置读取采样间隔
-    max_files = None # 设置为 None 以加载所有数据文件
-    
-    train_dataset = CARLAImageDataset(
-        dataset_path=dataset_path,
-        # pred_horizon=pred_horizon,
-        # obs_horizon=obs_horizon, 
-        # action_horizon=action_horizon,
-        # max_files=max_files,
-        # train_split=0.8,
-        mode='train',
-        # device=device,
-        # use_gpu_processing=True
-    )
-    
-    val_dataset = CARLAImageDataset(
-        dataset_path=dataset_path,
-        #pred_horizon=pred_horizon,
-        #obs_horizon=obs_horizon,
-        #action_horizon=action_horizon,
-        #max_files=max_files,
-        #train_split=0.8,
-        mode='val',
-        #device=device,
-        #use_gpu_processing=True
-    )
-    
+
+    # dataset
+    dataset_path_root = config.get('training', {}).get('dataset_path')
+    train_dataset_path = os.path.join(dataset_path_root, 'train')
+    val_dataset_path = os.path.join(dataset_path_root, 'val')
+    image_data_root = config.get('training', {}).get('image_data_root')
+    train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
+    val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
+
     print(f"\nTraining samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
     
@@ -241,7 +219,7 @@ def train_carla_policy():
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
     # 设置 checkpoint 目录
-    checkpoint_dir = "/home/wang/projects/diffusion_policy_z/checkpoints/carla_dit"
+    checkpoint_dir = "/home/wang/Project/MoT-DP/checkpoints/carla_dit"
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)

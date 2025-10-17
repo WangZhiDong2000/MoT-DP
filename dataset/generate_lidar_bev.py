@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import numpy as np
 import imageio
 import os
@@ -283,179 +284,175 @@ def attach_debugger():
 
 def process_all_scenes_pdm_lite(dataset_root, output_dir, process_all=False, scenario_filter=None, save_in_place=False, img_size=448):
     """
-    Process all scenes in PDM Lite dataset to generate BEV images
+    Process all scenes in PDM Lite dataset to generate BEV images.
+    This function now recursively finds all route directories.
     
     Args:
-        dataset_root: Path to the PDM Lite dataset root (/home/wang/dataset/data)
+        dataset_root: Path to the PDM Lite dataset root (e.g., /path/to/PDM_Lite)
         output_dir: Path to the output directory for BEV images (only used if save_in_place=False)
         process_all: If False, only process the first scenario (for debugging)
         scenario_filter: List of scenario names to process (e.g., ['Accident', 'ControlLoss'])
         save_in_place: If True, save BEV images in the same directory structure as lidar files
         img_size: BEV image size (height and width)
     """
-    # Get all scenario directories
-    if scenario_filter:
-        scenarios = [os.path.join(dataset_root, s) for s in scenario_filter if os.path.isdir(os.path.join(dataset_root, s))]
-    else:
-        scenarios = [d for d in glob.glob(os.path.join(dataset_root, '*')) if os.path.isdir(d)]
+    # --- Flexible logic to find all route folders with lidar data ---
+    all_scenes = []
     
-    total_scenarios = len(scenarios)
-    processed_scenarios = 0
-    total_scenes = 0
+    # Try two different directory structures:
+    # Structure 1: <dataset_root>/TownXX/data/<RouteName>/<Repetition>/lidar/
+    # Structure 2: <dataset_root>/<ScenarioName>/<RouteFolder>/lidar/
+    
+    # First, try to find Town folders (Structure 1)
+    town_folders = [d for d in glob.glob(os.path.join(dataset_root, 'Town*')) if os.path.isdir(d)]
+    
+    if town_folders:
+        print(f"Found {len(town_folders)} Town folders, using Structure 1: TownXX/data/...")
+        if scenario_filter:
+            town_folders = [d for d in town_folders if os.path.basename(d) in scenario_filter]
+        
+        for town_path in town_folders:
+            data_path = os.path.join(town_path, 'data')
+            if os.path.isdir(data_path):
+                route_folders = [d for d in glob.glob(os.path.join(data_path, '*')) if os.path.isdir(d)]
+                for route_path in route_folders:
+                    repetition_folders = [d for d in glob.glob(os.path.join(route_path, '*')) if os.path.isdir(d)]
+                    if not repetition_folders:
+                        all_scenes.append(route_path)
+                    else:
+                        all_scenes.extend(repetition_folders)
+    else:
+        # Try Structure 2: <dataset_root>/<ScenarioName>/<RouteFolder>/lidar/
+        print(f"No Town folders found, trying Structure 2: <ScenarioName>/<RouteFolder>/...")
+        scenario_folders = [d for d in glob.glob(os.path.join(dataset_root, '*')) if os.path.isdir(d)]
+        
+        if scenario_filter:
+            scenario_folders = [d for d in scenario_folders if os.path.basename(d) in scenario_filter]
+        
+        for scenario_path in scenario_folders:
+            # Find all route folders within each scenario
+            route_folders = [d for d in glob.glob(os.path.join(scenario_path, '*')) if os.path.isdir(d)]
+            for route_path in route_folders:
+                # Check if this folder contains a 'lidar' subdirectory
+                if os.path.isdir(os.path.join(route_path, 'lidar')):
+                    all_scenes.append(route_path)
+    
+    if not all_scenes:
+        print(f"Error: No valid scenes found in {dataset_root}.")
+        print(f"Tried Structure 1: <dataset_root>/TownXX/data/<RouteName>/<Repetition>/lidar/")
+        print(f"Tried Structure 2: <dataset_root>/<ScenarioName>/<RouteFolder>/lidar/")
+        print(f"\nPlease check your directory structure.")
+        return
+    
+    total_scenes_to_process = len(all_scenes)
+    processed_scenes_count = 0
     total_frames = 0
     
-    print(f"Found {total_scenarios} scenarios to process")
+    print(f"Found {total_scenes_to_process} scenes to process.")
     if save_in_place:
-        print(f"BEV images will be saved in original dataset structure (lidar_bev directory)")
+        print(f"BEV images will be saved in original dataset structure (in a 'lidar_bev' directory).")
     else:
         print(f"BEV images will be saved to: {output_dir}")
     
-    for scenario_idx, scenario_path in enumerate(scenarios):
-        scenario_name = os.path.basename(scenario_path)
+    for scene_idx, scene_path in enumerate(all_scenes):
+        # scene_path is now the full path to the folder containing the 'lidar' directory
+        relative_path = os.path.relpath(scene_path, dataset_root)
         print(f"\n{'='*70}")
-        print(f"[{scenario_idx+1}/{total_scenarios}] Processing scenario: {scenario_name}")
+        print(f"[{scene_idx+1}/{total_scenes_to_process}] Processing scene: {relative_path}")
         print(f"{'='*70}")
         
-        # Get all scenes in this scenario
-        scenes = [d for d in glob.glob(os.path.join(scenario_path, '*')) if os.path.isdir(d)]
-        scenario_frames = 0
+        # Check if scene has required directories
+        lidar_dir = os.path.join(scene_path, 'lidar')
         
-        for scene_idx, scene_path in enumerate(scenes):
-            scene_name = os.path.basename(scene_path)
-            print(f"\n  [{scene_idx+1}/{len(scenes)}] Processing scene: {scene_name}")
-            
-            # Check if scene has required directories
-            lidar_dir = os.path.join(scene_path, 'lidar')
-            measurements_dir = os.path.join(scene_path, 'measurements')
-            boxes_dir = os.path.join(scene_path, 'boxes')
-            
-            if not os.path.exists(lidar_dir):
-                print(f"    ⚠ Warning: No lidar directory found, skipping scene")
-                continue
-            
-            # Get file lists
-            lidar_files = sorted(glob.glob(os.path.join(lidar_dir, '*.laz')))
-            measurement_files = sorted(glob.glob(os.path.join(measurements_dir, '*.json*'))) if os.path.exists(measurements_dir) else []
-            bbox_files = sorted(glob.glob(os.path.join(boxes_dir, '*.json*'))) if os.path.exists(boxes_dir) else []
-            
-            if not lidar_files:
-                print(f"    ⚠ Warning: No lidar files found, skipping scene")
-                continue
-            
-            # Create output directories
-            if save_in_place:
-                # Save in the same directory structure as lidar files
-                bev_image_dir = os.path.join(scene_path, 'lidar_bev')
-            else:
-                # Save in separate output directory
-                output_scene_dir = os.path.join(output_dir, scenario_name, scene_name)
-                bev_image_dir = os.path.join(output_scene_dir, 'bev_images')
-            
-            # # Check if BEV images already exist and are complete
-            # if os.path.exists(bev_image_dir):
-            #     existing_bev_files = sorted(glob.glob(os.path.join(bev_image_dir, '*.png')))
-            #     if len(existing_bev_files) == len(lidar_files):
-            #         # Check if all corresponding BEV images exist
-            #         all_exist = True
-            #         for lidar_file in lidar_files:
-            #             frame_id = os.path.basename(lidar_file).split('.')[0]
-            #             bev_file = os.path.join(bev_image_dir, f'{frame_id}.png')
-            #             if not os.path.exists(bev_file):
-            #                 all_exist = False
-            #                 break
-                    
-            #         if all_exist:
-            #             print(f"    ✓ Scene already processed ({len(existing_bev_files)} BEV images), skipping...")
-            #             continue
-            #         else:
-            #             print(f"    ⚠ Incomplete BEV sequence found ({len(existing_bev_files)}/{len(lidar_files)}), reprocessing...")
-            #     else:
-            #         print(f"    ⚠ Incomplete BEV sequence found ({len(existing_bev_files)}/{len(lidar_files)}), reprocessing...")
-            
-            os.makedirs(bev_image_dir, exist_ok=True)
-            
-            print(f"    Found {len(lidar_files)} lidar files, {len(measurement_files)} measurement files, {len(bbox_files)} bbox files")
-            
-            # Process each frame
-            scene_frame_count = 0
-            for i in range(len(lidar_files)):
-                try:
-                    lidar_file = lidar_files[i]
-                    
-                    # Progress indicator
-                    if i % 20 == 0 or i == len(lidar_files) - 1:
-                        print(f"    Processing frame {i+1}/{len(lidar_files)}: {os.path.basename(lidar_file)}")
-                    
-                    # Load lidar data
-                    lidar_points = get_lidar_pts(lidar_file)
-                    
-                    # Generate BEV image
-                    frame_id = os.path.basename(lidar_file).split('.')[0]
-                    saving_bev_image = os.path.join(bev_image_dir, f'{frame_id}.png')
-                    
-                    # Generate and save BEV image
-                    bev_image = generate_lidar_bev_images(
-                        lidar_points, 
-                        saving_bev_image, 
-                        img_height=img_size,
-                        img_width=img_size
-                    )
-                    
-                    # Process bounding boxes if available
-                    if i < len(bbox_files):
-                        bbox_file = bbox_files[i]
-                        
-                        try:
-                            # Get bounding boxes in BEV coordinates (PDM Lite format)
-                            bbox_dict = get_bev_bboxs_pdm_lite(bbox_file)
-                            
-                            if bbox_dict and not save_in_place:
-                                # Only save bbox data to separate output dir if not saving in place
-                                bbox_output_dir = os.path.join(output_dir, scenario_name, scene_name)
-                                os.makedirs(bbox_output_dir, exist_ok=True)
-                                bbox_output_file = os.path.join(bbox_output_dir, f'bbox_data_{frame_id}.json')
-                                with open(bbox_output_file, 'w') as f:
-                                    # Convert numpy arrays to lists for JSON serialization
-                                    bbox_dict_serializable = {
-                                        k: v.tolist() if isinstance(v, np.ndarray) else v 
-                                        for k, v in bbox_dict.items()
-                                    }
-                                    json.dump(bbox_dict_serializable, f, indent=2)
-                        except Exception as e:
-                            print(f"      Warning: Error processing bboxes for frame {i}: {str(e)}")
-                    
+        if not os.path.exists(lidar_dir):
+            print(f"    ⚠ Warning: No 'lidar' directory found in {scene_path}, skipping scene.")
+            continue
+        
+        # Get file lists
+        lidar_files = sorted(glob.glob(os.path.join(lidar_dir, '*.laz')))
+        
+        if not lidar_files:
+            print(f"    ⚠ Warning: No .laz lidar files found in {lidar_dir}, skipping scene.")
+            continue
+        
+        # Create output directories
+        if save_in_place:
+            # Save in the same directory structure as lidar files
+            bev_image_dir = os.path.join(scene_path, 'lidar_bev')
+        else:
+            # Save in separate output directory, preserving structure
+            bev_image_dir = os.path.join(output_dir, relative_path, 'lidar_bev')
+        
+        os.makedirs(bev_image_dir, exist_ok=True)
+        
+        # Check if BEV images are already generated
+        existing_bev_files = glob.glob(os.path.join(bev_image_dir, '*.png'))
+        if len(existing_bev_files) == len(lidar_files):
+            print(f"    ✓ Scene already processed: {len(existing_bev_files)} BEV images found. Skipping...")
+            processed_scenes_count += 1
+            total_frames += len(existing_bev_files)
+            continue
+        elif len(existing_bev_files) > 0:
+            print(f"    ⚠ Partial completion detected: {len(existing_bev_files)}/{len(lidar_files)} BEV images found. Resuming...")
+        
+        print(f"    Found {len(lidar_files)} lidar files. Outputting to: {bev_image_dir}")
+        
+        # Process each frame
+        scene_frame_count = 0
+        skipped_frames = 0
+        for i, lidar_file in enumerate(lidar_files):
+            try:
+                # Generate BEV image path
+                frame_id = os.path.basename(lidar_file).split('.')[0]
+                saving_bev_image = os.path.join(bev_image_dir, f'{frame_id}.png')
+                
+                # Skip if BEV image already exists
+                if os.path.exists(saving_bev_image):
+                    skipped_frames += 1
                     scene_frame_count += 1
-                    scenario_frames += 1
-                    total_frames += 1
-                    
-                except Exception as e:
-                    print(f"      Error processing frame {i}: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
                     continue
-            
-            total_scenes += 1
-            print(f"    ✓ Completed scene: {scene_frame_count} frames processed")
-            
-            # Break after first scene if not processing all
-            if not process_all and scene_idx >= 0:
-                break
+                
+                # Progress indicator
+                if i % 50 == 0 or i == len(lidar_files) - 1:
+                    print(f"\r    Processing frame {i+1}/{len(lidar_files)} (skipped: {skipped_frames})...", end="")
+                
+                # Load lidar data
+                lidar_points = get_lidar_pts(lidar_file)
+                
+                # Generate and save BEV image
+                generate_lidar_bev_images(
+                    lidar_points, 
+                    saving_bev_image, 
+                    img_height=img_size,
+                    img_width=img_size
+                )
+                
+                scene_frame_count += 1
+                
+            except Exception as e:
+                print(f"\n      Error processing frame {os.path.basename(lidar_file)}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
         
-        processed_scenarios += 1
-        print(f"\n  ✓ Completed scenario {scenario_name}: {scenario_frames} frames processed")
+        total_frames += scene_frame_count
+        processed_scenes_count += 1
+        if skipped_frames > 0:
+            print(f"\n    ✓ Completed scene: {scene_frame_count} frames total ({scene_frame_count - skipped_frames} generated, {skipped_frames} skipped).")
+        else:
+            print(f"\n    ✓ Completed scene: {scene_frame_count} frames processed.")
         
-        # Break after first scenario if not processing all
+        # Break after first scene if not processing all
         if not process_all:
+            print("\n'--process_all' is False, stopping after the first scene.")
             break
     
     print(f"\n{'='*70}")
     print(f"=== Processing Complete ===")
     print(f"{'='*70}")
-    print(f"Processed scenarios: {processed_scenarios}/{total_scenarios}")
-    print(f"Total scenes: {total_scenes}")
-    print(f"Total frames: {total_frames}")
+    print(f"Total scenes processed: {processed_scenes_count}/{total_scenes_to_process}")
+    print(f"Total frames generated: {total_frames}")
     if save_in_place:
-        print(f"BEV images saved in original dataset structure (lidar_bev directories)")
+        print(f"BEV images saved in original dataset structure ('lidar_bev' directories).")
     else:
         print(f"Output directory: {output_dir}")
     print(f"{'='*70}\n")
@@ -465,7 +462,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Generate LiDAR BEV images from PDM Lite dataset')
     parser.add_argument('--input_dir', type=str, 
-                       default='/home/wang/dataset/data',
+                       default='/home/wang/Project/carla_garage/data',
                        help='Input directory containing the PDM Lite dataset')
     parser.add_argument('--output_dir', type=str, 
                        default='/home/wang/projects/diffusion_policy_z/data/pdm_lite_bev',

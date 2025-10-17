@@ -7,7 +7,6 @@ import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
-# from model.tcp_bev_encoder import SimplifiedTCPEncoder
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
@@ -69,30 +68,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             print("⚠ Action normalization disabled")
             self.action_stats = None
         
-        # 从配置文件获取obs_horizon
+
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
-        
-        # obs encoder 
-        # obs_encoder = SimplifiedTCPEncoder(
-        #     perception_backbone=None,  # 自动创建ResNet34
-        #     state_dim=9,  # speed(1) + target_point(2) + command(6)
-        #     feature_dim=256,
-        #     use_group_norm=True,
-        #     freeze_backbone=True,
-        #     bev_input_size=(448, 448)  # LiDAR BEV图像尺寸
-        # )
         obs_encoder = InterfuserBEVEncoder(
             perception_backbone=None,
             state_dim=9,
             feature_dim=256,
             use_group_norm=True,
-            freeze_backbone=True,  # 设为False以便加载权重
+            freeze_backbone=False,  # 设为False以便加载权重
             bev_input_size=(448, 448)
         )
-        pretrained_path = os.path.join(
-        os.path.dirname(__file__), 
-        'interfuser/lidar_bev_encoder_only.pth'
-    )
+        pretrained_path = '/home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth'
         load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
         self.obs_encoder = obs_encoder
         self.obs_encoder.cuda()
@@ -121,11 +107,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # create diffusion model
         # TCP模型输出特征维度（j_ctrl）为256，修改相应维度
         obs_feature_dim = 256  
-        input_dim = action_dim + obs_feature_dim
-        global_cond_dim = None
-        if obs_as_global_cond:
-            input_dim = action_dim
-            global_cond_dim = obs_feature_dim * self.n_obs_steps
         
         # Optional GroupNorm for j_ctrl features (recommended for training stability)
         self.use_j_ctrl_norm = policy_cfg.get('use_j_ctrl_norm', False)
@@ -215,10 +196,18 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         unnormalized = unnormalized * (action_max - action_min) + action_min
         return unnormalized
 
-    def extract_tcp_features(self, obs_dict):
+    def extract_tcp_features(self, obs_dict, return_attention=False):
         """
         使用SimplifiedTCPEncoder提取特征
         现在使用lidar_bev作为视觉输入
+        
+        Args:
+            obs_dict: 观测字典
+            return_attention: 是否返回attention map
+            
+        Returns:
+            如果return_attention=False: j_ctrl特征 (B, 256)
+            如果return_attention=True: (j_ctrl特征, attention_map) 
         """
         try:
             # 使用lidar_bev替代原来的front_img (RGB image)
@@ -230,13 +219,21 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             
             # 使用SimplifiedTCPEncoder的forward方法
             with torch.no_grad():
-                j_ctrl = self.obs_encoder(lidar_bev_img, state, normalize=True)
+                if return_attention:
+                    j_ctrl, attention_map = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=True)
+                else:
+                    j_ctrl = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=False)
+                    attention_map = None
                 
             # Optional GroupNorm for better training stability
             if self.use_j_ctrl_norm and self.training:
                 j_ctrl = self.j_ctrl_norm(j_ctrl.unsqueeze(-1)).squeeze(-1)
+            
+            if return_attention:
+                return j_ctrl, attention_map
+            else:
+                return j_ctrl
                 
-            return j_ctrl
         except KeyError as e:
             raise KeyError(f"Missing required field in obs_dict for TCP feature extraction: {e}")
         except Exception as e:
@@ -247,7 +244,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         batch: {
             'lidar_bev': (B, obs_horizon, 3, 448, 448) - LiDAR BEV图像
             'agent_pos': (B, obs_horizon, 2)
-            'action': (B, action_horizon, action_dim)
+            'next_command': (B, obs_horizon, 6)
             'speed': (B, obs_horizon)
             'target_point': (B, obs_horizon, 2)
         }
@@ -266,7 +263,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         # (B, horizon, 2)
         To = self.n_obs_steps
-        nactions = raw_agent_pos[:, To:, :]
+        nactions = raw_agent_pos
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
         cond = None
@@ -459,6 +456,169 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             'action_pred': action_pred
         }
         return result
+
+    def extract_attention_map(self, obs_dict: Dict[str, torch.Tensor]) -> np.ndarray:
+        """
+        提取最后一帧观测的attention map
+        
+        Args:
+            obs_dict: 观测字典
+            
+        Returns:
+            attention_map: (H, W) numpy数组
+        """
+        device = next(self.parameters()).device
+        nobs = dict_apply(obs_dict, lambda x: x.to(device))
+        
+        # 获取最后一帧观测
+        last_obs = dict_apply(nobs, lambda x: x[:, -1, ...])
+        
+        # 提取特征和attention map
+        with torch.no_grad():
+            _, attention_map = self.extract_tcp_features(last_obs, return_attention=True)
+        
+        # 转换为numpy
+        attention_map_np = attention_map[0].cpu().numpy()  # (H, W)
+        
+        return attention_map_np
+
+    def predict_action_with_steps(self, obs_dict: Dict[str, torch.Tensor]):
+        """
+        预测动作并返回去噪过程的中间步骤
+        
+        Returns:
+            result: 预测结果字典
+            denoising_steps: 去噪过程中的轨迹列表
+        """
+        device = next(self.parameters()).device
+        nobs = dict_apply(obs_dict, lambda x: x.to(device))
+
+        value = next(iter(nobs.values()))
+        B, To = value.shape[:2]
+        T = self.horizon
+        Da = self.action_dim
+        Do = self.obs_feature_dim
+        To = self.n_obs_steps
+
+        # 准备条件
+        cond = None
+        cond_data = None
+        cond_mask = None
+        if self.obs_as_global_cond:
+            obs_features_list = []
+            for t in range(To):
+                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
+                step_features = self.extract_tcp_features(this_step_nobs)
+                obs_features_list.append(step_features)
+            cond = torch.stack(obs_features_list, dim=1)
+            shape = (B, T, Da)
+            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
+            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+        else:
+            obs_features_list = []
+            for t in range(To):
+                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
+                step_features = self.extract_tcp_features(this_step_nobs)
+                obs_features_list.append(step_features)
+            nobs_features = torch.stack(obs_features_list, dim=1)
+            shape = (B, T, Da+Do)
+            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
+            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+            cond_data[:,:To,Da:] = nobs_features
+            cond_mask[:,:To,Da:] = True
+
+        # 运行采样并捕获中间步骤
+        nsample, denoising_steps = self.conditional_sample_with_steps(
+            cond_data, 
+            cond_mask,
+            cond=cond,
+        )
+        
+        naction_pred = nsample[...,:Da]
+        naction_pred = torch.clamp(naction_pred, -1.0, 1.0)
+        
+        # 反归一化去噪步骤用于可视化
+        denoising_steps_unnormalized = []
+        if self.enable_action_normalization and self.action_stats is not None:
+            for step in denoising_steps:
+                step_actions = step[..., :Da]
+                step_actions_clamped = torch.clamp(step_actions, -1.0, 1.0)
+                step_actions_unnorm = self.unnormalize_action(step_actions_clamped)
+                denoising_steps_unnormalized.append(step_actions_unnorm)
+            
+            # 反归一化最终预测
+            naction_pred = self.unnormalize_action(naction_pred)
+            device = naction_pred.device
+            action_min = self.action_stats['min'].to(device)
+            action_max = self.action_stats['max'].to(device)
+            safety_margin = 0.2
+            range_size = action_max - action_min
+            expanded_min = action_min - safety_margin * range_size
+            expanded_max = action_max + safety_margin * range_size
+            naction_pred = torch.clamp(naction_pred, expanded_min, expanded_max)
+        else:
+            denoising_steps_unnormalized = [step[..., :Da] for step in denoising_steps]
+        
+        action_pred = naction_pred.detach().cpu().numpy()
+        action = action_pred
+        result = {
+            'action': action,
+            'action_pred': action_pred
+        }
+        
+        # 转换去噪步骤为numpy（已经反归一化）
+        denoising_steps_np = [step[0].detach().cpu().numpy() for step in denoising_steps_unnormalized]
+        
+        return result, denoising_steps_np
+
+    def conditional_sample_with_steps(self, 
+            condition_data, condition_mask,
+            cond=None, generator=None,
+            **kwargs):
+        """
+        条件采样并返回中间去噪步骤
+        """
+        model = self.model
+        scheduler = self.noise_scheduler
+
+        trajectory = torch.randn(
+            size=condition_data.shape, 
+            dtype=condition_data.dtype,
+            device=condition_data.device,
+            generator=generator)
+    
+        scheduler.set_timesteps(self.num_inference_steps)
+        vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0], trajectory.device)
+        vl_embeds = self.feature_encoder(vl_features)
+
+        # 保存去噪步骤
+        denoising_steps = []
+        denoising_steps.append(trajectory.clone())  # 初始噪声
+        
+        total_steps = len(scheduler.timesteps)
+        for i, t in enumerate(scheduler.timesteps):
+            # 1. apply conditioning
+            trajectory[condition_mask] = condition_data[condition_mask]
+
+            # 2. predict model output
+            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask)
+
+            # 3. compute previous image: x_t -> x_t-1
+            trajectory = scheduler.step(
+                model_output, t, trajectory, 
+                generator=generator,
+                **kwargs
+                ).prev_sample
+            
+            # 保存关键步骤（初始、33%、66%、最终）
+            if i == total_steps // 3 or i == 2 * total_steps // 3:
+                denoising_steps.append(trajectory.clone())
+        
+        # 最终结果
+        trajectory[condition_mask] = condition_data[condition_mask]
+        denoising_steps.append(trajectory.clone())
+
+        return trajectory, denoising_steps
 
     # ========= VLM feature simulati, temporary! TODO   ============
 

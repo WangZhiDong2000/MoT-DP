@@ -15,18 +15,18 @@ import matplotlib.pyplot as plt
 
 class CARLAImageDataset(torch.utils.data.Dataset):
     """
-    一个为预处理好的、单个样本文件设计的高效Dataset类。
-    图像路径存储在pkl中，在__getitem__时动态加载。
+    Dataset for preprocessed PDM Lite data in 'frame' mode.
+    Each pickle file is a complete training sample with image paths.
+    Images are loaded dynamically in __getitem__.
     """
     def __init__(self,
-                 dataset_path: str, # 指向处理好的数据根目录 (包含 train/val)
-                 mode: str = 'train',
-                 image_base_path: str = '/home/wang/dataset/data'):
+                 dataset_path: str,  # Directory containing individual frame pkl files
+                 image_data_root:str,
+                 ):  # Base path for images (if None, use absolute paths from pkl)
 
-        self.mode = mode
-        self.image_base_path = image_base_path
+        self.image_data_root = image_data_root
+        self.dataset_path = dataset_path
         
-        # 定义RGB图像变换
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
             transforms.ToTensor(),
@@ -45,15 +45,23 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             )
         ])
     
-        data_dir = os.path.join(dataset_path, self.mode)
-        if not os.path.isdir(data_dir):
-            raise FileNotFoundError(f"Processed data directory not found: {data_dir}")
+        if not os.path.isdir(dataset_path):
+            raise FileNotFoundError(f"Processed data directory not found: {dataset_path}")
 
-        self.sample_files = sorted(glob.glob(os.path.join(data_dir, "sample_*.pkl")))
-        if not self.sample_files:
-            raise FileNotFoundError(f"No sample files found in {data_dir}. Did you run the preprocessing script?")
+        # Load pkl files - support both direct directory and train/val subdirectories
+        train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
+        val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
+        direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
         
-        print(f"Found {len(self.sample_files)} preprocessed samples in '{data_dir}'.")
+        # If subdirectories exist, use them; otherwise use direct files
+        if train_files or val_files:
+            self.sample_files = sorted(train_files + val_files)
+            print(f"Found {len(self.sample_files)} preprocessed samples in '{dataset_path}' ({len(train_files)} train, {len(val_files)} val).")
+        elif direct_files:
+            self.sample_files = sorted(direct_files)
+            print(f"Found {len(self.sample_files)} preprocessed samples in '{dataset_path}'.")
+        else:
+            raise FileNotFoundError(f"No pkl files found in {dataset_path} or its train/val subdirectories.")
 
     def __len__(self):
         return len(self.sample_files)
@@ -65,15 +73,16 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             sample = pickle.load(f)
 
         # 2. 动态加载图像
-        image_paths = sample.get('image_paths', [])
+        image_paths = sample.get('rgb_hist_jpg', [])
         images = []
+        
         for img_path in image_paths:
             if img_path is None:
                 # 如果路径为None，创建一个黑色图像
                 images.append(torch.zeros(3, 256, 928))
                 print(f"Warning: Image path is None in sample {sample_path}. Using black image.")
             else:
-                full_img_path = os.path.join(self.image_base_path, img_path)
+                full_img_path = os.path.join(self.image_data_root, img_path)
                 try:
                     img = Image.open(full_img_path)
                     img_tensor = self.image_transform(img)
@@ -89,7 +98,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
         
         # 2.5 动态加载LiDAR BEV图像（处理方式和image相同，但不裁剪）
-        lidar_bev_paths = sample.get('lidar_bev_paths', [])
+        lidar_bev_paths = sample.get('lidar_bev_hist', [])
         lidar_bev_images = []
         for bev_path in lidar_bev_paths:
             if bev_path is None:
@@ -97,7 +106,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 lidar_bev_images.append(torch.zeros(3, 336, 336))
                 print(f"Warning: LiDAR BEV path is None in sample {sample_path}. Using black BEV image.")
             else:
-                full_bev_path = os.path.join(self.image_base_path, bev_path)
+                full_bev_path = os.path.join(self.image_data_root, bev_path)
                 try:
                     bev_img = Image.open(full_bev_path)
                     bev_tensor = self.lidar_bev_transform(bev_img)
@@ -115,19 +124,52 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # 3. 转换其他数据
         final_sample = dict()
         for key, value in sample.items():
-            if key == 'image_paths':
-                # 将image_paths替换为加载的images
+            if key == 'rgb_hist_jpg':
+                final_sample['rgb_hist_jpg'] = image_paths  
                 final_sample['image'] = images_tensor
-            elif key == 'lidar_bev_paths':
-                # 将lidar_bev_paths替换为加载的lidar_bev图像
+            elif key == 'lidar_bev_hist':
+                final_sample['lidar_bev_hist'] = lidar_bev_paths  
                 final_sample['lidar_bev'] = lidar_bev_tensor
+            elif key == 'speed_hist':
+                # Convert speed_hist to tensor
+                speed_data = sample['speed_hist']
+                if isinstance(speed_data, np.ndarray):
+                    final_sample['speed'] = torch.from_numpy(speed_data).float()
+                elif isinstance(speed_data, (list, tuple)):
+                    final_sample['speed'] = torch.tensor(speed_data, dtype=torch.float32)
+                else:
+                    final_sample['speed'] = speed_data
+            elif key == 'ego_waypoints':
+                final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:])  # delete the first waypoint (current position always be 0,0)
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
                 final_sample[key] = value
         
+        final_sample = self.hard_process(final_sample, obs_horizon=images_tensor.shape[0])
+
         return final_sample
 
+    def hard_process(self, final_sample, obs_horizon):
+        '''
+        repeat command & target_point to match obs_horizon
+        '''
+        for key in ['command', 'next_command', 'target_point']:
+            if key in final_sample:
+                data = final_sample[key]
+                if isinstance(data, torch.Tensor):
+                    if data.ndim == 1:
+                        data = data.unsqueeze(0)  # (D,) -> (1, D)
+                    repeated_data = data.repeat(obs_horizon, 1)  # (obs_horizon, D)
+                    final_sample[key] = repeated_data
+                elif isinstance(data, np.ndarray):
+                    if data.ndim == 1:
+                        data = data[np.newaxis, :]  # (D,) -> (1, D)
+                    repeated_data = np.tile(data, (obs_horizon, 1))  # (obs_horizon, D)
+                    final_sample[key] = torch.from_numpy(repeated_data).float()
+                else:
+                    print(f"Warning: Unsupported data type for key '{key}' during hard_process.")
+        return final_sample
 
 def visualize_trajectory(sample, obs_horizon, rand_idx):
     """
@@ -143,14 +185,11 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
     if agent_pos.ndim == 3 and agent_pos.shape[1] == 1:
         agent_pos = agent_pos.squeeze(1)
     
-    obs_agent_pos = agent_pos[:obs_horizon]
-    pred_agent_pos = agent_pos[obs_horizon:]
+    pred_agent_pos = agent_pos
     
     plt.figure(figsize=(10, 8))
     
     # Plot observed and predicted points
-    if len(obs_agent_pos) > 0:
-        plt.plot(obs_agent_pos[:, 1], obs_agent_pos[:, 0], 'bo-', label='Observed agent_pos', markersize=8, linewidth=2)
     if len(pred_agent_pos) > 0:
         plt.plot(pred_agent_pos[:, 1], pred_agent_pos[:, 0], 'ro--', label='Predicted agent_pos', markersize=8, linewidth=2)
     
@@ -159,14 +198,9 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
         if target_point.ndim == 2:
             target_point = target_point[0]
         plt.plot(target_point[1], target_point[0], 'g*', markersize=15, label='Target point (relative)', markeredgecolor='black', markeredgewidth=1)
-        if len(obs_agent_pos) > 0:
-            last_obs = obs_agent_pos[-1]
-            plt.plot([last_obs[1], target_point[1]], [last_obs[0], target_point[0]], 'g--', alpha=0.5, linewidth=1, label='Direction to target')
+        
 
-    # Mark the reference point
-    if len(obs_agent_pos) > 0:
-        last_obs = obs_agent_pos[-1]
-        plt.plot(last_obs[1], last_obs[0], 'ks', markersize=10, label='Reference point (last obs)', markerfacecolor='yellow', markeredgecolor='black')
+
     
     plt.xlabel('Y (relative to last obs)')
     plt.ylabel('X (relative to last obs)')
@@ -176,7 +210,7 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
     plt.axis('equal')
     plt.tight_layout()
     
-    save_path = f'/home/wang/projects/diffusion_policy_z/image/sample_{rand_idx}_agent_pos_with_target.png'
+    save_path = f'/home/wang/Project/MoT-DP/image/sample_{rand_idx}_agent_pos_with_target.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
     print(f"保存agent_pos和target_point图像到: {save_path}")
@@ -216,8 +250,8 @@ def visualize_observation_images(sample, obs_horizon, rand_idx):
         plt.title(f'Random Sample {rand_idx} - Obs Image t={t}')
         plt.axis('off')
         plt.tight_layout()
-        
-        save_path = f'/home/wang/projects/diffusion_policy_z/image/sample_{rand_idx}_obs_image_t{t}.png'
+
+        save_path = f'/home/wang/Project/MoT-DP/image/sample_{rand_idx}_obs_image_t{t}.png'
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.show()
         print(f"保存观测图像到: {save_path}")
@@ -260,14 +294,14 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon):
 
 def test():
     import random
-    # 重要：现在路径应该指向预处理好的数据集
-    dataset_path = '/home/wang/projects/diffusion_policy_z/data'
+    # 重要：现在路径应该指向预处理好的数据集的根目录
+    dataset_path = '/home/wang/Project/carla_garage/tmp_data'  # 预处理数据集路径
     obs_horizon = 2
     
     # 使用新的Dataset类
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        mode='train' # or 'val'
+        image_data_root='/home/wang/Project/carla_garage/data'  # 图像的根目录
     )
     
     print(f"\n总样本数: {len(dataset)}")
