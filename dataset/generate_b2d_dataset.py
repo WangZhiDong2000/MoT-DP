@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import os
 import io
 import sys
@@ -11,6 +11,7 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
+import textwrap
 
 
 class CARLAImageDataset(torch.utils.data.Dataset):
@@ -152,9 +153,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
     def hard_process(self, final_sample, obs_horizon):
         '''
-        repeat command & target_point to match obs_horizon
+        repeat command, target_point, and meta_actions to match obs_horizon
         '''
-        for key in ['command', 'next_command', 'target_point']:
+        for key in ['command', 'next_command', 'target_point', 'meta_action_direction', 'meta_action_speed']:
             if key in final_sample:
                 data = final_sample[key]
                 if isinstance(data, torch.Tensor):
@@ -258,6 +259,154 @@ def visualize_observation_images(sample, obs_horizon, rand_idx):
         plt.show()
         print(f"保存观测图像到: {save_path}")
 
+def visualize_vqa_on_image(sample, obs_horizon, rand_idx, max_qa_pairs=5):
+    """
+    Visualizes VQA content as conversation overlay on the observation image.
+    
+    Args:
+        sample: The data sample containing 'image' and 'vqa' fields
+        obs_horizon: Number of observation frames
+        rand_idx: Sample index for saving
+        max_qa_pairs: Maximum number of QA pairs to display per category
+    """
+    if 'image' not in sample:
+        print("'image' not in sample. Skipping VQA visualization.")
+        return
+    
+    if 'vqa' not in sample or sample['vqa'] is None:
+        print("'vqa' not in sample or is None. Skipping VQA visualization.")
+        return
+    
+    vqa_data = sample['vqa']
+    images = sample['image']
+    
+    # Define the inverse normalization transform
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    
+    # Use the last observation image (most recent frame)
+    img_tensor = images[-1]
+    
+    # Convert torch tensor to numpy and denormalize
+    if isinstance(img_tensor, torch.Tensor):
+        img_tensor = img_tensor * std + mean
+        img_tensor = torch.clamp(img_tensor, 0, 1)
+        img_arr = img_tensor.numpy()
+    else:
+        img_arr = img_tensor
+        
+    if img_arr.shape[0] == 3:  # (C, H, W)
+        img_vis = np.moveaxis(img_arr, 0, -1)  # Convert to (H, W, C)
+        img_vis = (img_vis * 255).astype(np.uint8)
+    else:
+        img_vis = img_arr.astype(np.uint8)
+    
+    # Convert to PIL Image for drawing
+    pil_img = Image.fromarray(img_vis)
+    img_width, img_height = pil_img.size
+    
+    # Create a larger canvas to add Meta Actions text on the right side
+    canvas_width = img_width + 400  # Reduced from 600 since we only show meta actions
+    canvas_height = img_height  # No need for extra height since we removed VQA display
+    canvas = Image.new('RGB', (canvas_width, canvas_height), color=(255, 255, 255))
+    canvas.paste(pil_img, (0, 0))
+    
+    draw = ImageDraw.Draw(canvas)
+    
+    # Try to load a font, fallback to default if not available
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        font_text = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
+    except:
+        font_title = ImageFont.load_default()
+        font_text = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+    
+    # VQA text area starts after the image
+    text_x = img_width + 10
+    text_y = 10
+    text_width = 580
+    line_spacing = 5
+    
+    # Draw title - Only show Meta Actions
+    draw.text((text_x, text_y), "Meta Actions", fill=(0, 0, 0), font=font_title)
+    text_y += 30
+    
+    # Skip VQA conversation display - only show meta actions
+    # Commented out VQA display to focus on meta actions only
+    # qa_categories = vqa_data.get('QA', {})
+    # for category_name, qa_list in qa_categories.items():
+    #     ... (VQA display code commented out)
+    
+    # No need to check space since we skip VQA display
+    
+    # Add Meta Actions section at the bottom
+    text_y += 20
+    draw.text((text_x, text_y), "═══ META ACTIONS ═══", fill=(150, 50, 50), font=font_title)
+    text_y += 25
+    
+    # Display meta_action_direction
+    if 'meta_action_direction' in sample:
+        meta_dir = sample['meta_action_direction']
+        if isinstance(meta_dir, torch.Tensor):
+            meta_dir = meta_dir[0].cpu().numpy()  # Use first obs frame
+        elif isinstance(meta_dir, np.ndarray) and meta_dir.ndim > 1:
+            meta_dir = meta_dir[0]
+        
+        # Convert to string representation
+        direction_labels = ['Left', 'Straight', 'Right']
+        if len(meta_dir) == 3:
+            direction_idx = np.argmax(meta_dir)
+            direction_str = direction_labels[direction_idx]
+            confidence = meta_dir[direction_idx]
+            draw.text((text_x, text_y), f"Direction: {direction_str} (confidence: {confidence:.3f})", 
+                     fill=(0, 0, 150), font=font_text)
+            text_y += 20
+            
+            # Show all probabilities
+            prob_str = f"  Probabilities: L={meta_dir[0]:.3f}, S={meta_dir[1]:.3f}, R={meta_dir[2]:.3f}"
+            draw.text((text_x + 10, text_y), prob_str, fill=(80, 80, 80), font=font_small)
+            text_y += 15
+    
+    # Display meta_action_speed
+    if 'meta_action_speed' in sample:
+        meta_speed = sample['meta_action_speed']
+        if isinstance(meta_speed, torch.Tensor):
+            meta_speed = meta_speed[0].cpu().numpy()  # Use first obs frame
+        elif isinstance(meta_speed, np.ndarray) and meta_speed.ndim > 1:
+            meta_speed = meta_speed[0]
+        
+        # Convert to string representation
+        speed_labels = ['Slow', 'Normal', 'Fast']
+        if len(meta_speed) == 3:
+            speed_idx = np.argmax(meta_speed)
+            speed_str = speed_labels[speed_idx]
+            confidence = meta_speed[speed_idx]
+            draw.text((text_x, text_y), f"Speed: {speed_str} (confidence: {confidence:.3f})", 
+                     fill=(0, 150, 0), font=font_text)
+            text_y += 20
+            
+            # Show all probabilities
+            prob_str = f"  Probabilities: Slow={meta_speed[0]:.3f}, Normal={meta_speed[1]:.3f}, Fast={meta_speed[2]:.3f}"
+            draw.text((text_x + 10, text_y), prob_str, fill=(80, 80, 80), font=font_small)
+            text_y += 15
+    
+    # Convert back to numpy for matplotlib
+    canvas_np = np.array(canvas)
+    
+    # Display and save
+    plt.figure(figsize=(16, 8))
+    plt.imshow(canvas_np)
+    plt.title(f'Sample {rand_idx} - Image with Meta Actions')
+    plt.axis('off')
+    plt.tight_layout()
+    
+    save_path = f'/home/wang/Project/MoT-DP/image/sample_{rand_idx}_meta_actions.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"保存Meta Actions图像到: {save_path}")
+
 def print_sample_details(sample, dataset, rand_idx, obs_horizon):
     """
     Prints detailed information about a sample and the dataset.
@@ -287,17 +436,32 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon):
     print("Agent pos shape:", first_sample['agent_pos'].shape)
 
     print("\nNew CARLA fields:")
-    for key in ['town_name', 'speed', 'command', 'next_command', 'target_point', 'ego_waypoints', 'image', 'agent_pos']:
+    for key in ['town_name', 'speed', 'command', 'next_command', 'target_point', 'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed']:
         if key in first_sample:
             value = first_sample[key]
             print(f"  {key}: shape={getattr(value, 'shape', 'N/A')}, type={type(value)}")
             if hasattr(value, '__len__') and not isinstance(value, str):
                 print(f"    Length: {len(value)}")
+            # Show meta action values
+            if key == 'meta_action_direction':
+                direction_map = ['FOLLOW_LANE', 'CHANGE_LANE_LEFT', 'CHANGE_LANE_RIGHT', 'GO_STRAIGHT', 'TURN_LEFT', 'TURN_RIGHT']
+                if hasattr(value, 'shape') and value.shape[0] == obs_horizon:
+                    direction_idx = value[0].argmax()
+                else:
+                    direction_idx = value.argmax() if hasattr(value, 'argmax') else 0
+                print(f"    Value: {direction_map[direction_idx]}")
+            if key == 'meta_action_speed':
+                speed_map = ['KEEP', 'ACCELERATE', 'DECELERATE', 'STOP']
+                if hasattr(value, 'shape') and value.shape[0] == obs_horizon:
+                    speed_idx = value[0].argmax()
+                else:
+                    speed_idx = value.argmax() if hasattr(value, 'argmax') else 0
+                print(f"    Value: {speed_map[speed_idx]}")
 
 def test():
     import random
     # 重要：现在路径应该指向预处理好的数据集的根目录
-    dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data'  # 预处理数据集路径
+    dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data_vqa_with_meta'  # 预处理数据集路径（带VQA和meta action）
     obs_horizon = 2
     
     # 使用新的Dataset类
@@ -325,6 +489,7 @@ def test():
 
     visualize_trajectory(rand_sample, obs_horizon, rand_idx)
     visualize_observation_images(rand_sample, obs_horizon, rand_idx)
+    visualize_vqa_on_image(rand_sample, obs_horizon, rand_idx, max_qa_pairs=5)
     print_sample_details(rand_sample, dataset, rand_idx, obs_horizon)
 
     

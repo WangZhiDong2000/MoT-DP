@@ -100,6 +100,61 @@ def command_to_one_hot(command):
     cmd_one_hot[command] = 1.0
     return np.array(cmd_one_hot)
 
+def direction_cmd_to_one_hot(direction_cmd):
+    """
+    Convert direction command string to one-hot encoding.
+    
+    Args:
+        direction_cmd: String, one of ['FOLLOW_LANE', 'CHANGE_LANE_LEFT', 'CHANGE_LANE_RIGHT', 
+                                       'GO_STRAIGHT', 'TURN_LEFT', 'TURN_RIGHT']
+    
+    Returns:
+        np.array: One-hot encoded vector of length 6
+    """
+    direction_map = {
+        'FOLLOW_LANE': 0,
+        'CHANGE_LANE_LEFT': 1,
+        'CHANGE_LANE_RIGHT': 2,
+        'GO_STRAIGHT': 3,
+        'TURN_LEFT': 4,
+        'TURN_RIGHT': 5
+    }
+    
+    one_hot = np.zeros(6, dtype=np.float32)
+    if direction_cmd in direction_map:
+        one_hot[direction_map[direction_cmd]] = 1.0
+    else:
+        # Default to FOLLOW_LANE if unknown
+        one_hot[0] = 1.0
+    
+    return one_hot
+
+def speed_cmd_to_one_hot(speed_cmd):
+    """
+    Convert speed command string to one-hot encoding.
+    
+    Args:
+        speed_cmd: String, one of ['KEEP', 'ACCELERATE', 'DECELERATE', 'STOP']
+    
+    Returns:
+        np.array: One-hot encoded vector of length 4
+    """
+    speed_map = {
+        'KEEP': 0,
+        'ACCELERATE': 1,
+        'DECELERATE': 2,
+        'STOP': 3
+    }
+    
+    one_hot = np.zeros(4, dtype=np.float32)
+    if speed_cmd in speed_map:
+        one_hot[speed_map[speed_cmd]] = 1.0
+    else:
+        # Default to KEEP if unknown
+        one_hot[0] = 1.0
+    
+    return one_hot
+
 def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmentation=0.0):
     """
     Transform waypoints to be origin at current ego position.
@@ -162,7 +217,7 @@ def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmenta
     return waypoints_aug
 
 def preprocess(folder_list, idx, tmp_dir, data_root, out_dir, 
-               obs_horizon, action_horizon, sample_interval, hz_interval, save_mode):
+               obs_horizon, action_horizon, sample_interval, hz_interval, save_mode, vqa_root=None):
     """
     Preprocess PDM Lite data into pkl files.
     
@@ -179,6 +234,7 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
         hz_interval: Interval within a sample to match frequency (e.g., 2 for 2Hz from 4Hz data).
         save_mode: 'scene' to save all frames per scene in one file, 
                    'frame' to save each frame separately.
+        vqa_root: Root directory of VQA data (optional).
     """
     final_data = []
 
@@ -231,6 +287,9 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
         
         # Start processing from a frame that allows for a full observation history
         scen_start_frame_offset = (obs_horizon - 1) * hz_interval
+        
+        # Track the last valid VQA data for fallback
+        last_valid_vqa = None
         
         for ii in range(scen_start_frame_offset, last_frame_idx, sample_interval):
             # --- Load all measurements needed for this sample ---
@@ -515,6 +574,77 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                 
             frame_data['lidar_bev_hist'] = lidar_bev_hist
 
+            # --- VQA Data ---
+            if vqa_root is not None:
+                # Construct VQA folder path - matching the scenario name structure
+                # VQA folder name format: <ScenarioName> (e.g., Accident_Town03_Route101_Weather23)
+                vqa_folder_name = folder_name.replace('/', '_')
+                vqa_folder_path = join(vqa_root, vqa_folder_name)
+                
+                # VQA data is typically available at intervals (e.g., every 5 frames: 0, 5, 10, ...)
+                # Try to load VQA for current frame first, then search backwards for nearest available VQA
+                vqa_loaded = False
+                
+                # Try current frame
+                vqa_file_path = join(vqa_folder_path, f"{ii:05d}.json")
+                if os.path.exists(vqa_file_path):
+                    try:
+                        with open(vqa_file_path, 'r', encoding='utf-8') as f:
+                            vqa_data = json.load(f)
+                        frame_data['vqa'] = vqa_data
+                        last_valid_vqa = vqa_data  # Update last valid VQA
+                        vqa_loaded = True
+                    except (FileNotFoundError, json.JSONDecodeError) as e:
+                        if idx == 0:
+                            print(f"\nWarning: Failed to load VQA data from {vqa_file_path}: {e}")
+                
+                # If current frame doesn't have VQA, search backwards for nearest VQA (up to 10 frames back)
+                if not vqa_loaded:
+                    for offset in range(1, 11):
+                        search_frame_id = ii - offset
+                        if search_frame_id < 0:
+                            break
+                        vqa_file_path = join(vqa_folder_path, f"{search_frame_id:05d}.json")
+                        if os.path.exists(vqa_file_path):
+                            try:
+                                with open(vqa_file_path, 'r', encoding='utf-8') as f:
+                                    vqa_data = json.load(f)
+                                frame_data['vqa'] = vqa_data
+                                last_valid_vqa = vqa_data
+                                vqa_loaded = True
+                                if idx == 0 and offset <= 5:
+                                    print(f"\nInfo: Using VQA from frame {search_frame_id} for frame {ii} (offset: {offset})")
+                                break
+                            except (FileNotFoundError, json.JSONDecodeError):
+                                continue
+                
+                # If still no VQA found, use last valid VQA from previous samples
+                if not vqa_loaded:
+                    frame_data['vqa'] = last_valid_vqa
+                    if idx == 0 and last_valid_vqa is None:
+                        print(f"\nWarning: No VQA data found for frame {ii} within search range and no previous VQA to use as fallback")
+                
+                # Extract meta actions from VQA extra_flags and convert to one-hot encoding
+                if frame_data['vqa'] is not None and 'extra_flags' in frame_data['vqa']:
+                    extra_flags = frame_data['vqa']['extra_flags']
+                    
+                    # Direction command (6 classes)
+                    direction_cmd = extra_flags.get('direction_cmd', 'FOLLOW_LANE')
+                    frame_data['meta_action_direction'] = direction_cmd_to_one_hot(direction_cmd)
+                    
+                    # Speed command (4 classes)
+                    speed_cmd = extra_flags.get('speed_cmd', 'KEEP')
+                    frame_data['meta_action_speed'] = speed_cmd_to_one_hot(speed_cmd)
+                else:
+                    # Default values if no VQA data
+                    frame_data['meta_action_direction'] = direction_cmd_to_one_hot('FOLLOW_LANE')
+                    frame_data['meta_action_speed'] = speed_cmd_to_one_hot('KEEP')
+            else:
+                frame_data['vqa'] = None
+                # Default values if no VQA root provided
+                frame_data['meta_action_direction'] = direction_cmd_to_one_hot('FOLLOW_LANE')
+                frame_data['meta_action_speed'] = speed_cmd_to_one_hot('KEEP')
+
             scene_data.append(frame_data)
             
         # --- Save data for the entire scene ---
@@ -545,7 +675,7 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
     
 
 def generate_infos(folder_list, workers, tmp_dir, data_root, out_dir,
-                   obs_horizon, action_horizon, sample_interval, hz_interval, save_mode):
+                   obs_horizon, action_horizon, sample_interval, hz_interval, save_mode, vqa_root=None):
     """
     Generate dataset info using multiple workers.
     """
@@ -559,7 +689,7 @@ def generate_infos(folder_list, workers, tmp_dir, data_root, out_dir,
         process = multiprocessing.Process(
             target=preprocess, 
             args=(sub_folder_list, i, tmp_dir, data_root, out_dir,
-                  obs_horizon, action_horizon, sample_interval, hz_interval, save_mode)
+                  obs_horizon, action_horizon, sample_interval, hz_interval, save_mode, vqa_root)
         )
         process.start()
         process_list.append(process)
@@ -603,9 +733,10 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
     argparser.add_argument('--data-root', type=str, default='/home/wang/Dataset/b2d_10scene' , help='Root directory of raw PDM Lite data')
     argparser.add_argument('--out-dir', type=str, default='/home/wang/Dataset/b2d_10scene/tmp_data', help='Output directory for processed data')
+    argparser.add_argument('--vqa-root', type=str, default='/home/wang/Dataset/b2d_vlm_10scene', help='Root directory of VQA data (optional)')
     argparser.add_argument('--obs-horizon', type=int, default=2, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=8, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
-    argparser.add_argument('--sample-interval', type=int, default=2, help='Interval between training samples (e.g., 10 frames)')
+    argparser.add_argument('--sample-interval', type=int, default=5, help='Interval between training samples (e.g., 10 frames)')
     argparser.add_argument('--hz-interval', type=int, default=2, help='Interval within a sample to match frequency (e.g., 2 for 2Hz from 4Hz data)')
     argparser.add_argument('--save-mode', type=str, default='frame', choices=['scene', 'frame'], help='Save mode: "scene" to save all frames per scene in one file, "frame" to save each frame separately')
     argparser.add_argument('--workers', type=int, default=4, help='Number of workers for parallel processing')
@@ -672,6 +803,7 @@ if __name__ == "__main__":
     print(f'Processing data with parameters:')
     print(f'  Data root: {args.data_root}')
     print(f'  Output dir: {args.out_dir}')
+    print(f'  VQA root: {args.vqa_root}')
     print(f'  Obs horizon: {args.obs_horizon}')
     print(f'  Action horizon: {args.action_horizon}')
     print(f'  Sample interval: {args.sample_interval}')
@@ -685,7 +817,7 @@ if __name__ == "__main__":
     generate_infos(train_list, args.workers, args.tmp_dir, 
                    args.data_root, args.out_dir,
                    args.obs_horizon, args.action_horizon, args.sample_interval,
-                   args.hz_interval, args.save_mode)
+                   args.hz_interval, args.save_mode, args.vqa_root)
     
     print('Finished!')
 
