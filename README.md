@@ -4,18 +4,41 @@ A PyTorch implementation of Diffusion Policy
 
 ## Dataset
 
-### PushT Dataset
+### Generate Dataset
 
-Download the PushT dataset:
+Add BEV image to the current PDM-LITE dataset:
 
 ```bash
-# Create data directory
-mkdir -p data/pusht
+cd dataset
+python generate_lidar_bev.py
+```
 
-# Download dataset
-cd data/pusht
-wget https://diffusion-policy.cs.columbia.edu/data/training/pusht.zip
 
-# Extract dataset
-unzip pusht.zip
+### Preprocess Dataset
+
+Generate trainable sequences and divide:
+
+```bash
+python preprocess_pdm_lite.py
+```
+
+
+### Train
+
+
+```bash
+cd ..
+cd training
+python train_carla_bev_full.py
+```
+
+### Test
+
+
+```bash
+cd testing
+python test_carla_bev_full.py
+```
+
+
 
