@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 from typing import Tuple, Optional
@@ -49,7 +48,7 @@ class InterfuserBEVEncoder(nn.Module):
     ):
         """
         Args:
-            perception_backbone: 视觉backbone (如ResNet34)，如果为None则自动创建
+            perception_backbone: 视觉backbone 
             state_dim: 状态维度 (速度+目标点+指令)
             feature_dim: 输出特征维度
             use_group_norm: 是否使用GroupNorm标准化输出特征
@@ -63,21 +62,19 @@ class InterfuserBEVEncoder(nn.Module):
         self.freeze_backbone = freeze_backbone
         self.bev_input_size = bev_input_size
         
+        #1. BEV backbone
         if perception_backbone is None:
-            # self.perception = resnet34(pretrained=True)
-            # 使用 pretrained=False，稍后从我们自己的权重文件加载
             lidar_backbone = resnet18d(
                 pretrained=False,  # 改为False，避免从timm加载
                 in_chans=3,
                 features_only=True,
-                out_indices=[4],   # 取 layer4 输出
+                out_indices=[4],   
             )
             self.perception=lidar_backbone
             embed_dim=256
             self.lidar_embed_layer = partial(HybridEmbed, backbone=lidar_backbone)
-            # 使用 'gelu' 作为默认激活函数
             self.lidar_connector = MLPconnector(256, 512, 'gelu')
-            # # 2) LiDAR patch embed：把 512 通道通过 1×1 conv 投到 embed_dim=256
+            # LiDAR patch embed：把 512 通道通过 1×1 conv 投到 embed_dim=256
             self.bev_model_mot = self.lidar_embed_layer(
                 img_size=224,      # LiDAR BEV 输入分辨率，默认 224×224
                 patch_size=16,     # 与 RGB 保持一致；这里仅记录，不影响 backbone 计算
@@ -104,11 +101,10 @@ class InterfuserBEVEncoder(nn.Module):
         feat_h = bev_input_size[0] // 32  # 448 // 32 = 14
         feat_w = bev_input_size[1] // 32  # 448 // 32 = 14
         
-        # 更精确的计算
         if bev_input_size == (448, 448):
             feat_h, feat_w = 14, 14  # 实际输出为14x14
         else:
-            # 通用计算: input_size -> (input_size // 32)
+            # input_size -> (input_size // 32)
             feat_h = (bev_input_size[0] + 31) // 32
             feat_w = (bev_input_size[1] + 31) // 32
         
@@ -156,7 +152,8 @@ class InterfuserBEVEncoder(nn.Module):
         self, 
         image: torch.Tensor, 
         state: torch.Tensor,
-        normalize: bool = True
+        normalize: bool = True,
+        return_attention: bool = False
     ) -> torch.Tensor:
         
         if self.perception is None:
@@ -191,31 +188,37 @@ class InterfuserBEVEncoder(nn.Module):
         # Step 3: 空间注意力机制
         # 使用 measurement_feature 生成空间注意力权重
         attention_weights = self.init_att(measurement_feature)  # (batch, spatial_size)
-        attention_weights = attention_weights.unsqueeze(1)  # (batch, 1, spatial_size)
+        attention_weights_expanded = attention_weights.unsqueeze(1)  # (batch, 1, spatial_size)
         
         # 对 lidar_feature 应用注意力加权
-        # lidar_feature: (batch, 256, seq_len), attention_weights: (batch, 1, spatial_size)
+        # lidar_feature: (batch, 256, seq_len), attention_weights_expanded: (batch, 1, spatial_size)
         # 注意：seq_len = spatial_size + 1 (包含global token)
         # 我们只对空间token应用注意力，保留global token
         spatial_tokens = lidar_feature[:, :, :-1]  # (batch, 256, spatial_size)
         global_token = lidar_feature[:, :, -1:]  # (batch, 256, 1)
         
         # 应用注意力加权并求和
-        weighted_spatial = (spatial_tokens * attention_weights).sum(dim=2)  # (batch, 256)
+        weighted_spatial = (spatial_tokens * attention_weights_expanded).sum(dim=2)  # (batch, 256)
         
         # Step 4: 特征融合
         # 融合注意力加权后的视觉特征和测量特征
         fused_feature = torch.cat([weighted_spatial, measurement_feature], dim=1)
         output_feature = self.join_ctrl(fused_feature)
         
-        # Step 4: 可选的特征标准化
+        # Step 5: 可选的特征标准化
         if normalize is None:
             normalize = self.use_group_norm and self.training
         
         if normalize and self.use_group_norm:
             output_feature = self.feature_norm(output_feature.unsqueeze(-1)).squeeze(-1)
         
-        return output_feature
+        if return_attention:
+            # 返回特征和attention weights
+            # attention_weights shape: (batch, spatial_size) -> reshape to (batch, feat_h, feat_w)
+            attention_map = attention_weights.reshape(batch_size, self.feat_h, self.feat_w)
+            return output_feature, attention_map
+        else:
+            return output_feature
     
     def extract_features_batch(
         self, 
