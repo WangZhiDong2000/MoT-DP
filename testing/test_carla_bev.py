@@ -38,11 +38,11 @@ def load_best_model(checkpoint_path, config, device):
     
     # 提取action统计信息
     action_stats = {
-        'min': torch.tensor([0, -10.5050]),
-        'max': torch.tensor([24.4924,  9.9753]),
-        'mean': torch.tensor([2.3079, 0.0188]),
-        'std': torch.tensor([3.7443, 0.6994]),
-    }
+    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
+    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
+    'mean': torch.tensor([10.975193977355957, 0.04004639387130737]),
+    'std': torch.tensor([14.96833324432373, 3.419595956802368]),
+}
     
     # 初始化模型
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)

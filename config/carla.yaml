@@ -1,7 +1,7 @@
 
 dataloader:
-  batch_size: 64       # 减少以降低内存占用
-  num_workers: 4       # 设为0以避免OOM错误
+  batch_size: 64       
+  num_workers: 4       
   persistent_workers: True  # num_workers=0时必须为false
   pin_memory: true
   shuffle: true
@@ -24,7 +24,7 @@ ema:
 optimizer:
   _target_: torch.optim.AdamW
   betas:
-  - 0.9        # 训练稳定性
+  - 0.9        
   - 0.999
   eps: 1.0e-08
   lr: 5.0e-05  
@@ -34,7 +34,7 @@ optimizer:
 shape_meta:
   action:
     shape:
-    - 2           # throttle, steer
+    - 2           
   obs:
     agent_pos:
       shape:
@@ -60,7 +60,7 @@ shape_meta:
       type: low_dim
 
 # Action normalization settings
-enable_action_normalization: true  # 启用action normalization
+enable_action_normalization: true  
 
 # Policy configuration for DiT 
 policy:
@@ -103,9 +103,9 @@ training:
   image_data_root: '/home/wang/Project/carla_garage/data'  
   sample_interval: 1         # 增加采样间隔以减少数据量
   lr_final: 1e-7           
-  validation_freq: 5      # 每10个epoch进行一次验证
-  save_freq: 5            # 每5个epoch保存一次模型
-  early_stopping_patience: 10  # 早停机制
+  validation_freq: 5      
+  save_freq: 5            
+  early_stopping_patience: 10  
 
 # Logging - wandb配置
 logging:

@@ -55,6 +55,12 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories):
     # 平均轨迹误差 
     metrics['trajectory_error_mean'] = np.mean(l2_errors)
     
+    # ADE (Average Displacement Error): 所有时间步的平均L2距离
+    metrics['ADE'] = np.mean(l2_errors)
+    
+    # FDE (Final Displacement Error): 最后一个时间步的平均L2距离
+    metrics['FDE'] = np.mean(l2_errors[:, -1])
+    
     # x和y坐标的误差
     x_error = np.mean(np.abs(predicted_trajectories[:, :, 0] - target_trajectories[:, :, 0]))
     y_error = np.mean(np.abs(predicted_trajectories[:, :, 1] - target_trajectories[:, :, 1]))
@@ -176,11 +182,11 @@ def train_carla_policy():
     '''
 
     action_stats = {
-        'min': torch.tensor([0, -10.5050]),
-        'max': torch.tensor([24.4924,  9.9753]),
-        'mean': torch.tensor([2.3079, 0.0188]),
-        'std': torch.tensor([3.7443, 0.6994]),
-    }
+    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
+    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
+    'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
+    'std': torch.tensor([14.527670860290527, 3.224050521850586]),
+    } 
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
@@ -203,16 +209,7 @@ def train_carla_policy():
     
     print("Initializing policy model...")
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)  
-    #policy = DiffusionDiTTCPPolicy(config, action_stats=action_stats).to(device)
     print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
-    
-    # print("\n=== Checking data statistics ===")
-    # sample_batch = next(iter(train_loader))
-    # print(f"Sample agent_pos shape: {sample_batch['agent_pos'].shape}")
-    # print(f"Sample agent_pos range: [{sample_batch['agent_pos'].min():.4f}, {sample_batch['agent_pos'].max():.4f}]")
-    # print(f"Sample agent_pos mean: {sample_batch['agent_pos'].mean():.4f}, std: {sample_batch['agent_pos'].std():.4f}")
-    # print(f"First sample agent_pos:\n{sample_batch['agent_pos'][0]}")
-    # print("===================================\n")
     
     lr = config.get('optimizer', {}).get('lr', 5e-5)
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)

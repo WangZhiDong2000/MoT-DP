@@ -5,8 +5,6 @@ import torch
 import zarr
 
 
-
-
 class vlm_feature_extractor:
     def __init__(self):
         self.dataset_path = '/home/wang/projects/diffusion_policy_z/data/pusht/pusht/pusht_cchi_v7_replay.zarr'
@@ -21,7 +19,6 @@ class vlm_feature_extractor:
 
     def extract_and_save_features(self, chunk_size=1024):
         from tqdm import tqdm
-        # 直接加载固定模板特征
         print(f"Loading fixed VLM features from {self.fixed_vlm_template_path}")
         fixed_features = torch.load(self.fixed_vlm_template_path)
         # fixed_features shape: (seq_len, hidden_size) or (1, seq_len, hidden_size)
@@ -30,7 +27,6 @@ class vlm_feature_extractor:
 
         num_images = self._image_data.shape[0]
         seq_len, hidden_size = fixed_features.shape[1:]
-        # 创建 zarr 文件保存所有特征
         zarr_path = os.path.join(self.output_dir, 'vlm_features.zarr')
         vlm_zarr = zarr.open(zarr_path, mode='w')
         features_arr = vlm_zarr.create(
@@ -40,17 +36,12 @@ class vlm_feature_extractor:
             chunks=(min(chunk_size, num_images), seq_len, hidden_size),
             overwrite=True
         )
-        # 分块写入，带进度条
         for start in tqdm(range(0, num_images, chunk_size), desc="Writing features"):
             end = min(start + chunk_size, num_images)
             features_arr[start:end, :, :] = np.tile(fixed_features, (end - start, 1, 1)).astype('float32')
         print(f"Saved fixed VLM features to {zarr_path}")
 
 
-    # 不再需要VLM模型推理
-
-
-    # 不再需要VLM模型资源释放
 
 
 if __name__ == "__main__":
