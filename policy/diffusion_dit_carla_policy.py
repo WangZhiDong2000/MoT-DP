@@ -198,11 +198,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def extract_tcp_features(self, obs_dict, return_attention=False):
         """
-        使用SimplifiedTCPEncoder提取特征
-        现在使用lidar_bev作为视觉输入
+        使用InterfuserBEVEncoder提取特征
+        支持两种模式：
+        1. 使用预处理好的BEV特征（推荐，快速）
+        2. 使用原始lidar_bev图像（兼容模式，慢）
         
         Args:
-            obs_dict: 观测字典
+            obs_dict: 观测字典，应包含：
+                - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
+                - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
+                - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
+                - 'speed', 'target_point', 'next_command': 状态信息
             return_attention: 是否返回attention map
             
         Returns:
@@ -210,22 +216,58 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             如果return_attention=True: (j_ctrl特征, attention_map) 
         """
         try:
-            # 使用lidar_bev替代原来的front_img (RGB image)
-            lidar_bev_img = obs_dict['lidar_bev'].to(device='cuda', dtype=torch.float32)  
+            # 准备状态信息
             speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
             target_point = obs_dict['target_point'].to(dtype=torch.float32)
             command = obs_dict['next_command'].to(dtype=torch.float32)
             state = torch.cat([speed, target_point, command], 1).to('cuda')
             
-            if return_attention:
-                j_ctrl, attention_map = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=True)
-            else:
-                j_ctrl = self.obs_encoder(lidar_bev_img, state, normalize=True, return_attention=False)
-                attention_map = None
+            use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
+            
+            if use_precomputed:
+                # 模式1: 使用预处理好的BEV特征（快速）
+                lidar_token = obs_dict['lidar_token'].to(device='cuda', dtype=torch.float32)
+                lidar_token_global = obs_dict['lidar_token_global'].to(device='cuda', dtype=torch.float32)
                 
-            # Optional GroupNorm for better training stability
-            # if self.use_j_ctrl_norm and self.training:
-            #     j_ctrl = self.j_ctrl_norm(j_ctrl.unsqueeze(-1)).squeeze(-1)
+                if return_attention:
+                    j_ctrl, attention_map = self.obs_encoder(
+                        state=state,
+                        lidar_token=lidar_token,
+                        lidar_token_global=lidar_token_global,
+                        normalize=True,
+                        return_attention=True
+                    )
+                else:
+                    j_ctrl = self.obs_encoder(
+                        state=state,
+                        lidar_token=lidar_token,
+                        lidar_token_global=lidar_token_global,
+                        normalize=True,
+                        return_attention=False
+                    )
+                    attention_map = None
+            else:
+                # 模式2: 使用原始lidar_bev图像（兼容模式，慢）
+                if 'lidar_bev' not in obs_dict:
+                    raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
+                
+                lidar_bev_img = obs_dict['lidar_bev'].to(device='cuda', dtype=torch.float32)
+                
+                if return_attention:
+                    j_ctrl, attention_map = self.obs_encoder(
+                        image=lidar_bev_img,
+                        state=state,
+                        normalize=True,
+                        return_attention=True
+                    )
+                else:
+                    j_ctrl = self.obs_encoder(
+                        image=lidar_bev_img,
+                        state=state,
+                        normalize=True,
+                        return_attention=False
+                    )
+                    attention_map = None
             
             if return_attention:
                 return j_ctrl, attention_map
@@ -240,7 +282,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
+            # 选项1: 预处理好的特征（推荐）
+            'lidar_token': (B, obs_horizon, seq_len, 512) - 预处理的空间特征
+            'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征
+            
+            # 选项2: 原始图像（兼容模式）
             'lidar_bev': (B, obs_horizon, 3, 448, 448) - LiDAR BEV图像
+            
+            # 其他必需字段
             'agent_pos': (B, obs_horizon, 2)
             'next_command': (B, obs_horizon, 6)
             'speed': (B, obs_horizon)
@@ -249,10 +298,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         device = next(self.parameters()).device
         nobs = {}
-        carla_fields = ['lidar_bev', 'next_command', 'speed', 'target_point','agent_pos']
+        
+        # 支持预处理特征和原始图像两种模式
+        carla_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'next_command', 'speed', 'target_point', 'agent_pos']
         for field in carla_fields:
             if field in batch:
-                if field == 'lidar_bev':
+                if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
                     nobs[field] = batch[field].to(device=device, dtype=torch.float32)
                 else:
                     nobs[field] = batch[field].to(device)
@@ -811,44 +862,3 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
 
 
-def use_dummy_test():
-    base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(base_path, "config/carla.yaml")
-    import yaml
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)  
-    
-    # 对于测试，禁用action normalization或提供dummy stats
-    config['enable_action_normalization'] = False
-    model = DiffusionDiTCarlaPolicy(config)
-    # print(model)
-
-    # dummy input - 使用CARLA驾驶数据集格式，obs_horizon=1
-    obs_dict = {
-        'lidar_bev': torch.randn(4, 1, 3, 448, 448),  # LiDAR BEV图像格式 (448x448)
-        'agent_pos': torch.randn(4, 1, 2),      # 代理位置
-        'speed': torch.randn(4, 1),             # 速度
-        'theta': torch.randn(4, 1),             # 朝向角
-        'throttle': torch.randn(4, 1),          # 油门
-        'steer': torch.randn(4, 1),             # 转向
-        'brake': torch.randn(4, 1),             # 刹车
-        'target_point': torch.randn(4, 1, 2),  # 目标点
-        'next_command': torch.randn(4, 1, 6),  # 指令
-    }
-    batch_input = {
-        'lidar_bev': obs_dict['lidar_bev'],
-        'agent_pos': obs_dict['agent_pos'],
-        'speed': obs_dict['speed'],
-        'theta': obs_dict['theta'],
-        'throttle': obs_dict['throttle'],
-        'steer': obs_dict['steer'],
-        'brake': obs_dict['brake'],
-        'target_point': obs_dict['target_point'],
-        'next_command': obs_dict['next_command'],
-        'action': torch.randn(4, 16, 2)  
-    }
-    out = model.compute_loss(batch_input)
-    #print(out)
-
-if __name__ == "__main__":
-    use_dummy_test()

@@ -20,24 +20,15 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     Images are loaded dynamically in __getitem__.
     """
     def __init__(self,
-                 dataset_path: str,  # Directory containing individual frame pkl files
+                 dataset_path: str,  
                  image_data_root:str,
-                 ):  # Base path for images (if None, use absolute paths from pkl)
+                 ): 
 
         self.image_data_root = image_data_root
         self.dataset_path = dataset_path
         
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
-        # 定义LiDAR BEV图像变换（不裁剪，只转换为tensor和归一化）
-        self.lidar_bev_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -67,71 +58,69 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         return len(self.sample_files)
 
     def __getitem__(self, idx):
-        # 1. 获取文件路径并加载单个样本
         sample_path = self.sample_files[idx]
         with open(sample_path, 'rb') as f:
             sample = pickle.load(f)
 
-        # 2. 动态加载图像
-        image_paths = sample.get('rgb_hist_jpg', [])
-        images = []
+        # # 2. 动态加载图像
+        # image_paths = sample.get('rgb_hist_jpg', [])
+        # images = []
         
-        for img_path in image_paths:
-            if img_path is None:
-                # 如果路径为None，创建一个黑色图像
-                images.append(torch.zeros(3, 256, 928))
-                print(f"Warning: Image path is None in sample {sample_path}. Using black image.")
-            else:
-                full_img_path = os.path.join(self.image_data_root, img_path)
-                try:
-                    img = Image.open(full_img_path)
-                    img_tensor = self.image_transform(img)
-                    images.append(img_tensor)
-                except Exception as e:
-                    print(f"Error loading image {full_img_path}: {e}")
-                    images.append(torch.zeros(3, 256, 928))
+        # for img_path in image_paths:
+        #     if img_path is None:
+        #         # 如果路径为None，创建一个黑色图像
+        #         images.append(torch.zeros(3, 256, 928))
+        #         print(f"Warning: Image path is None in sample {sample_path}. Using black image.")
+        #     else:
+        #         full_img_path = os.path.join(self.image_data_root, img_path)
+        #         try:
+        #             img = Image.open(full_img_path)
+        #             img_tensor = self.image_transform(img)
+        #             images.append(img_tensor)
+        #         except Exception as e:
+        #             print(f"Error loading image {full_img_path}: {e}")
+        #             images.append(torch.zeros(3, 256, 928))
         
-        # 堆叠图像
-        if len(images) > 0:
-            images_tensor = torch.stack(images)
-        else:
-            images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
+        # # 堆叠图像
+        # if len(images) > 0:
+        #     images_tensor = torch.stack(images)
+        # else:
+        #     images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
         
-        # 2.5 动态加载LiDAR BEV图像（处理方式和image相同，但不裁剪）
+        # 2 动态加载预处理好的LiDAR BEV特征
         lidar_bev_paths = sample.get('lidar_bev_hist', [])
-        lidar_bev_images = []
-        for bev_path in lidar_bev_paths:
-            if bev_path is None:
-                # 如果路径为None，创建一个黑色BEV图像（336x336）
-                lidar_bev_images.append(torch.zeros(3, 336, 336))
-                print(f"Warning: LiDAR BEV path is None in sample {sample_path}. Using black BEV image.")
-            else:
-                full_bev_path = os.path.join(self.image_data_root, bev_path)
-                try:
-                    bev_img = Image.open(full_bev_path)
-                    bev_tensor = self.lidar_bev_transform(bev_img)
-                    lidar_bev_images.append(bev_tensor)
-                except Exception as e:
-                    print(f"Warning: Error loading BEV image {full_bev_path}: {e}")
-                    lidar_bev_images.append(torch.zeros(3, 336, 336))
+        lidar_tokens = []
+        lidar_tokens_global = []
         
-        # 堆叠LiDAR BEV图像
-        if len(lidar_bev_images) > 0:
-            lidar_bev_tensor = torch.stack(lidar_bev_images)
-        else:
-            lidar_bev_tensor = torch.zeros(2, 3, 336, 336)  # 默认obs_horizon=2, BEV尺寸336x336
+        for bev_path in lidar_bev_paths:
+            # 从BEV图像路径推断特征路径
+            # 例如: Town01/data/Route_0/lidar_bev/0000.png -> Town01/data/Route_0/lidar_bev_features/0000_token.pt
+            bev_dir = os.path.dirname(bev_path)  # e.g., Town01/data/Route_0/lidar_bev
+            frame_id = os.path.splitext(os.path.basename(bev_path))[0]  # e.g., 0000
+            feature_dir = bev_dir.replace('lidar_bev', 'lidar_bev_features')
+                
+            token_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token.pt')
+            token_global_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token_global.pt')
+                
+            lidar_token = torch.load(token_path)
+            lidar_token_global = torch.load(token_global_path)
+            lidar_tokens.append(lidar_token)
+            lidar_tokens_global.append(lidar_token_global)
+        
+        lidar_token_tensor = torch.stack(lidar_tokens)  # (obs_horizon, seq_len, 512)
+        lidar_token_global_tensor = torch.stack(lidar_tokens_global)  # (obs_horizon, 1, 512)
         
         # 3. 转换其他数据
         final_sample = dict()
         for key, value in sample.items():
-            if key == 'rgb_hist_jpg':
-                final_sample['rgb_hist_jpg'] = image_paths  
-                final_sample['image'] = images_tensor
-            elif key == 'lidar_bev_hist':
+            # if key == 'rgb_hist_jpg':
+            #     final_sample['rgb_hist_jpg'] = image_paths  
+            #     final_sample['image'] = images_tensor
+            if key == 'lidar_bev_hist':
                 final_sample['lidar_bev_hist'] = lidar_bev_paths  
-                final_sample['lidar_bev'] = lidar_bev_tensor
+                final_sample['lidar_token'] = lidar_token_tensor  # (obs_horizon, seq_len, 512)
+                final_sample['lidar_token_global'] = lidar_token_global_tensor  # (obs_horizon, 1, 512)
             elif key == 'speed_hist':
-                # Convert speed_hist to tensor
                 speed_data = sample['speed_hist']
                 if isinstance(speed_data, np.ndarray):
                     final_sample['speed'] = torch.from_numpy(speed_data).float()
@@ -146,7 +135,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             else:
                 final_sample[key] = value
         
-        final_sample = self.hard_process(final_sample, obs_horizon=images_tensor.shape[0])
+        final_sample = self.hard_process(final_sample, obs_horizon=lidar_token_tensor.shape[0])
 
         return final_sample
 
@@ -198,9 +187,6 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
         if target_point.ndim == 2:
             target_point = target_point[0]
         plt.plot(target_point[1], target_point[0], 'g*', markersize=15, label='Target point (relative)', markeredgecolor='black', markeredgewidth=1)
-        
-
-
     
     plt.xlabel('Y (relative to last obs)')
     plt.ylabel('X (relative to last obs)')
@@ -322,7 +308,7 @@ def test():
             print(f"  {key}: value={value}")
 
     visualize_trajectory(rand_sample, obs_horizon, rand_idx)
-    visualize_observation_images(rand_sample, obs_horizon, rand_idx)
+    # visualize_observation_images(rand_sample, obs_horizon, rand_idx)
     print_sample_details(rand_sample, dataset, rand_idx, obs_horizon)
 
     

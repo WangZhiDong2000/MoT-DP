@@ -206,11 +206,13 @@ def test_model(policy, test_loader, config, device='cuda'):
             # 提取观测数据
             obs_horizon = config.get('obs_horizon', 2)
             obs_dict = {
-                'lidar_bev': batch['lidar_bev'][:, :obs_horizon],
-                'agent_pos': batch['agent_pos'][:, :obs_horizon],
+                'lidar_token': batch['lidar_token'][:, :obs_horizon],  # (B, obs_horizon, seq_len, 512)
+                'lidar_token_global': batch['lidar_token_global'][:, :obs_horizon],  # (B, obs_horizon, 1, 512)
+                # 'lidar_bev': batch['lidar_bev'][:, :policy.n_obs_steps],  # (B, obs_horizon, 3, 448, 448)
+                'agent_pos': batch['agent_pos'][:, :obs_horizon],  # (B, obs_horizon, 2) - 观测步的agent_pos
                 'speed': batch['speed'][:, :obs_horizon],
                 'target_point': batch['target_point'][:, :obs_horizon],
-                'next_command': batch['next_command'][:, :obs_horizon],
+                'next_command': batch['next_command'][:, :obs_horizon],  
             }
             
             try:
@@ -344,7 +346,7 @@ def main():
     config = load_config(config_path)
     
     # 加载最优模型
-    checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_policy_best.pt"
+    checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_dit/carla_policy_best.pt"
     policy = load_best_model(checkpoint_path, config, device)
     
     # 加载测试数据集

@@ -4,13 +4,22 @@ A PyTorch implementation of Diffusion Policy
 
 ## Dataset
 
-### Generate Dataset
+### Generate BEV Figure in Dataset
 
 Add BEV image to the current PDM-LITE dataset:
 
 ```bash
 cd dataset
 python generate_lidar_bev.py
+```
+
+### Generate BEV Feature in Dataset
+
+Add BEV feature based on the generated BEV fugure:
+
+```bash
+cd dataset
+python preprocess_bev_feature.py
 ```
 
 

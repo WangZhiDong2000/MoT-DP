@@ -89,7 +89,9 @@ def validate_model(policy, val_loader, device):
             val_metrics['loss'].append(loss.item())
             
             obs_dict = {
-                'lidar_bev': batch['lidar_bev'][:, :policy.n_obs_steps],  # (B, obs_horizon, 3, 448, 448)
+                'lidar_token': batch['lidar_token'][:, :policy.n_obs_steps],  # (B, obs_horizon, seq_len, 512)
+                'lidar_token_global': batch['lidar_token_global'][:, :policy.n_obs_steps],  # (B, obs_horizon, 1, 512)
+                # 'lidar_bev': batch['lidar_bev'][:, :policy.n_obs_steps],  # (B, obs_horizon, 3, 448, 448)
                 'agent_pos': batch['agent_pos'][:, :policy.n_obs_steps],  # (B, obs_horizon, 2) - 观测步的agent_pos
                 'speed': batch['speed'][:, :policy.n_obs_steps],
                 'target_point': batch['target_point'][:, :policy.n_obs_steps],

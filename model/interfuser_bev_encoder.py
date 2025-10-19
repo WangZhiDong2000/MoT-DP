@@ -150,55 +150,105 @@ class InterfuserBEVEncoder(nn.Module):
     
     def forward(
         self, 
-        image: torch.Tensor, 
-        state: torch.Tensor,
+        image: torch.Tensor = None, 
+        state: torch.Tensor = None,
         normalize: bool = True,
-        return_attention: bool = False
+        return_attention: bool = False,
+        lidar_token: torch.Tensor = None,
+        lidar_token_global: torch.Tensor = None
     ) -> torch.Tensor:
+        """
+        Forward pass with support for both:
+        1. Raw BEV images (image + state) - extracts features on-the-fly
+        2. Pre-computed features (lidar_token + lidar_token_global + state) - uses cached features
         
-        if self.perception is None:
-            raise RuntimeError("Perception backbone not initialized. Set self.perception before forward.")
+        Args:
+            image: Raw BEV image (B, 3, H, W) - optional if using pre-computed features
+            state: State information (B, state_dim)
+            normalize: Whether to apply GroupNorm
+            return_attention: Whether to return attention weights
+            lidar_token: Pre-computed local tokens (B, seq_len, 512) - optional
+            lidar_token_global: Pre-computed global token (B, 1, 512) - optional
+        """
         
-        batch_size = image.shape[0]
+        # Determine which mode to use
+        use_precomputed = lidar_token is not None and lidar_token_global is not None
         
-        # Step 1: 使用 bev_model_mot 处理原始图像
-        # bev_model_mot 包含 backbone + projection，直接输入原始图像
-        lidar_token, lidar_token_global = self.bev_model_mot(image)
+        if use_precomputed:
+            # Mode 1: Use pre-computed features (fast path)
+            batch_size = lidar_token.shape[0]
+            
+            # lidar_token: (B, seq_len, 512)
+            # lidar_token_global: (B, 1, 512)
+            # These are already processed through bev_model_mot + position encoding + connector
+            
+        else:
+            # Mode 2: Extract features from raw image (slow path)
+            if self.perception is None:
+                raise RuntimeError("Perception backbone not initialized. Set self.perception before forward.")
+            if image is None:
+                raise ValueError("image is required when not using pre-computed features")
+            
+            batch_size = image.shape[0]
+            
+            # Step 1: 使用 bev_model_mot 处理原始图像
+            lidar_token_raw, lidar_token_global_raw = self.bev_model_mot(image)
+            
+            # 添加位置编码
+            lidar_token_raw = lidar_token_raw + self.position_encoding(lidar_token_raw)
+            
+            # 重塑为序列格式
+            lidar_token_raw = lidar_token_raw.flatten(2).permute(2, 0, 1)  # (seq_len, batch, embed_dim)
+            lidar_token_global_raw = lidar_token_global_raw.permute(2, 0, 1)  # (1, batch, embed_dim)
+            
+            # 连接局部和全局token
+            lidar_tokens = torch.cat([lidar_token_raw, lidar_token_global_raw], dim=0)
+            
+            # 通过connector
+            lidar_tokens = self.lidar_connector(lidar_tokens)
+            
+            # 转换为 (batch, seq_len, 512) 格式
+            lidar_token = lidar_tokens[:-1].permute(1, 0, 2)  # (batch, seq_len, 512)
+            lidar_token_global = lidar_tokens[-1:].permute(1, 0, 2)  # (batch, 1, 512)
         
-        # 添加位置编码
-        lidar_token = lidar_token + self.position_encoding(lidar_token)
-        
-        # 重塑为序列格式
-        lidar_token = lidar_token.flatten(2).permute(2, 0, 1)  # (seq_len, batch, embed_dim)
-        lidar_token_global = lidar_token_global.permute(2, 0, 1)  # (1, batch, embed_dim)
-        
-        # 连接局部和全局token
-        lidar_tokens = torch.cat([lidar_token, lidar_token_global], dim=0)
-        
-        # 通过connector
-        lidar_tokens = self.lidar_connector(lidar_tokens)
-        
-        # lidar_tokens shape: (seq_len, batch, 256)
-        # 转换为 (batch, 256, seq_len) 用于后续处理
-        lidar_feature = lidar_tokens.permute(1, 2, 0)  # (batch, 256, seq_len)
+        # From here, both paths use the same code
+        # lidar_token: (batch, seq_len, 512)
+        # lidar_token_global: (batch, 1, 512)
         
         # Step 2: 测量编码
+        if state is None:
+            raise ValueError("state is required for forward pass")
         measurement_feature = self.measurements(state)
         
         # Step 3: 空间注意力机制
         # 使用 measurement_feature 生成空间注意力权重
-        attention_weights = self.init_att(measurement_feature)  # (batch, spatial_size)
-        attention_weights_expanded = attention_weights.unsqueeze(1)  # (batch, 1, spatial_size)
+        spatial_size = lidar_token.shape[1]  # seq_len
+        attention_weights = self.init_att(measurement_feature)  # (batch, expected_spatial_size)
         
-        # 对 lidar_feature 应用注意力加权
-        # lidar_feature: (batch, 256, seq_len), attention_weights_expanded: (batch, 1, spatial_size)
-        # 注意：seq_len = spatial_size + 1 (包含global token)
-        # 我们只对空间token应用注意力，保留global token
-        spatial_tokens = lidar_feature[:, :, :-1]  # (batch, 256, spatial_size)
-        global_token = lidar_feature[:, :, -1:]  # (batch, 256, 1)
+        # Handle dynamic spatial size (in case of pre-computed features with different sizes)
+        if attention_weights.shape[1] != spatial_size:
+            # Resize attention weights to match actual spatial size
+            # This can happen when using pre-computed features from different image sizes
+            import torch.nn.functional as F
+            expected_h, expected_w = self.feat_h, self.feat_w
+            actual_h = actual_w = int(spatial_size ** 0.5)
+            
+            # Reshape and resize
+            attention_weights = attention_weights.reshape(batch_size, expected_h, expected_w)
+            attention_weights = F.interpolate(
+                attention_weights.unsqueeze(1), 
+                size=(actual_h, actual_w), 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze(1)
+            attention_weights = attention_weights.reshape(batch_size, -1)
+            # Re-normalize
+            attention_weights = F.softmax(attention_weights, dim=1)
         
-        # 应用注意力加权并求和
-        weighted_spatial = (spatial_tokens * attention_weights_expanded).sum(dim=2)  # (batch, 256)
+        attention_weights_expanded = attention_weights.unsqueeze(-1)  # (batch, spatial_size, 1)
+        
+        # 对 lidar_token 应用注意力加权并求和
+        weighted_spatial = (lidar_token * attention_weights_expanded).sum(dim=1)  # (batch, 512)
         
         # Step 4: 特征融合
         # 融合注意力加权后的视觉特征和测量特征
@@ -222,18 +272,47 @@ class InterfuserBEVEncoder(nn.Module):
     
     def extract_features_batch(
         self, 
-        images: torch.Tensor, 
-        states: torch.Tensor
+        images: torch.Tensor = None, 
+        states: torch.Tensor = None,
+        lidar_tokens: torch.Tensor = None,
+        lidar_tokens_global: torch.Tensor = None
     ) -> torch.Tensor:
+        """
+        Extract features for a batch with temporal dimension
         
-        B, T = images.shape[:2]
+        Supports two modes:
+        1. Raw images: images (B, T, C, H, W) + states (B, T, state_dim)
+        2. Pre-computed: lidar_tokens (B, T, seq_len, 512) + lidar_tokens_global (B, T, 1, 512) + states (B, T, state_dim)
+        """
         
-        # Reshape: (B, T, ...) -> (B*T, ...)
-        images_flat = images.reshape(B * T, *images.shape[2:])
-        states_flat = states.reshape(B * T, *states.shape[2:])
+        use_precomputed = lidar_tokens is not None and lidar_tokens_global is not None
         
-        # Extract features
-        features_flat = self.forward(images_flat, states_flat)
+        if use_precomputed:
+            B, T = lidar_tokens.shape[:2]
+            
+            # Reshape: (B, T, ...) -> (B*T, ...)
+            lidar_tokens_flat = lidar_tokens.reshape(B * T, *lidar_tokens.shape[2:])
+            lidar_tokens_global_flat = lidar_tokens_global.reshape(B * T, *lidar_tokens_global.shape[2:])
+            states_flat = states.reshape(B * T, *states.shape[2:])
+            
+            # Extract features using pre-computed tokens
+            features_flat = self.forward(
+                state=states_flat,
+                lidar_token=lidar_tokens_flat,
+                lidar_token_global=lidar_tokens_global_flat
+            )
+        else:
+            if images is None or states is None:
+                raise ValueError("Either (images, states) or (lidar_tokens, lidar_tokens_global, states) must be provided")
+            
+            B, T = images.shape[:2]
+            
+            # Reshape: (B, T, ...) -> (B*T, ...)
+            images_flat = images.reshape(B * T, *images.shape[2:])
+            states_flat = states.reshape(B * T, *states.shape[2:])
+            
+            # Extract features from raw images
+            features_flat = self.forward(images_flat, states_flat)
         
         # Reshape back: (B*T, feature_dim) -> (B, T, feature_dim)
         features = features_flat.reshape(B, T, self.feature_dim)
