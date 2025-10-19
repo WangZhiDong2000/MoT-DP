@@ -178,13 +178,17 @@ def train_carla_policy():
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
+    persistent_workers = config.get('dataloader', {}).get('persistent_workers', True)
+    prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
     
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None
     )
     
     val_loader = DataLoader(
@@ -192,7 +196,9 @@ def train_carla_policy():
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None
     )
     
     print("Initializing policy model...")
