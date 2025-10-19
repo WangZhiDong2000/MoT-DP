@@ -13,13 +13,22 @@ cd dataset
 python generate_lidar_bev.py
 ```
 
+### Generate BEV Feature
+
+Add BEV feature to the current PDM-LITE dataset:
+
+```bash
+cd dataset
+python preprocess_lidar_bev.py
+```
+
 
 ### Preprocess Dataset
 
 Generate trainable sequences and divide:
 
 ```bash
-python preprocess_pdm_lite.py
+python preprocess_b2d.py
 ```
 
 

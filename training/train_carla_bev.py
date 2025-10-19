@@ -80,7 +80,8 @@ def validate_model(policy, val_loader, device):
     policy.eval()
     val_metrics = defaultdict(list)
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validating")):
+        pbar = tqdm(val_loader, desc="Validating", leave=False)
+        for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
@@ -89,7 +90,9 @@ def validate_model(policy, val_loader, device):
             val_metrics['loss'].append(loss.item())
             
             obs_dict = {
-                'lidar_bev': batch['lidar_bev'][:, :policy.n_obs_steps],  # (B, obs_horizon, 3, 448, 448)
+                'lidar_token': batch['lidar_token'][:, :policy.n_obs_steps],  # (B, obs_horizon, seq_len, 512)
+                'lidar_token_global': batch['lidar_token_global'][:, :policy.n_obs_steps],  # (B, obs_horizon, 1, 512)
+                # 'lidar_bev': batch['lidar_bev'][:, :policy.n_obs_steps],  # (B, obs_horizon, 3, 448, 448)
                 'agent_pos': batch['agent_pos'][:, :policy.n_obs_steps],  # (B, obs_horizon, 2) - 观测步的agent_pos
                 'speed': batch['speed'][:, :policy.n_obs_steps],
                 'target_point': batch['target_point'][:, :policy.n_obs_steps],
@@ -116,9 +119,14 @@ def validate_model(policy, val_loader, device):
                 driving_metrics = compute_driving_metrics(predicted_actions, target_actions)
                 for key, value in driving_metrics.items():
                     val_metrics[key].append(value)
+                    
+                # 更新验证进度条信息
+                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
             except Exception as e:
                 print(f"Warning: Error in action prediction during validation: {e}")
                 continue
+    
+    pbar.close()  # 关闭验证进度条
     
     averaged_metrics = {}
     for key, values in val_metrics.items():
@@ -182,11 +190,11 @@ def train_carla_policy():
     '''
 
     action_stats = {
-    'min': torch.tensor([-2.7400121688842773, -4.734850883483887]),
-    'max': torch.tensor([20.197893142700195, 9.115757942199707]),
-    'mean': torch.tensor([4.428925037384033, 0.18523629009723663]),
-    'std': torch.tensor([4.4664106369018555, 1.0404058694839478]),
-}
+    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
+    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
+    'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
+    'std': torch.tensor([14.527670860290527, 3.224050521850586]),
+    }
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
@@ -215,9 +223,10 @@ def train_carla_policy():
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # 设置 checkpoint 目录
-    checkpoint_dir = "/home/wang/Project/MoT-DP/checkpoints/carla_dit"
+    # 从config文件加载checkpoint目录
+    checkpoint_dir = config.get('logging', {}).get('checkpoint_dir', '/home/wang/Project/MoT-DP/checkpoints/carla_dit')
     os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
@@ -228,7 +237,8 @@ def train_carla_policy():
         policy.train()
         train_losses = []
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+        for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
@@ -240,6 +250,12 @@ def train_carla_policy():
             optimizer.step()
             train_losses.append(loss.item())
             
+            # 更新进度条信息，显示当前loss
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{np.mean(train_losses):.4f}'
+            })
+            
             if batch_idx % 10 == 0:
                 step = epoch * len(train_loader) + batch_idx
                 safe_wandb_log({
@@ -249,19 +265,14 @@ def train_carla_policy():
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/batch_idx": batch_idx
                 }, use_wandb)
-                
-                #print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
         
-
+        pbar.close()  # 关闭当前epoch的进度条
+        
         avg_train_loss = np.mean(train_losses)
-        # print(f"Epoch {epoch+1} average training loss: {avg_train_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
         torch.save({
                     'model_state_dict': policy.state_dict(),
                     'config': config,
-                    'epoch': epoch,
-                    'val_loss': val_loss,
-                    'train_loss': avg_train_loss,
-                    'val_metrics': val_metrics
                     }, os.path.join(checkpoint_dir, "carla_policy.pt"))
         
         safe_wandb_log({
@@ -270,10 +281,11 @@ def train_carla_policy():
             "train/samples_processed": (epoch + 1) * len(train_dataset)
         }, use_wandb)
 
-        if (epoch + 1) % config.get('validation_freq', 1) == 0:
-            print("Validating...")
+        validation_freq = config.get('training', {}).get('validation_freq', 1)
+        if (epoch + 1) % validation_freq == 0:
+            print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
             val_metrics = validate_model(policy, val_loader, device)
-        
+            
             log_dict = {
                 "epoch": epoch,
                 "train/loss": avg_train_loss,
