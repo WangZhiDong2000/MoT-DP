@@ -62,6 +62,15 @@ shape_meta:
 # Action normalization settings
 enable_action_normalization: true  
 
+# BEV Encoder configuration
+bev_encoder:
+  pretrained_path: '/home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth'
+  state_dim: 9           # speed(1) + target_point(2) + command(6)
+  feature_dim: 256
+  use_group_norm: true
+  freeze_backbone: false
+  bev_input_size: [448, 448]
+
 # Policy configuration for DiT 
 policy:
   input_dim: 2        # action_dim 
@@ -112,7 +121,7 @@ logging:
   use_wandb: true
   wandb_project: "carla-diffusion-policy"
   run_name: "carla_dit_optimized"
-  checkpoint_dir: "/home/wang/projects/diffusion_policy_z/checkpoints/carla_dit"
+  checkpoint_dir: "/home/wang/Project/MoT-DP/checkpoints/carla_dit"
   save_every: 5
   log_freq: 10             
 

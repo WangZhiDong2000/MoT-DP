@@ -70,16 +70,27 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
 
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
+        
+        # Load BEV encoder configuration from config file
+        bev_encoder_cfg = config.get('bev_encoder', {})
         obs_encoder = InterfuserBEVEncoder(
             perception_backbone=None,
-            state_dim=9,
-            feature_dim=256,
-            use_group_norm=True,
-            freeze_backbone=False,  # 设为False以便加载权重
-            bev_input_size=(448, 448)
+            state_dim=bev_encoder_cfg.get('state_dim', 9),
+            feature_dim=bev_encoder_cfg.get('feature_dim', 256),
+            use_group_norm=bev_encoder_cfg.get('use_group_norm', True),
+            freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
+            bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
         )
-        pretrained_path = '/home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth'
-        load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
+        
+        # Load pretrained weights from config
+        pretrained_path = bev_encoder_cfg.get('pretrained_path', None)
+        if pretrained_path is not None and os.path.exists(pretrained_path):
+            load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
+            print(f"✓ BEV encoder loaded from: {pretrained_path}")
+        else:
+            print(f"⚠ BEV encoder pretrained_path not found or not specified: {pretrained_path}")
+            print("  Continuing with random initialization...")
+        
         self.obs_encoder = obs_encoder
         self.obs_encoder.cuda()
 

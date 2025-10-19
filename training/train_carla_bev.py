@@ -217,9 +217,10 @@ def train_carla_policy():
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # 设置 checkpoint 目录
-    checkpoint_dir = "/home/wang/Project/MoT-DP/checkpoints/carla_dit"
+    # 从config文件加载checkpoint目录
+    checkpoint_dir = config.get('logging', {}).get('checkpoint_dir', '/home/wang/Project/MoT-DP/checkpoints/carla_dit')
     os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
