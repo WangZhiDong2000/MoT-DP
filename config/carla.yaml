@@ -1,9 +1,10 @@
 
 dataloader:
-  batch_size: 64       
-  num_workers: 4       
-  persistent_workers: True  # num_workers=0时必须为false
-  pin_memory: true
+  batch_size: 128              # 增加批大小以减少epoch中的batch数
+  num_workers: 8               # 增加工作进程数以加速数据加载
+  persistent_workers: True     # 保持工作进程以避免启动/销毁开销
+  pin_memory: true             # 锁定内存以加速GPU传输
+  prefetch_factor: 2           # 预取因子，提前加载下个batch
   shuffle: true
 
 # Horizon settings 
@@ -112,8 +113,8 @@ training:
   image_data_root: '/home/wang/Project/carla_garage/data'  
   sample_interval: 1         # 增加采样间隔以减少数据量
   lr_final: 1e-7           
-  validation_freq: 5      
-  save_freq: 5            
+  validation_freq: 3         # 每隔3个epoch进行一次评估
+  save_freq: 3               # 每隔3个epoch保存一次checkpoint
   early_stopping_patience: 10  
 
 # Logging - wandb配置

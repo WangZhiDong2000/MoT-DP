@@ -43,7 +43,7 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories):
     # L2距离误差
     l2_errors = np.linalg.norm(predicted_trajectories - target_trajectories, axis=-1)  # (B, T)
 
-    # 不同时间步的L2误差（仿照TCP的0.5s, 1s, 1.5s, 2s评估）
+    # 不同时间步的L2误差
     metrics = {}
     time_steps = [1, 3, 5, 7]  
     time_labels = ['step_1', 'step_2', 'step_3', 'step_4']
@@ -285,8 +285,9 @@ def train_carla_policy():
             "train/samples_processed": (epoch + 1) * len(train_dataset)
         }, use_wandb)
 
-        if (epoch + 1) % config.get('validation_freq', 1) == 0:
-            print("Validating...")
+        validation_freq = config.get('training', {}).get('validation_freq', 1)
+        if (epoch + 1) % validation_freq == 0:
+            print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
             val_metrics = validate_model(policy, val_loader, device)
         
             log_dict = {
