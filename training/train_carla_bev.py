@@ -80,7 +80,8 @@ def validate_model(policy, val_loader, device):
     policy.eval()
     val_metrics = defaultdict(list)
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validating")):
+        pbar = tqdm(val_loader, desc="Validating", leave=False)
+        for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
@@ -118,9 +119,14 @@ def validate_model(policy, val_loader, device):
                 driving_metrics = compute_driving_metrics(predicted_actions, target_actions)
                 for key, value in driving_metrics.items():
                     val_metrics[key].append(value)
+                    
+                # 更新验证进度条信息
+                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
             except Exception as e:
                 print(f"Warning: Error in action prediction during validation: {e}")
                 continue
+    
+    pbar.close()  # 关闭验证进度条
     
     averaged_metrics = {}
     for key, values in val_metrics.items():
@@ -231,7 +237,8 @@ def train_carla_policy():
         policy.train()
         train_losses = []
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+        for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
@@ -243,6 +250,12 @@ def train_carla_policy():
             optimizer.step()
             train_losses.append(loss.item())
             
+            # 更新进度条信息，显示当前loss
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{np.mean(train_losses):.4f}'
+            })
+            
             if batch_idx % 10 == 0:
                 step = epoch * len(train_loader) + batch_idx
                 safe_wandb_log({
@@ -252,12 +265,11 @@ def train_carla_policy():
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/batch_idx": batch_idx
                 }, use_wandb)
-                
-                #print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
         
-
+        pbar.close()  # 关闭当前epoch的进度条
+        
         avg_train_loss = np.mean(train_losses)
-        # print(f"Epoch {epoch+1} average training loss: {avg_train_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
         torch.save({
                     'model_state_dict': policy.state_dict(),
                     'config': config,
