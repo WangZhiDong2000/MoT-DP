@@ -12,7 +12,7 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 
-
+#TODO ego_pose -> [x,y,heading], ego_velocity -> [vx,vy], ego_acceleration -> [ax,ay], 
 class CARLAImageDataset(torch.utils.data.Dataset):
     """
     Dataset for preprocessed PDM Lite data in 'frame' mode.
