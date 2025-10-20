@@ -190,11 +190,11 @@ def train_carla_policy():
     '''
 
     action_stats = {
-    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
-    'std': torch.tensor([14.527670860290527, 3.224050521850586]),
-    }
+    'min': torch.tensor([-5.7965264320373535, -15.481648445129395]),
+    'max': torch.tensor([20.342018127441406, 10.594539642333984]),
+    'mean': torch.tensor([4.2325334548950195, 0.07142174243927002]),
+    'std': torch.tensor([4.369570255279541, 1.6511776447296143]),
+}
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)

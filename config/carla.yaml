@@ -109,7 +109,7 @@ noise_scheduler:
 training:
   num_epochs: 300            
   max_grad_norm: 1.0        
-  dataset_path: '/home/wang/Dataset/b2d_10scene/processed_data'
+  dataset_path: '/home/wang/Dataset/b2d_10scene/tmp_data'
   image_data_root: '/home/wang/Dataset/b2d_10scene'  
   sample_interval: 1         # 增加采样间隔以减少数据量
   lr_final: 1e-7           

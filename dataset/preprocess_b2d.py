@@ -344,9 +344,31 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             
             # Target point - following TCP's approach: convert to ego frame
             # TCP uses x_target, y_target in world coordinates and converts to ego frame
-            origin_x = current_anno_in_list['x']
-            origin_y = current_anno_in_list['y']
-            origin_theta = current_anno_in_list['theta']
+            # 加载平滑后的轨迹数据
+            scene_id = folder_name.split('/')[-1]  # Get the last component (scenario name)
+            fid2smooth = None
+            
+            # 平滑轨迹文件位于 data_root/smoothed_data_b2d/
+            smooth_traj_file = join(data_root, 'smoothed_data_b2d', f"{scene_id}_smooth_traj.pkl")
+            
+            if os.path.exists(smooth_traj_file):
+                try:
+                    with open(smooth_traj_file, 'rb') as f:
+                        fid2smooth = pickle.load(f)
+                except Exception as e:
+                    if idx == 0:
+                        print(f"⚠️  Warning: Failed to load smooth trajectory from {smooth_traj_file}: {e}")
+            
+            # 如果存在平滑后的轨迹，使用平滑后的x, y, theta；否则使用原始值
+            if fid2smooth is not None and ii in fid2smooth:
+                smooth_data = fid2smooth[ii]
+                origin_x = smooth_data['x']
+                origin_y = smooth_data['y']
+                origin_theta = smooth_data['theta']
+            else:
+                origin_x = current_anno_in_list['x']
+                origin_y = current_anno_in_list['y']
+                origin_theta = current_anno_in_list['theta']
             
             target_x_world = current_anno_in_list.get('x_target', origin_x)
             target_y_world = current_anno_in_list.get('y_target', origin_y)
@@ -370,9 +392,23 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             
             # Construct waypoints from x, y positions (TCP's approach)
             waypoints = []
-            origin_x = future_measurements[0]['x']
-            origin_y = future_measurements[0]['y']
-            origin_theta = future_measurements[0]['theta']
+            
+            # 对于future waypoints，也使用平滑后的坐标
+            if fid2smooth is not None and current_idx_in_list < len(future_measurements):
+                first_frame_id = future_measurements[0].get('frame_id', ii)
+                if first_frame_id in fid2smooth:
+                    smooth_data = fid2smooth[first_frame_id]
+                    origin_x = smooth_data['x']
+                    origin_y = smooth_data['y']
+                    origin_theta = smooth_data['theta']
+                else:
+                    origin_x = future_measurements[0]['x']
+                    origin_y = future_measurements[0]['y']
+                    origin_theta = future_measurements[0]['theta']
+            else:
+                origin_x = future_measurements[0]['x']
+                origin_y = future_measurements[0]['y']
+                origin_theta = future_measurements[0]['theta']
             
             # Create rotation matrix for current frame
             # In vehicle frame: x is forward, y is left
@@ -388,8 +424,15 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             # Transform future positions to ego frame
             for index in range(1, action_horizon + 1):
                 if index < len(future_measurements):
-                    world_x = future_measurements[index]['x']
-                    world_y = future_measurements[index]['y']
+                    frame_id = future_measurements[index].get('frame_id', ii + index * hz_interval)
+                    # 优先使用平滑后的坐标
+                    if fid2smooth is not None and frame_id in fid2smooth:
+                        smooth_data = fid2smooth[frame_id]
+                        world_x = smooth_data['x']
+                        world_y = smooth_data['y']
+                    else:
+                        world_x = future_measurements[index]['x']
+                        world_y = future_measurements[index]['y']
                     
                     # Transform to ego frame (rotate by -theta)
                     dx = world_x - origin_x

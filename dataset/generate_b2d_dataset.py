@@ -129,7 +129,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             #     final_sample['rgb_hist_jpg'] = image_paths  
             #     final_sample['image'] = images_tensor
             if key == 'lidar_bev_hist':
-                final_sample['lidar_bev_hist'] = lidar_bev_paths  
+                # final_sample['lidar_bev_hist'] = lidar_bev_paths  
                 final_sample['lidar_token'] = lidar_token_tensor  # (obs_horizon, seq_len, 512)
                 final_sample['lidar_token_global'] = lidar_token_global_tensor  # (obs_horizon, 1, 512)
             elif key == 'speed_hist':
@@ -143,6 +143,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample['speed'] = speed_data
             elif key == 'ego_waypoints':
                 final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:])  # delete the first waypoint (current position always be 0,0)
+            elif key == 'vqa':
+                # Skip VQA data as it contains nested dicts that cause collate issues
+                # The VQA data will not be used in the model
+                pass
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
@@ -192,7 +196,7 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
     
     pred_agent_pos = agent_pos
     
-    plt.figure(figsize=(10, 8))
+    plt.figure(figsize=(10, 10))
     
     # Plot predicted agent positions (future waypoints)
     if len(pred_agent_pos) > 0:
@@ -211,6 +215,7 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
     plt.legend(fontsize=10, loc='best')
     plt.grid(True, alpha=0.3)
     plt.axis('equal')
+    plt.gca().set_aspect('equal', adjustable='box')
     
     # Add origin marker
     plt.plot(0, 0, 'ko', markersize=10, label='Current position (origin)', zorder=5)
@@ -487,7 +492,7 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon):
 def test():
     import random
     # 重要：现在路径应该指向预处理好的数据集的根目录
-    dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data_vqa_with_meta'  # 预处理数据集路径（带VQA和meta action）
+    dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data'  # 预处理数据集路径（带VQA和meta action）
     obs_horizon = 2
     
     # 使用新的Dataset类

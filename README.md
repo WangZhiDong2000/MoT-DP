@@ -22,6 +22,14 @@ cd dataset
 python preprocess_lidar_bev.py
 ```
 
+### Smooth Global Trajectory
+
+Deal with unstable recorded path data:
+
+```bash
+cd dataset
+python smooth_trajectory.py
+```
 
 ### Preprocess Dataset
 
@@ -32,13 +40,21 @@ python preprocess_b2d.py
 ```
 
 
-### Train
+### Get min-max range
 
+Before training, get the range and revise training and testing script:
+
+```bash
+python compute_action_stats.py
+```
+
+
+### Train
 
 ```bash
 cd ..
 cd training
-python train_carla_bev_full.py
+python train_carla_bev.py
 ```
 
 ### Test
