@@ -17,8 +17,9 @@ from dataset.generate_pdm_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml
 
-def create_carla_config():
-    config_path = "/home/wang/Project/MoT-DP/config/carla.yaml"
+def create_carla_config(config_path=None):
+    if config_path is None:
+        config_path = "/root/z_projects/code/MoT-DP/config/carla.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
@@ -135,9 +136,9 @@ def validate_model(policy, val_loader, device):
         
     return averaged_metrics
 
-def train_carla_policy():
+def train_carla_policy(config_path):
     print("Initializing CARLA driving policy training...")
-    config = create_carla_config()
+    config = create_carla_config(config_path=config_path)
     
     # 支持wandb离线模式和断网恢复
     wandb_mode = os.environ.get('WANDB_MODE', 'online')  # 可通过环境变量设置: export WANDB_MODE=offline
@@ -145,6 +146,7 @@ def train_carla_policy():
     
     if use_wandb:
         try:
+            wandb.login(key="bddb5a05a0820c1157702750c9f0ce60bcac2bba", anonymous="must")
             wandb.init(
                 project=config.get('logging', {}).get('wandb_project', "carla-diffusion-policy"),
                 name=config.get('logging', {}).get('run_name', "carla_dit_full_validation"),
@@ -229,8 +231,8 @@ def train_carla_policy():
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # 从config文件加载checkpoint目录
-    checkpoint_dir = config.get('logging', {}).get('checkpoint_dir', '/home/wang/Project/MoT-DP/checkpoints/carla_dit')
+    # 设置 checkpoint 目录
+    checkpoint_dir = config.get('logging', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
@@ -362,4 +364,9 @@ def train_carla_policy():
         print("✓ WandB session finished")
 
 if __name__ == "__main__":
-    train_carla_policy()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train CARLA Driving Policy with Diffusion DiT")
+    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/carla.yaml", help='Path to the configuration YAML file')
+    args = parser.parse_args()
+    train_carla_policy(config_path=args.config_path)
