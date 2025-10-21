@@ -232,7 +232,7 @@ def train_carla_policy(config_path):
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
     # 设置 checkpoint 目录
-    checkpoint_dir = config.get('logging', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
+    checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
