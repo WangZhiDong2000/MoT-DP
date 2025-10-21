@@ -49,6 +49,11 @@ def compute_action_stats_from_dataset(dataset_path, max_samples=None):
         all_files = all_files[:max_samples]
         print(f"⚠ Limiting to {len(all_files)} samples for statistics computation")
     
+    quarantine_dir = os.path.join(dataset_path, 'quarantined_samples')
+    os.makedirs(quarantine_dir, exist_ok=True)
+    failed = []
+    print(f"Problematic samples will be moved to: {quarantine_dir}")
+    
     all_actions = []
     failed_samples = 0
     
@@ -63,13 +68,22 @@ def compute_action_stats_from_dataset(dataset_path, max_samples=None):
             
             if ego_waypoints is None:
                 failed_samples += 1
-                continue
+                failed.append(pkl_file)
+                print(f"\n⚠ ego_waypoints is None for sample: {pkl_file}")
+                # continue
             
             if isinstance(ego_waypoints, torch.Tensor):
                 ego_waypoints = ego_waypoints.cpu().numpy()
             elif not isinstance(ego_waypoints, np.ndarray):
                 ego_waypoints = np.array(ego_waypoints)
             
+            # Check for NaN values
+            if np.isnan(ego_waypoints).any():
+                print(f"\n⚠ NaN value found in ego_waypoints for sample: {pkl_file}")
+                failed_samples += 1
+                failed.append(pkl_file)
+                continue
+
             # if len(ego_waypoints) > 1:
             #     ego_waypoints = ego_waypoints[1:]
             
@@ -82,7 +96,14 @@ def compute_action_stats_from_dataset(dataset_path, max_samples=None):
     
     if failed_samples > 0:
         print(f"\n⚠ Failed to load {failed_samples} samples")
-    
+        for failed_file in failed:
+            try:
+                base_name = os.path.basename(failed_file)
+                dst_path = os.path.join(quarantine_dir, base_name)
+                os.rename(failed_file, dst_path)
+                print(f"  - Moved problematic sample to: {dst_path}")
+            except Exception as e:
+                print(f"  - Error moving file {failed_file}: {e}")
     if len(all_actions) == 0:
         raise ValueError("No valid actions found in dataset!")
     

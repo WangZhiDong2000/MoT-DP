@@ -86,11 +86,24 @@ def compute_theta_from_trajectory(traj_xy):
     return theta
 
 def list_scene_dirs(data_root):
+    """
+    Recursively find all directories containing an 'anno' subdirectory.
+    """
     scenes = []
-    for d in os.listdir(data_root):
-        scene_path = join(data_root, d)
-        if os.path.isdir(scene_path) and os.path.isdir(join(scene_path, 'anno')):
-            scenes.append(d)
+    print(f"Searching for 'anno' directories under {data_root}...")
+    for root, dirs, files in os.walk(data_root):
+        if 'anno' in dirs:
+            # Found a directory that contains 'anno'.
+            # 'root' is the path to this directory.
+            # We want the path relative to data_root.
+            scene_path = os.path.relpath(root, data_root)
+            scenes.append(scene_path)
+            
+            # To avoid searching inside the 'anno' directory itself or other subdirectories
+            # of a found scene, we can clear the 'dirs' list. This makes the search faster.
+            dirs.clear()
+
+    print(f"Found {len(scenes)} scenes.")
     return sorted(scenes)
 
 def list_frame_jsons(scene_dir):
@@ -135,15 +148,32 @@ def read_json_gz(path):
     with gzip.open(path, 'rt', encoding='utf-8') as f:
         return json.load(f)
 
-def preprocess_b2d(scene_list, idx, tmp_dir, train_or_val,
+def preprocess_b2d(scene_list, idx, input_dir, output_dir, tmp_dir, train_or_val, sample_interval=SAMPLE_INTERVAL,
                    sigma_t=5, sigma_s_xy=4, sigma_s_z=None, radius=15):
-    data_root = DATAROOT
-    out_dir  = join(OUT_DIR, tmp_dir)
+    data_root = input_dir
+    out_dir  = join(output_dir, tmp_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     iterator = tqdm(scene_list) if idx == 0 else scene_list
-    for scene_id in iterator:
-        scene_path = join(data_root, scene_id, 'anno')
+    for scene_id_raw in iterator:
+        # Fix for duplicated scene_id like 'A/A'
+        parts = scene_id_raw.split(os.sep)
+        if len(parts) == 2:
+            if parts[0] == parts[1]:
+                scene_id = parts[0]
+            else:
+                scene_id = parts[1]
+                print(parts[0], parts[1])
+        elif len(parts) == 1:
+            scene_id = scene_id_raw
+        elif len(parts) > 2:
+            print(parts, "warning: more than 2 parts found")
+        # exist_files = os.listdir(out_dir)
+        # print(len(exist_files), 'files exist in', out_dir)
+        # if f"{scene_id}_smooth_traj.pkl" in exist_files:
+        #     continue
+
+        scene_path = join(data_root, scene_id_raw, 'anno') # Use cleaned path to find data
         frame_files = list_frame_jsons(scene_path)
         if not frame_files:
             continue
@@ -185,63 +215,64 @@ def preprocess_b2d(scene_list, idx, tmp_dir, train_or_val,
         with open(smooth_traj_file, 'wb') as f:
             pickle.dump(fid2smooth, f)
 
-        for fname in frame_files:
-            fid = int(fname.split('.')[0])
-            if fid % SAMPLE_INTERVAL != 0:
-                continue
-            obj = json_cache.get(fid)
-            if obj is None:
-                try:
-                    obj = read_json_gz(join(scene_path, fname))
-                except Exception:
-                    continue
+        # for fname in frame_files:
+        #     fid = int(fname.split('.')[0])
+        #     if fid % sample_interval != 0:
+        #         continue
+        #     obj = json_cache.get(fid)
+        #     if obj is None:
+        #         try:
+        #             obj = read_json_gz(join(scene_path, fname))
+        #         except Exception:
+        #             continue
 
-            frame_data = {}
-            frame_data['scene_id'] = scene_id
-            for k in ['speed','throttle','steer','brake']:
-                if k in obj: frame_data[k] = obj[k]
+        #     frame_data = {}
+        #     frame_data['scene_id'] = scene_id
+        #     for k in ['speed','throttle','steer','brake']:
+        #         if k in obj: frame_data[k] = obj[k]
 
-            if 'command' in obj:
-                frame_data['command'] = command_to_one_hot(obj['command'])
-            if 'next_command' in obj:
-                frame_data['next_command'] = command_to_one_hot(obj['next_command'])
+        #     if 'command' in obj:
+        #         frame_data['command'] = command_to_one_hot(obj['command'])
+        #     if 'next_command' in obj:
+        #         frame_data['next_command'] = command_to_one_hot(obj['next_command'])
 
-            if 'target_point' in obj:
-                frame_data['target_point'] = np.array(obj['target_point'])
-            if 'ego_matrix' in obj:
-                try:
-                    m = np.array(obj['ego_matrix'])
-                    if m.shape[0] >= 2 and m.shape[1] >= 4:
-                        frame_data['ego_waypoint'] = m[:2, 3]
-                except Exception:
-                    pass
-            if 'route' in obj:
-                route = obj['route']
-                if isinstance(route, list):
-                    if len(route) < 20:
-                        num_missing = 20 - len(route)
-                        route = np.array(route)
-                        route = np.vstack((route, np.tile(route[-1], (num_missing, 1))))
-                    else:
-                        route = np.array(route[:20])
-                    frame_data['route'] = route
+        #     if 'target_point' in obj:
+        #         frame_data['target_point'] = np.array(obj['target_point'])
+        #     if 'ego_matrix' in obj:
+        #         try:
+        #             m = np.array(obj['ego_matrix'])
+        #             if m.shape[0] >= 2 and m.shape[1] >= 4:
+        #                 frame_data['ego_waypoint'] = m[:2, 3]
+        #         except Exception:
+        #             pass
+        #     if 'route' in obj:
+        #         route = obj['route']
+        #         if isinstance(route, list):
+        #             if len(route) < 20:
+        #                 num_missing = 20 - len(route)
+        #                 route = np.array(route)
+        #                 route = np.vstack((route, np.tile(route[-1], (num_missing, 1))))
+        #             else:
+        #                 route = np.array(route[:20])
+        #             frame_data['route'] = route
 
-            # 图像路径（前视）
-            frame_data['rgb'] = join(scene_id, CAMERA_SUBDIR, f"{fid:05d}.jpg")
-            # 平滑后的当前帧自车世界系坐标和theta
-            if fid in fid2smooth:
-                frame_data['ego_world_smooth'] = [fid2smooth[fid]['x'], fid2smooth[fid]['y'], fid2smooth[fid]['z']]
-                frame_data['theta_smooth'] = fid2smooth[fid]['theta']
-            else:
-                frame_data['ego_world_smooth'] = None
-                frame_data['theta_smooth'] = None
+        #     # 图像路径（前视）
+        #     frame_data['rgb'] = join(scene_id, CAMERA_SUBDIR, f"{fid:05d}.jpg")
+        #     # 平滑后的当前帧自车世界系坐标和theta
+        #     if fid in fid2smooth:
+        #         frame_data['ego_world_smooth'] = [fid2smooth[fid]['x'], fid2smooth[fid]['y'], fid2smooth[fid]['z']]
+        #         frame_data['theta_smooth'] = fid2smooth[fid]['theta']
+        #     else:
+        #         frame_data['ego_world_smooth'] = None
+        #         frame_data['theta_smooth'] = None
 
-            out_name = f"{scene_id}_{fid:05d}_{train_or_val}.pkl"
-            out_path = join(out_dir, out_name)
-            with open(out_path, 'wb') as f:
-                pickle.dump(frame_data, f)
+        #     out_name = f"{scene_id}_{fid:05d}_{train_or_val}.pkl"
+        #     out_path = join(out_dir, out_name)
+        #     with open(out_path, 'wb') as f:
+        #         pickle.dump(frame_data, f)
 
-def generate_infos_b2d(scene_list, workers, train_or_val, tmp_dir):
+def generate_infos_b2d(scene_list, workers, train_or_val, input_dir, output_dir, tmp_dir, sample_interval,
+                       sigma_t=5, sigma_s_xy=4, sigma_s_z=None, radius=15):
     folder_num = len(scene_list)
     devide_list = [(folder_num//workers)*i for i in range(workers)]
     devide_list.append(folder_num)
@@ -251,7 +282,8 @@ def generate_infos_b2d(scene_list, workers, train_or_val, tmp_dir):
         # preprocess_b2d(sub_scenes, i, tmp_dir, train_or_val)
         p = multiprocessing.Process(
             target=preprocess_b2d,
-            args=(sub_scenes, i, tmp_dir, train_or_val)
+            args=(sub_scenes, i, input_dir, output_dir, tmp_dir, train_or_val, sample_interval,
+                  sigma_t, sigma_s_xy, sigma_s_z, radius)
         )
         p.start()
         process_list.append(p)
@@ -259,14 +291,23 @@ def generate_infos_b2d(scene_list, workers, train_or_val, tmp_dir):
         p.join()
 
 if __name__ == "__main__":
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # os.makedirs(OUT_DIR, exist_ok=True)
     parser = argparse.ArgumentParser()
     parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--input_dir', type=str, default=DATAROOT)
+    parser.add_argument('--output_dir', type=str, default=OUT_DIR)
+    parser.add_argument('--sample_interval', type=int, default=1)
     parser.add_argument('--tmp_dir', default="smoothed_data_b2d")
+    parser.add_argument('--sigma_t', type=float, default=5)
+    parser.add_argument('--sigma_s_xy', type=float, default=4)
+    parser.add_argument('--sigma_s_z', type=float, default=None)
+    parser.add_argument('--radius', type=int, default=15)
     args = parser.parse_args()
 
-    all_scenes = list_scene_dirs(DATAROOT)
-
+    all_scenes = list_scene_dirs(args.input_dir)
+    print(len(all_scenes), 'scenes found in', args.input_dir)
     print('processing Bench2Drive train data...')
-    generate_infos_b2d(all_scenes, args.workers, 'train', args.tmp_dir)
+    generate_infos_b2d(all_scenes, args.workers, 'train', args.input_dir, args.output_dir,
+                       args.tmp_dir, args.sample_interval, 
+                       args.sigma_t, args.sigma_s_xy, args.sigma_s_z, args.radius)
     print('finish!')

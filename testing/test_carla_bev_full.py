@@ -206,7 +206,9 @@ def test_model(policy, test_loader, config, device='cuda'):
             # 提取观测数据
             obs_horizon = config.get('obs_horizon', 2)
             obs_dict = {
-                'lidar_bev': batch['lidar_bev'][:, :obs_horizon],
+                'lidar_token': batch['lidar_token'][:, :obs_horizon],  # (B, obs_horizon, seq_len, 512)
+                'lidar_token_global': batch['lidar_token_global'][:, :obs_horizon],  # (B, obs_horizon, 1, 512)
+                # 'lidar_bev': batch['lidar_bev'][:, :obs_horizon],
                 'agent_pos': batch['agent_pos'][:, :obs_horizon],
                 'speed': batch['speed'][:, :obs_horizon],
                 'target_point': batch['target_point'][:, :obs_horizon],
@@ -333,18 +335,20 @@ def print_and_save_metrics(metrics, num_samples, save_path):
     print(f"\n✓ Metrics saved to: {save_path}")
 
 
-def main():
+def main(args):
     """主函数"""
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
     # 加载配置
-    config_path = os.path.join(project_root, "config/carla.yaml")
+    config_path = args.config_path
+    # config_path = os.path.join(project_root, "config/carla.yaml")
     config = load_config(config_path)
     
     # 加载最优模型
-    checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_policy_best1.pt"
+    checkpoint_path_base = config.get('training', {}).get('checkpoint_dir')
+    checkpoint_path = os.path.join(checkpoint_path_base, 'carla_policy_best.pt')
     policy = load_best_model(checkpoint_path, config, device)
     
     # 加载测试数据集
@@ -383,7 +387,9 @@ def main():
     )
     
     # 打印并保存结果
-    save_dir = os.path.join(project_root, 'image', 'test_results')
+    evaluation_config = config.get('evaluation', {})
+    results_dir = evaluation_config.get('results_dir', os.path.join(project_root, 'image'))
+    save_dir = os.path.join(results_dir, 'test_results')
     metrics_path = os.path.join(save_dir, 'test_metrics.txt')
     
     print_and_save_metrics(metrics, len(predictions), metrics_path)
@@ -394,4 +400,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Test DiffusionDiTCarlaPolicy on full test dataset')
+    parser.add_argument('--config-path', type=str, default=os.path.join(project_root, "config/carla.yaml"), help='Path to the config file')
+    args = parser.parse_args()
+    main(args)

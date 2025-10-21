@@ -1,0 +1,50 @@
+============================================================
+Test Results Summary
+============================================================
+
+Number of samples: 29858
+
+Basic Metrics:
+  MSE: 16.977820 ± 47.494400
+  MAE: 1.572980 ± 1.938885
+  ADE: 2.757096 ± 3.380350  (Average Displacement Error)
+  FDE: 5.845038 ± 7.873841  (Final Displacement Error)
+  L2 Distance (mean): 2.757096 ± 5.133620
+  L2 Distance (median): 0.516808
+  L2 Distance (max): 114.817346
+  L2 Distance (min): 0.000103
+
+Driving Metrics (from train_carla_bev.py):
+  Trajectory Error (mean): 2.764285
+  Trajectory Error (step 1): 0.845103
+  Trajectory Error (step 2): 2.166733
+  Trajectory Error (step 3): 3.765000
+  Trajectory Error (step 4): 5.853844
+  X Coordinate MAE: 2.453737
+  Y Coordinate MAE: 0.701340
+  Trajectory Smoothness Error: 1.582434
+
+============================================================
+All Metrics (key-value pairs):
+============================================================
+ADE: 2.757096
+ADE_std: 3.380350
+FDE: 5.845038
+FDE_std: 7.873841
+L2_max: 114.817346
+L2_mean: 2.757096
+L2_median: 0.516808
+L2_min: 0.000103
+L2_std: 5.133620
+MAE: 1.572980
+MAE_std: 1.938885
+MSE: 16.977820
+MSE_std: 47.494400
+trajectory_error_mean: 2.764285
+trajectory_error_step_1: 0.845103
+trajectory_error_step_2: 2.166733
+trajectory_error_step_3: 3.765000
+trajectory_error_step_4: 5.853844
+trajectory_smoothness_error: 1.582434
+x_coordinate_mae: 2.453737
+y_coordinate_mae: 0.701340

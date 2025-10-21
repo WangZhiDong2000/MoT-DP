@@ -18,7 +18,7 @@ from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml
 
 def create_carla_config():
-    config_path = "/home/wang/Project/MoT-DP/config/carla.yaml"
+    config_path = "/root/z_projects/code/MoT-DP/config/b2d_8obs_20pred.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
@@ -190,10 +190,10 @@ def train_carla_policy():
     '''
 
     action_stats = {
-    'min': torch.tensor([-5.7965264320373535, -15.481648445129395]),
-    'max': torch.tensor([20.342018127441406, 10.594539642333984]),
-    'mean': torch.tensor([4.2325334548950195, 0.07142174243927002]),
-    'std': torch.tensor([4.369570255279541, 1.6511776447296143]),
+    'min': torch.tensor([-3.674278974533081, -15.09633731842041]),
+    'max': torch.tensor([32.8021125793457, 12.464978218078613]),
+    'mean': torch.tensor([4.17860746383667, -0.014984924346208572]),
+    'std': torch.tensor([5.0119242668151855, 1.0905653238296509]),
 }
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)

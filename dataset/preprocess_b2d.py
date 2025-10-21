@@ -768,7 +768,7 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
     argparser.add_argument('--data-root', type=str, default='/home/wang/Dataset/b2d_10scene' , help='Root directory of raw PDM Lite data')
     argparser.add_argument('--out-dir', type=str, default='/home/wang/Dataset/b2d_10scene/tmp_data', help='Output directory for processed data')
-    argparser.add_argument('--vqa-root', type=str, default='/home/wang/Dataset/b2d_vlm_10scene', help='Root directory of VQA data (optional)')
+    argparser.add_argument('--vqa-root', type=str, default=None, help='Root directory of VQA data (optional)')
     argparser.add_argument('--obs-horizon', type=int, default=2, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=8, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
     argparser.add_argument('--sample-interval', type=int, default=5, help='Interval between training samples (e.g., 10 frames)')
@@ -857,4 +857,4 @@ if __name__ == "__main__":
     print('Finished!')
 
     print("start split train/val dataset")
-    split_train_val(join(args.out_dir, args.tmp_dir), args.out_dir, val_ratio=0.1)
+    split_train_val(join(args.out_dir, args.tmp_dir), args.out_dir, val_ratio=0.05)
