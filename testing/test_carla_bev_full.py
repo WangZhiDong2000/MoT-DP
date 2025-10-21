@@ -335,18 +335,21 @@ def print_and_save_metrics(metrics, num_samples, save_path):
     print(f"\n✓ Metrics saved to: {save_path}")
 
 
-def main():
+def main(args):
     """主函数"""
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
     # 加载配置
-    config_path = os.path.join(project_root, "config/carla.yaml")
+    config_path = args.config_path
+    # config_path = os.path.join(project_root, "config/carla.yaml")
     config = load_config(config_path)
     
     # 加载最优模型
-    checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_dit/carla_policy_best.pt"
+    checkpoint_base_path = config.get('training', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
+    checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
+    #checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_dit/carla_policy_best.pt"
     policy = load_best_model(checkpoint_path, config, device)
     
     # 加载测试数据集
@@ -396,4 +399,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Test DiffusionDiTCarlaPolicy on full test dataset")
+    parser.add_argument('--config_path', type=str, default=os.path.join(project_root, "config/carla.yaml"), help='Path to the configuration file')
+    args = parser.parse_args()
+    main(args)

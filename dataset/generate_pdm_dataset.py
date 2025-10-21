@@ -102,8 +102,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             token_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token.pt')
             token_global_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token_global.pt')
                 
-            lidar_token = torch.load(token_path)
-            lidar_token_global = torch.load(token_global_path)
+            lidar_token = torch.load(token_path, weights_only=True)
+            lidar_token_global = torch.load(token_global_path, weights_only=True)
             lidar_tokens.append(lidar_token)
             lidar_tokens_global.append(lidar_token_global)
         
