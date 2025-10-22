@@ -13,7 +13,7 @@ import time
 import psutil
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-from dataset.generate_pdm_dataset import CARLAImageDataset
+from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml
 
@@ -146,7 +146,7 @@ def train_carla_policy(config_path):
     
     if use_wandb:
         try:
-            wandb.login(key="bddb5a05a0820c1157702750c9f0ce60bcac2bba", anonymous="must")
+            # wandb.login(key="bddb5a05a0820c1157702750c9f0ce60bcac2bba", anonymous="must")
             wandb.init(
                 project=config.get('logging', {}).get('wandb_project', "carla-diffusion-policy"),
                 name=config.get('logging', {}).get('run_name', "carla_dit_full_validation"),
@@ -232,7 +232,7 @@ def train_carla_policy(config_path):
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
     # 设置 checkpoint 目录
-    checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
+    checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit")
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
@@ -367,6 +367,6 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Train CARLA Driving Policy with Diffusion DiT")
-    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP/config/carla3obs.yaml", help='Path to the configuration YAML file')
+    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/carla.yaml", help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_carla_policy(config_path=args.config_path)

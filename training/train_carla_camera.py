@@ -113,10 +113,11 @@ def validate_model(policy, val_loader, device):
 def train_carla_policy():
     print("Initializing CARLA driving policy training...")
     config = create_carla_config()
-    wandb.init(
-        project=config.get('logging', {}).get('wandb_project', "carla-diffusion-policy"),
-        name=config.get('logging', {}).get('run_name', "carla_dit_full_validation"),
-        config={
+    
+    # 使用当前登陆的wandb账户
+    wandb_init_kwargs = {
+        "name": config.get('logging', {}).get('run_name', "carla_dit_full_validation"),
+        "config": {
             "learning_rate": config.get('optimizer', {}).get('lr', 5e-5),
             "epochs": config.get('training', {}).get('num_epochs', 50),
             "batch_size": config.get('dataloader', {}).get('batch_size', 16),
@@ -129,7 +130,17 @@ def train_carla_policy():
             "weight_decay": config.get('optimizer', {}).get('weight_decay', 1e-5),
             "num_workers": config.get('dataloader', {}).get('num_workers', 4)
         }
-    )
+    }
+    
+    # 只有当project和entity明确指定时才添加（非None）
+    project = config.get('logging', {}).get('wandb_project')
+    entity = config.get('logging', {}).get('wandb_entity')
+    if project is not None:
+        wandb_init_kwargs['project'] = project
+    if entity is not None:
+        wandb_init_kwargs['entity'] = entity
+    
+    wandb.init(**wandb_init_kwargs)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dataset_path = config.get('training', {}).get('dataset_path', "/media/z/data/dataset/carla/processed_mini_data")
     pred_horizon = config.get('pred_horizon', 6)
@@ -170,11 +181,11 @@ def train_carla_policy():
     '''
 
     action_stats = {
-        'min': torch.tensor([0, -10.5050]),
-        'max': torch.tensor([24.4924,  9.9753]),
-        'mean': torch.tensor([2.3079, 0.0188]),
-        'std': torch.tensor([3.7443, 0.6994]),
-    }
+    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
+    'max': torch.tensor([98.44920349121094, 55.585079193115234]),
+    'mean': torch.tensor([9.752570152282715, 0.03436247631907463]),
+    'std': torch.tensor([14.524223327636719, 3.2186851501464844]),
+}
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)

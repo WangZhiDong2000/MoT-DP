@@ -15,7 +15,7 @@ from collections import defaultdict
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
-from dataset.generate_pdm_dataset import CARLAImageDataset
+from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 
 
@@ -347,7 +347,11 @@ def main(args):
     config = load_config(config_path)
     
     # 加载最优模型
+<<<<<<< HEAD
     checkpoint_base_path = config.get('training', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
+=======
+    checkpoint_base_path = config.get('logging', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
+>>>>>>> 097392b7d652b3dc3246a3851f43c9efa8a53acc
     checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
     #checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_dit/carla_policy_best.pt"
     policy = load_best_model(checkpoint_path, config, device)
