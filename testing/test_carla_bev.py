@@ -38,10 +38,10 @@ def load_best_model(checkpoint_path, config, device):
     
     # 提取action统计信息
     action_stats = {
-    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    'mean': torch.tensor([10.975193977355957, 0.04004639387130737]),
-    'std': torch.tensor([14.96833324432373, 3.419595956802368]),
+    'min': torch.tensor([-21.217477798461914, -22.13955307006836]),
+    'max': torch.tensor([33.02915954589844, 26.23844337463379]),
+    'mean': torch.tensor([3.9731080532073975, -0.05837925150990486]),
+    'std': torch.tensor([4.942440032958984, 1.4319489002227783]),
 }
     
     # 初始化模型
@@ -502,7 +502,9 @@ def test_model(policy, test_dataset, config, num_samples=10, visualize_samples=5
             # 提取观测数据
             obs_horizon = config.get('obs_horizon', 2)
             obs_dict = {
-                'lidar_bev': batch['lidar_bev'][:, :obs_horizon],
+                'lidar_token': batch['lidar_token'][:, :obs_horizon],  # (B, obs_horizon, seq_len, 512)
+                'lidar_token_global': batch['lidar_token_global'][:, :obs_horizon],  # (B, obs_horizon, 1, 512)
+                #'lidar_bev': batch['lidar_bev'][:, :obs_horizon],
                 'agent_pos': batch['agent_pos'][:, :obs_horizon],
                 'speed': batch['speed'][:, :obs_horizon],
                 'target_point': batch['target_point'][:, :obs_horizon],
@@ -580,7 +582,7 @@ def test_model(policy, test_dataset, config, num_samples=10, visualize_samples=5
     return metrics, predictions, ground_truths
 
 
-def main():
+def main(args):
     """主函数"""
     # 使用时间戳作为随机种子，每次运行都不同
     import time
@@ -598,11 +600,12 @@ def main():
     print(f"Using device: {device}\n")
     
     # 加载配置
-    config_path = os.path.join(project_root, "config/carla.yaml")
+    config_path = args.config_path
     config = load_config(config_path)
     
     # 加载最优模型
-    checkpoint_path = "/home/wang/Project/MoT-DP/checkpoints/carla_policy_best.pt"
+    checkpoint_path_base = config.get('training', {}).get('checkpoint_dir')
+    checkpoint_path = os.path.join(checkpoint_path_base, 'carla_policy_best.pt')
     policy = load_best_model(checkpoint_path, config, device)
     
     # 加载测试数据集
@@ -636,4 +639,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Test DiffusionDiTCarlaPolicy and visualize predictions')
+    parser.add_argument('--config-path', type=str, default=os.path.join(project_root, "config/carla.yaml"), help='Path to the config file')
+    args = parser.parse_args()
+    main(args)

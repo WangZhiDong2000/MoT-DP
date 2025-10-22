@@ -190,10 +190,10 @@ def train_carla_policy():
     '''
 
     action_stats = {
-    'min': torch.tensor([-3.674278974533081, -15.09633731842041]),
-    'max': torch.tensor([32.8021125793457, 12.464978218078613]),
-    'mean': torch.tensor([4.17860746383667, -0.014984924346208572]),
-    'std': torch.tensor([5.0119242668151855, 1.0905653238296509]),
+    'min': torch.tensor([-21.217477798461914, -22.13955307006836]),
+    'max': torch.tensor([33.02915954589844, 26.23844337463379]),
+    'mean': torch.tensor([3.9731080532073975, -0.05837925150990486]),
+    'std': torch.tensor([4.942440032958984, 1.4319489002227783]),
 }
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
@@ -230,7 +230,7 @@ def train_carla_policy():
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
     # 从config文件加载checkpoint目录
-    checkpoint_dir = config.get('logging', {}).get('checkpoint_dir', '/home/wang/Project/MoT-DP/checkpoints/carla_dit')
+    checkpoint_dir = config.get('training', {}).get('checkpoint_dir', '/home/wang/Project/MoT-DP/checkpoints/carla_dit')
     os.makedirs(checkpoint_dir, exist_ok=True)
     print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
