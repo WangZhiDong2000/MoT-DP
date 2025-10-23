@@ -27,6 +27,8 @@ MANIFEST
 *.pth
 *.pt
 *.ckpt
+# Specific large model files
+model/interfuser/lidar_bev_encoder_only.pth
 
 # Data files
 *.zarr/
