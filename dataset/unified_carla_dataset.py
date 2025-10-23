@@ -43,11 +43,14 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     
     def __init__(self,
                  dataset_path: str,
-                 image_data_root: str):
+                 image_data_root: str,
+                 mode: str = 'train'        # train or val
+                 ):
 
         self.image_data_root = image_data_root
         self.dataset_path = dataset_path
-        
+        self.mode = mode
+
         self.image_transform = transforms.Compose([
             transforms.Resize((256, 928)),
             transforms.ToTensor(),
@@ -92,14 +95,23 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         with open(sample_path, 'rb') as f:
             sample = pickle.load(f)
 
+        # load image data for visualization 
+        if self.mode == 'val':
+            image_paths = sample.get('rgb_hist_jpg', [])
+            images_tensor = self.load_image(image_paths, sample_path)
+
+
         # Load LiDAR BEV features
         lidar_bev_paths = sample.get('lidar_bev_hist', [])
+        if self.mode == 'val':
+            lidar_bev_tensor = self.load_lidar_bev(lidar_bev_paths, sample_path)
+        
         lidar_tokens = []
         lidar_tokens_global = []
-        
         for bev_path in lidar_bev_paths:
             if bev_path is None:
                 continue
+            
             # Infer feature paths from BEV image paths
             # Example: Town01/data/Route_0/lidar_bev/0000.png 
             #       -> Town01/data/Route_0/lidar_bev_features/0000_token.pt
@@ -130,7 +142,13 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Convert sample data
         final_sample = dict()
         for key, value in sample.items():
+            if key == 'rgb_hist_jpg' and self.mode == 'val':
+                final_sample['rgb_hist_jpg'] = image_paths  
+                final_sample['image'] = images_tensor
             if key == 'lidar_bev_hist':
+                if self.mode == 'val':
+                    final_sample['lidar_bev'] = lidar_bev_tensor
+                    final_sample['lidar_bev_hist'] = lidar_bev_paths
                 if lidar_token_tensor is not None:
                     final_sample['lidar_token'] = lidar_token_tensor
                     final_sample['lidar_token_global'] = lidar_token_global_tensor
@@ -187,6 +205,49 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
         return final_sample
 
+    def load_image(self, image_paths, sample_path):
+        images = []
+        for img_path in image_paths:
+            if img_path is None:
+                # 如果路径为None，创建一个黑色图像
+                images.append(torch.zeros(3, 256, 928))
+                print(f"Warning: Image path is None in sample {sample_path}. Using black image.")
+            else:
+                full_img_path = os.path.join(self.image_data_root, img_path)
+                try:
+                    img = Image.open(full_img_path)
+                    img_tensor = self.image_transform(img)
+                    images.append(img_tensor)
+                except Exception as e:
+                    print(f"Error loading image {full_img_path}: {e}")
+                    images.append(torch.zeros(3, 256, 928))
+        
+        # 堆叠图像
+        if len(images) > 0:
+            images_tensor = torch.stack(images)
+        else:
+            images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
+
+        return images_tensor
+
+    def load_lidar_bev(self, bev_paths, sample_path):
+        images = []
+        for bev_path in bev_paths:
+            if bev_path is None:
+                images.append(torch.zeros(3, 448, 448))
+                print(f"Warning: LiDAR BEV path is None in sample {sample_path}. Using black image.")
+            else:
+                full_bev_path = os.path.join(self.image_data_root, bev_path)
+                bev_image = Image.open(full_bev_path)
+                bev_tensor = self.lidar_bev_transform(bev_image)
+                images.append(bev_tensor)
+
+        if len(images) > 0:
+            images_tensor = torch.stack(images)
+        else:
+            images_tensor = torch.zeros(2, 3, 448, 448)  # 默认obs_horizon=2
+
+        return images_tensor
 
 # ============================================================================
 # Visualization Functions
