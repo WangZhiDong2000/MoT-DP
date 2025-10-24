@@ -15,6 +15,8 @@ import carla
 import numpy as np
 from PIL import Image
 from torchvision import transforms as T
+import imageio
+import laspy
 
 # Add the project directories to the Python path
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
@@ -36,6 +38,7 @@ from dataset.generate_lidar_bev_pdm import (
     makeBVFeature,
     BOUNDARY
 )
+from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images as generate_lidar_bev_images_b2d
 from scipy.optimize import fsolve
 
 
@@ -46,6 +49,7 @@ print('*'*10)
 print(PLANNER_TYPE)
 print('*'*10)
 EARTH_RADIUS_EQUA = 6378137.0
+
 
 def get_entry_point():
 	return 'MOTAgent'
@@ -86,120 +90,7 @@ def load_best_model(checkpoint_path, config, device):
     return policy
 
 
-class LiDARBEVConverter:
-	"""
-	Real-time LiDAR to BEV (Bird's Eye View) image converter.
-	Converts raw CARLA LiDAR point clouds to BEV images for model input.
-	Outputs normalized torch tensors ready for InterfuserBEVEncoder.
-	"""
-	def __init__(self, img_height=448, img_width=448, normalize=True, return_tensor=True):
-		"""
-		Initialize the LiDAR BEV converter.
-		
-		Args:
-			img_height: Height of the output BEV image
-			img_width: Width of the output BEV image
-			normalize: Whether to normalize the output to [0, 1] range
-			return_tensor: Whether to return PyTorch tensor (B, 3, H, W) or numpy array (H, W, 3)
-		"""
-		self.img_height = img_height
-		self.img_width = img_width
-		self.discretization = (BOUNDARY["maxX"] - BOUNDARY["minX"]) / img_height
-		self.normalize = normalize
-		self.return_tensor = return_tensor
-	
-	def process_lidar(self, lidar_pc, return_numpy=False):
-		"""
-		Convert raw LiDAR point cloud to BEV image ready for InterfuserBEVEncoder.
-		
-		Args:
-			lidar_pc: Raw LiDAR point cloud from CARLA sensor (Nx3 or Nx4 array)
-			return_numpy: If True, return numpy array instead of torch tensor
-			
-		Returns:
-			bev_image: 
-				- If return_tensor=True: PyTorch tensor (1, 3, H, W) normalized to [0, 1]
-				- If return_tensor=False: numpy array (H, W, 3) with values in [0, 255]
-		"""
-		try:
-			# Ensure input is numpy array
-			if not isinstance(lidar_pc, np.ndarray):
-				lidar_pc = np.array(lidar_pc)
-			
-			# Handle empty point cloud
-			if lidar_pc.shape[0] == 0:
-				# Return black image if no points
-				empty_image = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
-				return self._format_output(empty_image, return_numpy)
-			
-			# Make a copy to avoid modifying original data
-			lidar_pc = np.copy(lidar_pc)
-			
-			# Step 1: Coordinate transformation (flip x-axis for CARLA convention)
-			lidar_pc[:, 0] = lidar_pc[:, 0] * -1
-			
-			# Step 2: Handle 3-channel to 4-channel (add intensity if not present)
-			if lidar_pc.shape[-1] == 3:
-				# If only XYZ, add a default intensity channel
-				lidar_pc = np.concatenate([lidar_pc, np.ones((*lidar_pc.shape[:-1], 1))], axis=-1)
-			
-			# Step 3: Remove points outside boundary and center region
-			lidar_pc = removePoints(lidar_pc, BOUNDARY)
-			
-			# Handle case when all points are filtered out
-			if lidar_pc.shape[0] == 0:
-				empty_image = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
-				return self._format_output(empty_image, return_numpy)
-			
-			# Step 4: Translate points to positive coordinates for BEV generation
-			lidar_pc_filtered = np.copy(lidar_pc)
-			lidar_pc_filtered[:, 0] = lidar_pc_filtered[:, 0] + BOUNDARY["maxX"]
-			lidar_pc_filtered[:, 1] = lidar_pc_filtered[:, 1] + BOUNDARY["maxY"]
-			
-			# Step 5: Generate BEV image (uint8, [0, 255])
-			bev_image = makeBVFeature(
-				lidar_pc_filtered, 
-				BOUNDARY, 
-				self.img_height, 
-				self.img_width, 
-				self.discretization
-			)
-			
-			# Step 6: Zero out the blue channel as per original implementation
-			bev_image[:, :, 2] = 0.0
-			
-			return self._format_output(bev_image, return_numpy)
-			
-		except Exception as e:
-			print(f"Error processing LiDAR: {e}", flush=True)
-			# Return black image on error
-			empty_image = np.zeros((self.img_height, self.img_width, 3), dtype=np.uint8)
-			return self._format_output(empty_image, return_numpy)
-	
-	def _format_output(self, bev_image_np, return_numpy):
-		"""
-		Format the output according to settings.
-		
-		Args:
-			bev_image_np: numpy array (H, W, 3) with uint8 values [0, 255]
-			return_numpy: Whether to return numpy or torch tensor
-			
-		Returns:
-			Formatted output (numpy array or torch tensor)
-		"""
-		# Convert to float [0, 1] if normalize is True
-		if self.normalize:
-			bev_image_np = bev_image_np.astype(np.float32) / 255.0
-		
-		# Return numpy if requested
-		if return_numpy or not self.return_tensor:
-			return bev_image_np
-		
-		# Convert to torch tensor (B, C, H, W) format for model input
-		# Input: (H, W, 3) -> (1, 3, H, W)
-		bev_tensor = torch.from_numpy(bev_image_np).permute(2, 0, 1).unsqueeze(0).float()
-		
-		return bev_tensor
+
 
 
 class MOTAgent(autonomous_agent.AutonomousAgent):
@@ -232,14 +123,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.save_path = None
 		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
 
-		# Initialize LiDAR BEV converter - returns normalized torch tensors (1, 3, 448, 448)
-		# ready for direct input to InterfuserBEVEncoder
-		self.lidar_bev_converter = LiDARBEVConverter(
-			img_height=448, 
-			img_width=448, 
-			normalize=True,      # Normalize to [0, 1]
-			return_tensor=True   # Return (1, 3, H, W) torch tensor
-		)
 
 		self.last_steers = deque()
 		# self.lat_ref, self.lon_ref = 42.0, 2.0
@@ -251,13 +134,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 			print (string)
 
-			self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
-			self.save_path.mkdir(parents=True, exist_ok=False)
+		self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
+		self.save_path.mkdir(parents=True, exist_ok=False)
 
-			(self.save_path / 'rgb').mkdir()
-			(self.save_path / 'rgb_front').mkdir()
-			(self.save_path / 'meta').mkdir()
-			(self.save_path / 'bev').mkdir()
+		(self.save_path / 'rgb_front').mkdir()
+		(self.save_path / 'meta').mkdir()
+		(self.save_path / 'bev').mkdir()
+		(self.save_path / 'lidar_bev').mkdir()
+		(self.save_path / 'lidar').mkdir()
+		
+		# Initialize lidar buffer for combining two frames
+		self.lidar_buffer = deque(maxlen=2)
+		self.lidar_step_counter = 0
+		self.last_ego_transform = None
+		self.last_lidar = None
 
 	def _init(self):
 		try:
@@ -291,25 +181,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					'width': 1600, 'height': 900, 'fov': 70,
 					'id': 'CAM_FRONT'
 					},
-				{
-					'type': 'sensor.camera.rgb',
-					'x': 0.27, 'y': -0.55, 'z': 1.60,
-					'roll': 0.0, 'pitch': 0.0, 'yaw': -55.0,
-					'width': 1600, 'height': 900, 'fov': 70,
-					'id': 'CAM_FRONT_LEFT'
-					},
-				{
-					'type': 'sensor.camera.rgb',
-					'x': 0.27, 'y': 0.55, 'z': 1.60,
-					'roll': 0.0, 'pitch': 0.0, 'yaw': 55.0,
-					'width': 1600, 'height': 900, 'fov': 70,
-					'id': 'CAM_FRONT_RIGHT'
-					},
 				# lidar
 				{
           			'type': 'sensor.lidar.ray_cast',
           			'x': 0.0, 'y': 0.0, 'z': 2.5,
-          			'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+          			'roll': 0.0, 'pitch': 0.0, 'yaw': -90.0,
           			'id': 'LIDAR'
       				},
 				# imu
@@ -350,47 +226,68 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def tick(self, input_data):
 		self.step += 1
 		# Process camera
-		front_img = cv2.cvtColor(input_data['CAM_FRONT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
-		front_left_img = cv2.cvtColor(input_data['CAM_FRONT_LEFT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
-		front_right_img = cv2.cvtColor(input_data['CAM_FRONT_RIGHT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
 		rgb_front =  cv2.cvtColor(input_data['CAM_FRONT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
-		
-		encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 20]
 
-		_, front_img = cv2.imencode('.jpg', front_img, encode_param)
-		front_img = cv2.imdecode(front_img, cv2.IMREAD_COLOR)
-
-		_, front_left_img = cv2.imencode('.jpg', front_left_img, encode_param)
-		front_left_img = cv2.imdecode(front_left_img, cv2.IMREAD_COLOR)
-
-		_, front_right_img = cv2.imencode('.jpg', front_right_img, encode_param)
-		front_right_img = cv2.imdecode(front_right_img, cv2.IMREAD_COLOR)
-		front_img = front_img[:, 200:1400, :]
-		front_left_img = front_left_img[:, :1400, :]
-		front_right_img = front_right_img[:, 200:, :]
-
-		rgb = np.concatenate((front_left_img, front_img, front_right_img), axis=1)
-		rgb = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float()
-		rgb = torch.nn.functional.interpolate(rgb, size=(256, 900), mode='bilinear', align_corners=False)
-		rgb = rgb.squeeze(0).permute(1, 2, 0).byte().numpy()
-
-		# Process lidar 
+		# Process lidar - convert to ego coordinate and buffer two frames to get complete point cloud
 		lidar_raw = input_data['LIDAR'][1]
-		lidar_bev_tensor = self.lidar_bev_converter.process_lidar(lidar_raw)
+		lidar_ego = lidar_to_ego_coordinate(input_data['LIDAR'])
+		
+		# Get current pose information
+		gps = input_data['GPS'][1][:2]
+		compass = input_data['IMU'][1][-1]
+		
+		# Combine two frames of lidar data using algin_lidar
+		if self.last_lidar is not None and self.last_ego_transform is not None:
+			# Calculate relative transformation between current and last frame
+			current_pos = np.array([gps[0], gps[1], 0.0])
+			last_pos = np.array([self.last_ego_transform['gps'][0], self.last_ego_transform['gps'][1], 0.0])
+			relative_translation = current_pos - last_pos
+			
+			# Calculate relative rotation
+			current_yaw = compass
+			last_yaw = self.last_ego_transform['compass']
+			relative_rotation = current_yaw - last_yaw
+			
+			# Rotate difference vector from global to local coordinate system
+			orientation_target = np.deg2rad(current_yaw)
+			rotation_matrix = np.array([[np.cos(orientation_target), -np.sin(orientation_target), 0.0],
+										[np.sin(orientation_target), np.cos(orientation_target), 0.0], 
+										[0.0, 0.0, 1.0]])
+			relative_translation_local = rotation_matrix.T @ relative_translation
+			
+			# Align the last lidar to current coordinate system
+			lidar_last = algin_lidar(self.last_lidar, relative_translation_local, relative_rotation)
+			# Combine lidar frames
+			lidar_combined = np.concatenate((lidar_ego, lidar_last), axis=0)
+		else:
+			lidar_combined = lidar_ego
+		
+		# Store current frame for next iteration
+		self.last_lidar = lidar_ego
+		self.last_ego_transform = {'gps': gps, 'compass': compass}
+		
+		# Generate lidar BEV image from combined lidar data
+		lidar_bev_img = generate_lidar_bev_images_b2d(
+			np.copy(lidar_combined), 
+			saving_name=None, 
+			img_height=448, 
+			img_width=448
+		)
+		# Convert BEV image to tensor format for interfuser_bev_encoder backbone
+		# Input shape should be (C, H, W) where C=3 (RGB), H=448, W=448
+		lidar_bev_tensor = torch.from_numpy(lidar_bev_img).permute(2, 0, 1).float() / 255.0
 		
 		#Process other sensors
 		bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
-		gps = input_data['GPS'][1][:2]
 		speed = input_data['SPEED'][1]['speed']
-		compass = input_data['IMU'][1][-1]
 
 		if (math.isnan(compass) == True): #It can happen that the compass sends nan for a few frames
 			compass = 0.0
 
 		result = {
-				'rgb': rgb,
 				'rgb_front': rgb_front,
-				'lidar_bev': lidar_bev_tensor, 
+				'lidar_bev': lidar_bev_tensor,
+				'lidar_combined': lidar_combined,
 				'gps': gps,
 				'speed': speed,
 				'compass': compass,
@@ -418,8 +315,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self._init()
 		tick_data = self.tick(input_data)
 		if self.step < 1:
-			rgb = self._im_transform(tick_data['rgb']).unsqueeze(0)
-
 			control = carla.VehicleControl()
 			control.steer = 0.0
 			control.throttle = 0.0
@@ -437,16 +332,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cmd_one_hot[command] = 1
 		cmd_one_hot = torch.tensor(cmd_one_hot).view(1, 6).to('cuda', dtype=torch.float32)
 		speed = torch.FloatTensor([float(tick_data['speed'])]).view(1,1).to('cuda', dtype=torch.float32)
-		speed = speed / 12
-		rgb = self._im_transform(tick_data['rgb']).unsqueeze(0).to('cuda', dtype=torch.float32)
-		lidar= tick_data['lidar_bev'].to('cuda', dtype=torch.float32)
+		lidar = tick_data['lidar_bev'].to('cuda', dtype=torch.float32)
+		# Add batch dimension to lidar_bev: (C, H, W) -> (1, C, H, W)
+		lidar = lidar.unsqueeze(0)
 		tick_data['target_point'] = [torch.FloatTensor([tick_data['target_point'][0]]),
 										torch.FloatTensor([tick_data['target_point'][1]])]
 		target_point = torch.stack(tick_data['target_point'], dim=1).to('cuda', dtype=torch.float32)
 
 		obs_horizon = self.config.get('obs_horizon', 2)
 		obs_dict = {
-                'lidar_bev': lidar.repeat(1, obs_horizon, 1, 1, 1),  # (B, obs_horizon, 3, 448, 448)
+                'lidar_bev': lidar.repeat(1, obs_horizon, 1, 1, 1),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
                 'speed': speed.repeat(1, obs_horizon, 1),  # (B, obs_horizon, 1) - 观测步的speed
                 'target_point': target_point.repeat(1, obs_horizon, 1),  # (B, obs_horizon, 2) - 观测步的target_point
                 'next_command': cmd_one_hot.repeat(1, obs_horizon, 1), 
@@ -502,11 +397,43 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def save(self, tick_data):
 		frame = self.step
 
-		Image.fromarray(tick_data['rgb']).save(self.save_path / 'rgb' / ('%04d.png' % frame))
-
 		Image.fromarray(tick_data['rgb_front']).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
 
 		Image.fromarray(tick_data['bev']).save(self.save_path / 'bev' / ('%04d.png' % frame))
+
+
+		# Save combined lidar data in LAZ format (compressed point cloud)
+		if 'lidar_combined' in tick_data and len(tick_data['lidar_combined']) > 0:
+			lidar_combined = tick_data['lidar_combined']
+			# Use LAZ compression format similar to data_agent.py
+			header = laspy.LasHeader(point_format=0)
+			header.offsets = np.min(lidar_combined, axis=0)
+			header.scales = np.array([0.01, 0.01, 0.01])
+
+			laz_path = self.save_path / 'lidar' / (f'{frame:04d}.laz')
+			with laspy.open(laz_path, mode='w', header=header) as writer:
+				point_record = laspy.ScaleAwarePointRecord.zeros(lidar_combined.shape[0], header=header)
+				point_record.x = lidar_combined[:, 0]
+				point_record.y = lidar_combined[:, 1]
+				point_record.z = lidar_combined[:, 2]
+
+				writer.write_points(point_record)
+			
+			# Read LAZ file and generate BEV image using generate_lidar_bev_images
+			try:
+				# Use laspy.read() method similar to get_lidar_pts() in generate_lidar_bev_b2d
+				las = laspy.read(str(laz_path))
+				lidar_data = np.vstack((las.x, las.y, las.z)).transpose()
+				
+				# Generate BEV image from LAZ data using generate_lidar_bev_images function
+				lidar_bev_img = generate_lidar_bev_images(
+					lidar_data,
+					saving_name=str(self.save_path / 'lidar_bev' / (f'{frame:04d}.png')),
+					img_height=448,
+					img_width=448
+				)
+			except Exception as e:
+				print(f"Error reading LAZ file or generating BEV image: {e}")
 
 		outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
 		json.dump(self.pid_metadata, outfile, indent=4)
@@ -530,6 +457,41 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		y = scale * EARTH_RADIUS_EQUA * math.log(math.tan((90.0 + self.lat_ref) * math.pi / 360.0)) - my
 		x = mx - scale * self.lon_ref * math.pi * EARTH_RADIUS_EQUA / 180.0
 		return np.array([x, y])
+
+
+def lidar_to_ego_coordinate(lidar):
+	"""
+	Converts the LiDAR points given by the simulator into the ego agents
+	coordinate system
+	:param lidar: the LiDAR point cloud as provided in the input of run_step
+	:return: lidar where the points are w.r.t. 0/0/0 of the car and the carla
+	coordinate system.
+	"""
+	yaw = np.deg2rad(-90.0)
+	rotation_matrix = np.array([[np.cos(yaw), -np.sin(yaw), 0.0], [np.sin(yaw), np.cos(yaw), 0.0], [0.0, 0.0, 1.0]])
+
+	translation = np.array([0.0, 0.0, 2.5])
+
+	# The double transpose is a trick to compute all the points together.
+	ego_lidar = (rotation_matrix @ lidar[1][:, :3].T).T + translation
+
+	return ego_lidar
+
+
+def algin_lidar(lidar, translation, yaw):
+	"""
+	Translates and rotates a LiDAR into a new coordinate system.
+	Rotation is inverse to translation and yaw
+	:param lidar: numpy LiDAR point cloud (N,3)
+	:param translation: translations in meters
+	:param yaw: yaw angle in radians
+	:return: numpy LiDAR point cloud in the new coordinate system.
+	"""
+	rotation_matrix = np.array([[np.cos(yaw), -np.sin(yaw), 0.0], [np.sin(yaw), np.cos(yaw), 0.0], [0.0, 0.0, 1.0]])
+
+	aligned_lidar = (rotation_matrix.T @ (lidar - translation).T).T
+
+	return aligned_lidar
 
 
 if __name__ == "__main__":
