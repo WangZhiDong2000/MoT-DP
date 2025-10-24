@@ -32,13 +32,7 @@ for path in [project_root, leaderboard_root, scenario_runner_root, mot_dp_root, 
 from leaderboard.autoagents import autonomous_agent
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from team_code.planner import RoutePlanner
-from dataset.generate_lidar_bev_pdm import (
-    generate_lidar_bev_images, 
-    removePoints, 
-    makeBVFeature,
-    BOUNDARY
-)
-from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images as generate_lidar_bev_images_b2d
+from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 from scipy.optimize import fsolve
 
 
@@ -91,8 +85,6 @@ def load_best_model(checkpoint_path, config, device):
 
 
 
-
-
 class MOTAgent(autonomous_agent.AutonomousAgent):
 	def setup(self, path_to_conf_file):
 		self.track = autonomous_agent.Track.SENSORS
@@ -141,7 +133,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		(self.save_path / 'meta').mkdir()
 		(self.save_path / 'bev').mkdir()
 		(self.save_path / 'lidar_bev').mkdir()
-		(self.save_path / 'lidar').mkdir()
 		
 		# Initialize lidar buffer for combining two frames
 		self.lidar_buffer = deque(maxlen=2)
@@ -229,7 +220,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_front =  cv2.cvtColor(input_data['CAM_FRONT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
 
 		# Process lidar - convert to ego coordinate and buffer two frames to get complete point cloud
-		lidar_raw = input_data['LIDAR'][1]
 		lidar_ego = lidar_to_ego_coordinate(input_data['LIDAR'])
 		
 		# Get current pose information
@@ -267,14 +257,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_ego_transform = {'gps': gps, 'compass': compass}
 		
 		# Generate lidar BEV image from combined lidar data
-		lidar_bev_img = generate_lidar_bev_images_b2d(
+		lidar_bev_img = generate_lidar_bev_images(
 			np.copy(lidar_combined), 
 			saving_name=None, 
 			img_height=448, 
 			img_width=448
 		)
 		# Convert BEV image to tensor format for interfuser_bev_encoder backbone
-		# Input shape should be (C, H, W) where C=3 (RGB), H=448, W=448
 		lidar_bev_tensor = torch.from_numpy(lidar_bev_img).permute(2, 0, 1).float() / 255.0
 		
 		#Process other sensors
@@ -287,7 +276,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result = {
 				'rgb_front': rgb_front,
 				'lidar_bev': lidar_bev_tensor,
-				'lidar_combined': lidar_combined,
 				'gps': gps,
 				'speed': speed,
 				'compass': compass,
@@ -361,11 +349,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		control.steer = np.clip(float(steer_traj), -1, 1)
 		control.throttle = np.clip(float(throttle_traj), 0, 0.75)
 		control.brake = np.clip(float(brake_traj), 0, 1)
-		# self.pid_metadata['steer'] = control.steer
-		# self.pid_metadata['throttle'] = control.throttle
-		# self.pid_metadata['brake'] = control.brake
 		
-
 		self.pid_metadata['steer_traj'] = float(steer_traj)
 		self.pid_metadata['throttle_traj'] = float(throttle_traj)
 		self.pid_metadata['brake_traj'] = float(brake_traj)
@@ -396,44 +380,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 	def save(self, tick_data):
 		frame = self.step
-
 		Image.fromarray(tick_data['rgb_front']).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
-
 		Image.fromarray(tick_data['bev']).save(self.save_path / 'bev' / ('%04d.png' % frame))
-
-
-		# Save combined lidar data in LAZ format (compressed point cloud)
-		if 'lidar_combined' in tick_data and len(tick_data['lidar_combined']) > 0:
-			lidar_combined = tick_data['lidar_combined']
-			# Use LAZ compression format similar to data_agent.py
-			header = laspy.LasHeader(point_format=0)
-			header.offsets = np.min(lidar_combined, axis=0)
-			header.scales = np.array([0.01, 0.01, 0.01])
-
-			laz_path = self.save_path / 'lidar' / (f'{frame:04d}.laz')
-			with laspy.open(laz_path, mode='w', header=header) as writer:
-				point_record = laspy.ScaleAwarePointRecord.zeros(lidar_combined.shape[0], header=header)
-				point_record.x = lidar_combined[:, 0]
-				point_record.y = lidar_combined[:, 1]
-				point_record.z = lidar_combined[:, 2]
-
-				writer.write_points(point_record)
-			
-			# Read LAZ file and generate BEV image using generate_lidar_bev_images
-			try:
-				# Use laspy.read() method similar to get_lidar_pts() in generate_lidar_bev_b2d
-				las = laspy.read(str(laz_path))
-				lidar_data = np.vstack((las.x, las.y, las.z)).transpose()
-				
-				# Generate BEV image from LAZ data using generate_lidar_bev_images function
-				lidar_bev_img = generate_lidar_bev_images(
-					lidar_data,
-					saving_name=str(self.save_path / 'lidar_bev' / (f'{frame:04d}.png')),
-					img_height=448,
-					img_width=448
-				)
-			except Exception as e:
-				print(f"Error reading LAZ file or generating BEV image: {e}")
+		
+		if 'lidar_bev' in tick_data:
+			lidar_bev_tensor = tick_data['lidar_bev']
+			if isinstance(lidar_bev_tensor, torch.Tensor):
+				lidar_bev_tensor = lidar_bev_tensor.cpu().numpy()
+			lidar_bev_img = (lidar_bev_tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
+			imageio.imwrite(str(self.save_path / 'lidar_bev' / (f'{frame:04d}.png')), lidar_bev_img)
 
 		outfile = open(self.save_path / 'meta' / ('%04d.json' % frame), 'w')
 		json.dump(self.pid_metadata, outfile, indent=4)
