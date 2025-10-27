@@ -8,10 +8,10 @@ dataloader:
   shuffle: true
 
 # Horizon settings 
-obs_horizon: 2         
+obs_horizon: 1         
 pred_horizon: 8        
 action_horizon: 4      
-n_obs_steps: 2
+n_obs_steps: 1
 
 # EMA settings
 ema:
@@ -77,7 +77,7 @@ policy:
   input_dim: 2        # action_dim 
   output_dim: 2       # action_dim  
   horizon: 8          # 与action_horizon保持一致
-  n_obs_steps: 2      # obs_horizon
+  n_obs_steps: 1      # obs_horizon
   cond_dim: 256       # TCP模型j_ctrl特征维度
   obs_as_global_cond: true
   
@@ -132,7 +132,7 @@ noise_scheduler:
 
 # Training settings 
 training:
-  num_epochs: 300            
+  num_epochs: 500            
   max_grad_norm: 1.0        
   dataset_path: '/home/wang/Project/carla_garage/tmp_data'  
   # dataset_path: '/home/wang/Dataset/b2d_10scene/tmp_data' 
@@ -140,9 +140,10 @@ training:
   # image_data_root: '/home/wang/Dataset/b2d_10scene'
   sample_interval: 1         # 增加采样间隔以减少数据量
   lr_final: 1e-7           
-  validation_freq: 3         # 每隔3个epoch进行一次评估
-  save_freq: 3               # 每隔3个epoch保存一次checkpoint
+  validation_freq: 5         # 每隔3个epoch进行一次评估
+  save_freq: 5               # 每隔3个epoch保存一次checkpoint
   early_stopping_patience: 10  
+  checkpoint_dir: "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best"
 
 # Logging - wandb配置
 logging:

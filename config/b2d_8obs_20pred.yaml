@@ -65,7 +65,7 @@ enable_action_normalization: true
 
 # BEV Encoder configuration
 bev_encoder:
-  pretrained_path: '/root/z_projects/code/MoT-DP/checkpoints/interfuser/lidar_bev_encoder_only.pth'
+  pretrained_path: '/home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth'
   state_dim: 9           # speed(1) + target_point(2) + command(6)
   feature_dim: 256
   use_group_norm: true
@@ -116,8 +116,8 @@ training:
   validation_freq: 3         # 每隔3个epoch进行一次评估
   save_freq: 3               # 每隔3个epoch保存一次checkpoint
   early_stopping_patience: 10  
-  checkpoint_dir: "/root/z_projects/code/MoT-DP/checkpoints/b2d_linearnorm_8obs_20pred"
-  interfuser_ckpt_dir: "/root/z_projects/code/MoT-DP/checkpoints/interfuser/lidar_bev_encoder_only.pth"
+  checkpoint_dir: "/home/wang/Project/MoT-DP/checkpoints/b2d_best"
+  interfuser_ckpt_dir: "/home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth"
 
 
 evaluation:

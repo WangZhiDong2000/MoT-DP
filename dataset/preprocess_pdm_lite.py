@@ -471,7 +471,7 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
     argparser.add_argument('--data-root', type=str, default='/home/wang/Project/carla_garage/data/' , help='Root directory of raw PDM Lite data')
     argparser.add_argument('--out-dir', type=str, default='/home/wang/Project/carla_garage/tmp_data', help='Output directory for processed data')
-    argparser.add_argument('--obs-horizon', type=int, default=2, help='Number of observation history frames')
+    argparser.add_argument('--obs-horizon', type=int, default=1, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=8, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
     argparser.add_argument('--sample-interval', type=int, default=2, help='Interval between training samples (e.g., 10 frames)')
     argparser.add_argument('--hz-interval', type=int, default=2, help='Interval within a sample to match frequency (e.g., 2 for 2Hz from 4Hz data)')

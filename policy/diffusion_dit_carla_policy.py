@@ -6,7 +6,6 @@ from collections import defaultdict
 import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from TCP.model import Discrete_Actions_DICT
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
@@ -946,22 +945,29 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         waypoints[:, [0, 1]] = waypoints[:, [1, 0]]  
         target[[0, 1]] = target[[1, 0]]
 
+		# Downsample waypoints: from 10Hz (20 points in 2s) to 2Hz (take every 5th point)
+		# Original indices: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+		# Downsampled indices: 4, 9, 14, 19 (starting from index 4)
+		# This matches the original 2Hz assumption: 4 waypoints with 2.5s intervals = 10 seconds
+        downsample_factor = 5
+        downsampled_waypoints = waypoints[4::downsample_factor]
+
 		# iterate over vectors between predicted waypoints
-        num_pairs = len(waypoints) - 1
+        num_pairs = len(downsampled_waypoints) - 1
         best_norm = 1e5
         desired_speed = 0
-        aim = waypoints[0]
+        aim = downsampled_waypoints[0]
         for i in range(num_pairs):
             # magnitude of vectors, used for speed
             desired_speed += np.linalg.norm(
-					waypoints[i+1] - waypoints[i]) * 2.0 / num_pairs
+					downsampled_waypoints[i+1] - downsampled_waypoints[i]) * 2.0 / num_pairs
             # norm of vector midpoints, used for steering
-            norm = np.linalg.norm((waypoints[i+1] + waypoints[i]) / 2.0)
+            norm = np.linalg.norm((downsampled_waypoints[i+1] + downsampled_waypoints[i]) / 2.0)
             if abs(aim_dist-best_norm) > abs(aim_dist-norm):
-                aim = waypoints[i]
+                aim = downsampled_waypoints[i]
                 best_norm = norm
         
-        aim_last = waypoints[-1] - waypoints[-2]
+        aim_last = downsampled_waypoints[-1] - downsampled_waypoints[-2]
         angle = np.degrees(np.pi / 2 - np.arctan2(aim[1], aim[0])) / 90
         angle_last = np.degrees(np.pi / 2 - np.arctan2(aim_last[1], aim_last[0])) / 90
         angle_target = np.degrees(np.pi / 2 - np.arctan2(target[1], target[0])) / 90
@@ -993,10 +999,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 			'steer': float(steer),
 			'throttle': float(throttle),
 			'brake': float(brake),
-			'wp_4': tuple(waypoints[3].astype(np.float64)),
-			'wp_3': tuple(waypoints[2].astype(np.float64)),
-			'wp_2': tuple(waypoints[1].astype(np.float64)),
-			'wp_1': tuple(waypoints[0].astype(np.float64)),
+			'wp_4': tuple(downsampled_waypoints[3].astype(np.float64)) if len(downsampled_waypoints) > 3 else tuple(downsampled_waypoints[-1].astype(np.float64)),
+			'wp_3': tuple(downsampled_waypoints[2].astype(np.float64)) if len(downsampled_waypoints) > 2 else tuple(downsampled_waypoints[-1].astype(np.float64)),
+			'wp_2': tuple(downsampled_waypoints[1].astype(np.float64)) if len(downsampled_waypoints) > 1 else tuple(downsampled_waypoints[-1].astype(np.float64)),
+			'wp_1': tuple(downsampled_waypoints[0].astype(np.float64)),
 			'aim': tuple(aim.astype(np.float64)),
 			'target': tuple(target.astype(np.float64)),
 			'desired_speed': float(desired_speed.astype(np.float64)),

@@ -50,7 +50,7 @@ def get_entry_point():
 
 def create_carla_config(config_path=None):
     if config_path is None:
-        config_path = "/home/wang/Project/MoT-DP/config/carla.yaml"
+        config_path = "/home/wang/Project/MoT-DP/config/b2d_8obs_20pred.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
@@ -59,13 +59,18 @@ def load_best_model(checkpoint_path, config, device):
     print(f"Loading best model from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
+#     action_stats = {
+#     'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
+#     'max': torch.tensor([98.34003448486328, 55.585079193115234]),
+#     'mean': torch.tensor([10.975193977355957, 0.04004639387130737]),
+#     'std': torch.tensor([14.96833324432373, 3.419595956802368]),
+# }
     action_stats = {
-    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    'mean': torch.tensor([10.975193977355957, 0.04004639387130737]),
-    'std': torch.tensor([14.96833324432373, 3.419595956802368]),
+    'min': torch.tensor([-21.217477798461914, -22.13955307006836]),
+    'max': torch.tensor([33.02915954589844, 26.23844337463379]),
+    'mean': torch.tensor([3.9731080532073975, -0.05837925150990486]),
+    'std': torch.tensor([4.942440032958984, 1.4319489002227783]),
 }
-    
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
     policy.load_state_dict(checkpoint['model_state_dict'])
     policy.eval()
@@ -104,7 +109,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		checkpoint_base_path = self.config.get('logging', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP/checkpoints/pdm_linearnorm_2obs_8pred")
+		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/b2d_best")
 		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
 
@@ -139,6 +144,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.lidar_step_counter = 0
 		self.last_ego_transform = None
 		self.last_lidar = None
+		
+		# Initialize observation history buffers for accumulating historical observations
+		obs_horizon = self.config.get('obs_horizon', 2)
+		self.obs_horizon = obs_horizon
+		self.lidar_bev_history = deque(maxlen=obs_horizon)
+		self.speed_history = deque(maxlen=obs_horizon)
+		self.target_point_history = deque(maxlen=obs_horizon)
+		self.next_command_history = deque(maxlen=obs_horizon)
+		
+		# Frame skip counter for 10Hz obs_dict construction (20Hz tick -> 10Hz obs_dict)
+		self.obs_accumulate_counter = 0
 
 	def _init(self):
 		try:
@@ -327,12 +343,47 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 										torch.FloatTensor([tick_data['target_point'][1]])]
 		target_point = torch.stack(tick_data['target_point'], dim=1).to('cuda', dtype=torch.float32)
 
-		obs_horizon = self.config.get('obs_horizon', 2)
+		# Accumulate observation every 2 frames (20Hz tick -> 10Hz obs_dict)
+		self.obs_accumulate_counter += 1
+		if self.obs_accumulate_counter % 2 == 0:
+			# Accumulate observation history into buffers (only every 2 frames)
+			self.lidar_bev_history.append(lidar)
+			self.speed_history.append(speed)
+			self.target_point_history.append(target_point)
+			self.next_command_history.append(cmd_one_hot)
+		
+		# Build obs_dict from historical observations
+		lidar_list = list(self.lidar_bev_history)
+		speed_list = list(self.speed_history)
+		target_point_list = list(self.target_point_history)
+		cmd_list = list(self.next_command_history)
+		
+		# If buffer is empty or not full, pad with the current observation
+		if len(lidar_list) == 0:
+			# First few frames - initialize buffer with current observation
+			lidar_list = [lidar] * self.obs_horizon
+			speed_list = [speed] * self.obs_horizon
+			target_point_list = [target_point] * self.obs_horizon
+			cmd_list = [cmd_one_hot] * self.obs_horizon
+		elif len(lidar_list) < self.obs_horizon:
+			# Buffer not yet full - pad with the oldest observation
+			pad_size = self.obs_horizon - len(lidar_list)
+			lidar_list = [lidar_list[0]] * pad_size + lidar_list
+			speed_list = [speed_list[0]] * pad_size + speed_list
+			target_point_list = [target_point_list[0]] * pad_size + target_point_list
+			cmd_list = [cmd_list[0]] * pad_size + cmd_list
+		
+		# Stack along time dimension: from [(1, C, H, W), ...] to (1, obs_horizon, C, H, W)
+		lidar_stacked = torch.cat(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
+		speed_stacked = torch.cat(speed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
+		target_point_stacked = torch.cat(target_point_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		cmd_stacked = torch.cat(cmd_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 6)
+		
 		obs_dict = {
-                'lidar_bev': lidar.repeat(1, obs_horizon, 1, 1, 1),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
-                'speed': speed.repeat(1, obs_horizon, 1),  # (B, obs_horizon, 1) - 观测步的speed
-                'target_point': target_point.repeat(1, obs_horizon, 1),  # (B, obs_horizon, 2) - 观测步的target_point
-                'next_command': cmd_one_hot.repeat(1, obs_horizon, 1), 
+                'lidar_bev': lidar_stacked,  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
+                'speed': speed_stacked,  # (B, obs_horizon, 1)
+                'target_point': target_point_stacked,  # (B, obs_horizon, 2)
+                'next_command': cmd_stacked,  # (B, obs_horizon, 6)
             }
 		result = self.net.predict_action(obs_dict)
         
@@ -364,10 +415,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			max_throttle = 0.5
 		control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
 
-		if control.brake > 0:
-			control.brake = 1.0
-		if control.brake > 0.5:
-			control.throttle = float(0)
+		# if control.brake > 0:
+		# 	control.brake = 1.0
+		# if control.brake > 0.5:
+		# 	control.throttle = float(0)
 
 		self.pid_metadata['steer'] = control.steer
 		self.pid_metadata['throttle'] = control.throttle
@@ -452,6 +503,6 @@ def algin_lidar(lidar, translation, yaw):
 if __name__ == "__main__":
 	test_config = create_carla_config()
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-	checkpoint_base_path = test_config.get('logging', {}).get('checkpoint_dir')
+	checkpoint_base_path = test_config.get('training', {}).get('checkpoint_dir')
 	checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
 	policy = load_best_model(checkpoint_path, test_config, device)
