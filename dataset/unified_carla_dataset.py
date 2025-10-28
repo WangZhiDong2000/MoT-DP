@@ -139,6 +139,28 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             lidar_token_tensor = None
             lidar_token_global_tensor = None
         
+        # Load VQA features from pt files
+        vqa_paths = sample.get('vqa', [])
+        vqa_features = []
+        for vqa_path in vqa_paths:
+            if vqa_path is None:
+                continue
+            
+            # Load the .pt file
+            full_vqa_path = os.path.join(self.image_data_root, vqa_path)
+            try:
+                vqa_feature = torch.load(full_vqa_path, weights_only=True)
+                vqa_features.append(vqa_feature)
+            except FileNotFoundError:
+                print(f"Warning: VQA feature file not found for {vqa_path}")
+                continue
+        
+        if vqa_features:
+            vqa_feature_tensor = torch.stack(vqa_features)  # (obs_horizon, feature_dim, ...)
+        else:
+            # Fallback if no VQA features found
+            vqa_feature_tensor = None
+        
         # Convert sample data
         final_sample = dict()
         for key, value in sample.items():
@@ -163,8 +185,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             elif key == 'ego_waypoints':
                 final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
             elif key == 'vqa':
-                # Skip VQA data for now (B2D specific, causes collate issues)
-                pass
+                # Load VQA features from pt files
+                if vqa_feature_tensor is not None:
+                    final_sample['vqa'] = vqa_feature_tensor
+                else:
+                    final_sample['vqa'] = None
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
@@ -178,14 +203,16 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
     def hard_process(self, final_sample, obs_horizon):
         """
-        Repeat command, next_command, and target_point to match obs_horizon.
+        Process sample data:
+        1. Repeat command, next_command, and target_point to match obs_horizon.
+        2. For VQA features, remove time dimension and keep only the last timestep.
         
         Args:
             final_sample (dict): Sample data
             obs_horizon (int): Number of observation frames
             
         Returns:
-            dict: Processed sample with repeated fields
+            dict: Processed sample with repeated fields and processed VQA
         """
         for key in ['command', 'next_command', 'target_point']:
             if key in final_sample:
@@ -202,6 +229,22 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample[key] = torch.from_numpy(repeated_data).float()
                 else:
                     print(f"Warning: Unsupported data type for key '{key}' during hard_process.")
+        
+        # Process VQA features: remove time dimension, keep only last timestep
+        if 'vqa' in final_sample and final_sample['vqa'] is not None:
+            vqa_data = final_sample['vqa']
+            if isinstance(vqa_data, torch.Tensor):
+                if vqa_data.ndim >= 2:
+                    final_sample['vqa'] = vqa_data[-1]  
+                else:
+                    print(f"Warning: VQA data has unexpected shape {vqa_data.shape}")
+            elif isinstance(vqa_data, np.ndarray):
+                if vqa_data.ndim >= 2:
+                    final_sample['vqa'] = torch.from_numpy(vqa_data[-1]).float()
+                else:
+                    print(f"Warning: VQA data has unexpected shape {vqa_data.shape}")
+            else:
+                print(f"Warning: Unsupported data type for VQA during hard_process.")
         
         return final_sample
 
@@ -542,7 +585,7 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon,
 
     print("\nKey fields:")
     for key in ['town_name', 'speed', 'command', 'next_command', 'target_point', 
-                'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed']:
+                'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed', 'vqa']:
         if key in first_sample:
             value = first_sample[key]
             print(f"  {key}: shape={getattr(value, 'shape', 'N/A')}, type={type(value)}")
@@ -626,13 +669,13 @@ def test():
     import random
     
     # dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data'
-    dataset_path = '/home/wang/Project/carla_garage/tmp_data'
+    dataset_path = '/root/data/z_projects/PDM_Lite_processed_2obs_4hz'
     obs_horizon = 2
     
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
         # image_data_root='/home/wang/Dataset/b2d_10scene'
-        image_data_root='/home/wang/Project/carla_garage/data'
+        image_data_root= '/root/data/pdm_lite/'
     )
 
     print(f"\n总样本数: {len(dataset)}")

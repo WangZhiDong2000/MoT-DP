@@ -380,6 +380,37 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                 
             frame_data['lidar_bev_hist'] = lidar_bev_hist
 
+            # --- VQA Features (dp_vl_feature) ---
+            # dp_vl_feature contains .pt files at frame indices that are multiples of 5
+            # For other frames, map to the previous multiple of 5
+            dp_vl_feature_dir = join(folder_path, 'dp_vl_feature')
+            vqa_hist = []
+            if os.path.exists(dp_vl_feature_dir):
+                for j in range(obs_start_idx, ii + 1, hz_interval):
+                    if j < 0: 
+                        continue
+                    # Find the corresponding frame index that is a multiple of 5
+                    vqa_frame_idx = (j // 5) * 5
+                    vqa_path = join(dp_vl_feature_dir, f"{vqa_frame_idx:04d}.pt")
+                    
+                    if os.path.exists(vqa_path):
+                        vqa_hist.append(join(folder_name, 'dp_vl_feature', f"{vqa_frame_idx:04d}.pt"))
+                    else:
+                        vqa_hist.append(None)
+                
+                # Pad if we don't have enough history frames
+                while len(vqa_hist) < obs_horizon:
+                    if vqa_hist:
+                        vqa_hist.insert(0, vqa_hist[0])
+                    else:
+                        vqa_hist.insert(0, None)
+            
+            # If dp_vl_feature directory doesn't exist or no features were found, fill with None
+            if not vqa_hist:
+                vqa_hist = [None] * obs_horizon
+                
+            frame_data['vqa'] = vqa_hist
+
             scene_data.append(frame_data)
             
         # --- Save data for the entire scene ---
@@ -471,7 +502,7 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
     argparser.add_argument('--data-root', type=str, default='/home/wang/Project/carla_garage/data/' , help='Root directory of raw PDM Lite data')
     argparser.add_argument('--out-dir', type=str, default='/home/wang/Project/carla_garage/tmp_data', help='Output directory for processed data')
-    argparser.add_argument('--obs-horizon', type=int, default=1, help='Number of observation history frames')
+    argparser.add_argument('--obs-horizon', type=int, default=2, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=8, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
     argparser.add_argument('--sample-interval', type=int, default=2, help='Interval between training samples (e.g., 10 frames)')
     argparser.add_argument('--hz-interval', type=int, default=2, help='Interval within a sample to match frequency (e.g., 2 for 2Hz from 4Hz data)')

@@ -11,7 +11,6 @@ from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
 from collections import OrderedDict
-from collections import deque
 
 VLMDriveBackbone = None
 VLM_AVAILABLE = False
@@ -43,31 +42,6 @@ def unnormalize_data(ndata, stats):
     data = ndata * (stats['max'] - stats['min']) + stats['min']
     return data
 
-
-class PIDController(object):
-	def __init__(self, K_P=1.0, K_I=0.0, K_D=0.0, n=20):
-		self._K_P = K_P
-		self._K_I = K_I
-		self._K_D = K_D
-
-		self._window = deque([0 for _ in range(n)], maxlen=n)
-		self._max = 0.0
-		self._min = 0.0
-
-	def step(self, error):
-		self._window.append(error)
-		self._max = max(self._max, abs(error))
-		self._min = -abs(self._max)
-
-		if len(self._window) >= 2:
-			integral = np.mean(self._window)
-			derivative = (self._window[-1] - self._window[-2])
-		else:
-			integral = 0.0
-			derivative = 0.0
-
-		return self._K_P * error + self._K_I * integral + self._K_D * derivative
-    
 class DiffusionDiTCarlaPolicy(nn.Module):
     def __init__(self, config: Dict, action_stats: Optional[Dict[str, torch.Tensor]] = None):
         super().__init__()
@@ -137,11 +111,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 self.vlm_backbone = None
         else:
             print("⚠ VLM backbone not available, using simulated features")
-        self.feature_encoder = None
-        self._init_loaded_vlm_features()
+        self.feature_encoder = nn.Linear(2560, 1536)
+        # self.feature_encoder.eval()
+        # self._init_loaded_vlm_features()
 
 
         # create diffusion model
+        # TCP模型输出特征维度（j_ctrl）为256，修改相应维度
         obs_feature_dim = 256  
         
         # Optional GroupNorm for j_ctrl features (recommended for training stability)
@@ -189,27 +165,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
         self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
-
-        # Controller - Initialize PID controllers with config parameters
-        control_cfg = config.get('controller', {})
-        self.turn_controller = PIDController(
-            K_P=control_cfg.get('turn_KP', 0.75), 
-            K_I=control_cfg.get('turn_KI', 0.75), 
-            K_D=control_cfg.get('turn_KD', 0.3), 
-            n=control_cfg.get('turn_n', 40)
-        )
-        self.speed_controller = PIDController(
-            K_P=control_cfg.get('speed_KP', 5.0),
-            K_I=control_cfg.get('speed_KI', 0.5),
-            K_D=control_cfg.get('speed_KD', 1.0),
-            n=control_cfg.get('speed_n', 40)
-        )
-        
-        # Store config for later use in control_pid
-        self.config = config
-        print(f"✓ PID controllers initialized")
-        print(f"  - Turn controller: KP={control_cfg.get('turn_KP', 0.75)}, KI={control_cfg.get('turn_KI', 0.75)}, KD={control_cfg.get('turn_KD', 0.3)}")
-        print(f"  - Speed controller: KP={control_cfg.get('speed_KP', 5.0)}, KI={control_cfg.get('speed_KI', 0.5)}, KD={control_cfg.get('speed_KD', 1.0)}")
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """
@@ -420,7 +375,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        vl_features, vl_mask = self.generate_simulated_vlm_outputs(batch_size, trajectory.device)
+        vl_features = batch['vqa'].to(device=device, dtype=torch.float32)  # (B, seq_len, feat_dim)
+        vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=device)
         vl_embeds = self.feature_encoder(vl_features)
         pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask)
 
@@ -445,7 +401,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def conditional_sample(self, 
             condition_data, condition_mask,
-            cond=None, generator=None,
+            cond=None, generator=None, vl_features=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -460,7 +416,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
-        vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0],trajectory.device)
+        
+        # Use provided vl_features or generate simulated ones
+        if vl_features is None:
+            vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0], trajectory.device)
+        else:
+            # vl_features provided, create mask for valid positions
+            vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=vl_features.device)
+        
         vl_embeds = self.feature_encoder(vl_features)
 
         for t in scheduler.timesteps:
@@ -526,10 +489,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond_mask[:,:To,Da:] = True
 
         # run sampling
+        # Extract VQA features from obs_dict if available
+        vl_feat = None
+        if 'vqa' in nobs:
+            vl_feat = nobs['vqa'].to(dtype=torch.float32)
+        
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             cond=cond,
+            vl_features=vl_feat
             )
         
         naction_pred = nsample[...,:Da]
@@ -634,10 +603,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond_mask[:,:To,Da:] = True
 
         # 运行采样并捕获中间步骤
+        # Extract VQA features from obs_dict if available
+        vl_feat = None
+        if 'vqa' in nobs:
+            vl_feat = nobs['vqa'].to(dtype=torch.float32)
+        
         nsample, denoising_steps = self.conditional_sample_with_steps(
             cond_data, 
             cond_mask,
             cond=cond,
+            vl_features=vl_feat
         )
         
         naction_pred = nsample[...,:Da]
@@ -679,7 +654,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def conditional_sample_with_steps(self, 
             condition_data, condition_mask,
-            cond=None, generator=None,
+            cond=None, generator=None, vl_features=None,
             **kwargs):
         """
         条件采样并返回中间去噪步骤
@@ -694,7 +669,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             generator=generator)
     
         scheduler.set_timesteps(self.num_inference_steps)
-        vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0], trajectory.device)
+        
+        # Use provided vl_features or generate simulated ones
+        if vl_features is None:
+            print("No VLM features provided, generating simulated features...")
+            vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0], trajectory.device)
+        else:
+            # vl_features provided, create mask for valid positions
+            vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=vl_features.device)
+        
         vl_embeds = self.feature_encoder(vl_features)
 
         # 保存去噪步骤
@@ -846,8 +829,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         # 备用方案：使用固定的随机特征
         print("Using simulated VLM features...")
-        F = 3584  # VLM隐藏层维度
-        self.fixed_seq_len = 25  # 固定序列长度
+        F = 2560  # VLM隐藏层维度
+        self.fixed_seq_len = 8  # 固定序列长度
         
         generator = torch.Generator()
         generator.manual_seed(42)  
@@ -918,104 +901,4 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         return vlm_features, vl_mask_batch
 
 
-    # ===============Copy from TCP=====================
 
-
-    def control_pid(self, waypoints, velocity, target):
-        ''' Predicts vehicle control with a PID controller.
-		Args:
-			waypoints (tensor): output of self.plan()
-			velocity (tensor): speedometer input
-		'''
-        # Read hyperparameters from config
-        control_cfg = self.config.get('controller', {})
-        aim_dist = control_cfg.get('aim_dist', 4.0)  # distance to search around for aim point
-        angle_thresh = control_cfg.get('angle_thresh', 0.3)  # outlier control detection angle
-        dist_thresh = control_cfg.get('dist_thresh', 10.0)  # target point y-distance for outlier filtering
-        brake_speed = control_cfg.get('brake_speed', 0.4)  # desired speed below which brake is triggered
-        brake_ratio = control_cfg.get('brake_ratio', 1.1)  # ratio of speed to desired speed at which brake is triggered
-        clip_delta = control_cfg.get('clip_delta', 0.25)  # maximum change in speed input to longitudinal controller
-        max_throttle = control_cfg.get('max_throttle', 0.75)  # upper limit on throttle signal value in dataset
-
-
-        assert(waypoints.size(0)==1)
-        waypoints = waypoints[0].data.cpu().numpy()
-        target = target.squeeze().data.cpu().numpy()
-        
-        waypoints[:, [0, 1]] = waypoints[:, [1, 0]]  
-        target[[0, 1]] = target[[1, 0]]
-
-		# Downsample waypoints: from 10Hz (20 points in 2s) to 2Hz (take every 5th point)
-		# Original indices: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
-		# Downsampled indices: 4, 9, 14, 19 (starting from index 4)
-		# This matches the original 2Hz assumption: 4 waypoints with 2.5s intervals = 10 seconds
-        downsample_factor = 5
-        downsampled_waypoints = waypoints[4::downsample_factor]
-
-		# iterate over vectors between predicted waypoints
-        num_pairs = len(downsampled_waypoints) - 1
-        best_norm = 1e5
-        desired_speed = 0
-        aim = downsampled_waypoints[0]
-        for i in range(num_pairs):
-            # magnitude of vectors, used for speed
-            desired_speed += np.linalg.norm(
-					downsampled_waypoints[i+1] - downsampled_waypoints[i]) * 2.0 / num_pairs
-            # norm of vector midpoints, used for steering
-            norm = np.linalg.norm((downsampled_waypoints[i+1] + downsampled_waypoints[i]) / 2.0)
-            if abs(aim_dist-best_norm) > abs(aim_dist-norm):
-                aim = downsampled_waypoints[i]
-                best_norm = norm
-        
-        aim_last = downsampled_waypoints[-1] - downsampled_waypoints[-2]
-        angle = np.degrees(np.pi / 2 - np.arctan2(aim[1], aim[0])) / 90
-        angle_last = np.degrees(np.pi / 2 - np.arctan2(aim_last[1], aim_last[0])) / 90
-        angle_target = np.degrees(np.pi / 2 - np.arctan2(target[1], target[0])) / 90
-
-		# choice of point to aim for steering, removing outlier predictions
-		# use target point if it has a smaller angle or if error is large
-		# predicted point otherwise
-		# (reduces noise in eg. straight roads, helps with sudden turn commands)
-        use_target_to_aim = np.abs(angle_target) < np.abs(angle)
-        use_target_to_aim = use_target_to_aim or (np.abs(angle_target-angle_last) > angle_thresh and target[1] < dist_thresh)
-        if use_target_to_aim:
-            angle_final = angle_target
-        else:
-            angle_final = angle
-        
-        steer = self.turn_controller.step(angle_final)
-        steer = np.clip(steer, -1.0, 1.0)
-
-        speed = velocity[0].data.cpu().numpy()
-        brake = desired_speed < brake_speed or (speed / desired_speed) > brake_ratio
-
-        delta = np.clip(desired_speed - speed, 0.0, clip_delta)
-        throttle = self.speed_controller.step(delta)
-        throttle = np.clip(throttle, 0.0, max_throttle)
-        throttle = throttle if not brake else 0.0
-
-        metadata = {
-			'speed': float(speed.astype(np.float64)),
-			'steer': float(steer),
-			'throttle': float(throttle),
-			'brake': float(brake),
-			'wp_4': tuple(downsampled_waypoints[3].astype(np.float64)) if len(downsampled_waypoints) > 3 else tuple(downsampled_waypoints[-1].astype(np.float64)),
-			'wp_3': tuple(downsampled_waypoints[2].astype(np.float64)) if len(downsampled_waypoints) > 2 else tuple(downsampled_waypoints[-1].astype(np.float64)),
-			'wp_2': tuple(downsampled_waypoints[1].astype(np.float64)) if len(downsampled_waypoints) > 1 else tuple(downsampled_waypoints[-1].astype(np.float64)),
-			'wp_1': tuple(downsampled_waypoints[0].astype(np.float64)),
-			'aim': tuple(aim.astype(np.float64)),
-			'target': tuple(target.astype(np.float64)),
-			'desired_speed': float(desired_speed.astype(np.float64)),
-			'angle': float(angle.astype(np.float64)),
-			'angle_last': float(angle_last.astype(np.float64)),
-			'angle_target': float(angle_target.astype(np.float64)),
-			'angle_final': float(angle_final.astype(np.float64)),
-			'delta': float(delta.astype(np.float64)),
-		}
-
-        return steer, throttle, brake, metadata
-
-
-
-
-    
