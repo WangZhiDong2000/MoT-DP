@@ -16,6 +16,7 @@ sys.path.append(project_root)
 from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 import yaml
+import argparse
 
 def create_carla_config(config_path=None):
     if config_path is None:
@@ -364,7 +365,6 @@ def train_carla_policy(config_path):
         print("✓ WandB session finished")
 
 if __name__ == "__main__":
-    import argparse
 
     parser = argparse.ArgumentParser(description="Train CARLA Driving Policy with Diffusion DiT")
     parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/carla.yaml", help='Path to the configuration YAML file')

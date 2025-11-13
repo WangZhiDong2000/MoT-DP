@@ -298,70 +298,143 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
 def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
     """
-    Visualizes and saves the agent's trajectory and target point from a sample.
+    Visualizes historical waypoints and future predicted waypoints in BEV.
+    
+    Shows:
+    - Historical waypoints (past ego positions) as blue dots with sequence markers
+    - Future predicted waypoints (agent_pos) as red dots with sequence markers
+    - Current position at origin (0, 0) in black
+    - Target point as green star
     
     Args:
-        sample (dict): Data sample
+        sample (dict): Data sample containing 'agent_pos', 'waypoints_hist', 'target_point'
         obs_horizon (int): Number of observation frames
         rand_idx (int): Sample index for saving
         save_dir (str): Directory to save visualization
     """
     agent_pos = sample.get('agent_pos')
+    waypoints_hist = sample.get('waypoints_hist')
     target_point = sample.get('target_point')
     
     if agent_pos is None:
         print("'agent_pos' not in sample. Skipping trajectory visualization.")
         return
 
-    if agent_pos.ndim == 3 and agent_pos.shape[1] == 1:
-        agent_pos = agent_pos.squeeze(1)
-    
-    pred_agent_pos = agent_pos
+    # Convert to numpy if needed
+    if isinstance(agent_pos, torch.Tensor):
+        agent_pos = agent_pos.numpy()
+    if isinstance(waypoints_hist, torch.Tensor):
+        waypoints_hist = waypoints_hist.numpy()
+    if isinstance(target_point, torch.Tensor):
+        target_point = target_point.numpy()
     
     plt.figure(figsize=(10, 10))
-
-    # 收集所有y值用于自动扩展y轴
-    y_values = []
-    if len(pred_agent_pos) > 0:
-        plt.plot(pred_agent_pos[:, 1], pred_agent_pos[:, 0], 'ro--', 
-                label='Predicted agent_pos', markersize=8, linewidth=2)
-        y_values.extend(pred_agent_pos[:, 1].tolist())
-
+    
+    # ========== Plot Historical Waypoints ==========
+    if waypoints_hist is not None and len(waypoints_hist) > 0:
+        # waypoints_hist shape: (obs_horizon, 2)
+        # Plot line connecting historical points
+        plt.plot(waypoints_hist[:, 1], waypoints_hist[:, 0], 'b-', 
+                linewidth=1.5, alpha=0.5, label='History trajectory', zorder=2)
+        
+        # Plot each historical waypoint as discrete point
+        for i, waypoint in enumerate(waypoints_hist[:-1]):  # Exclude last (current frame)
+            plt.plot(waypoint[1], waypoint[0], 'bo', markersize=8, zorder=3)
+            # Add time label
+            plt.text(waypoint[1] + 0.3, waypoint[0] + 0.3, f't-{obs_horizon-1-i}', 
+                    fontsize=9, ha='center', color='blue', fontweight='bold')
+    
+    # ========== Plot Current Position (Origin) ==========
+    plt.plot(0, 0, 'ko', markersize=15, label='Current position (t=0)', 
+            markeredgecolor='yellow', markeredgewidth=2, zorder=5)
+    plt.text(0.3, -0.5, 't=0', fontsize=10, ha='center', 
+            color='black', fontweight='bold', bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
+    
+    # ========== Plot Future Waypoints (Predictions) ==========
+    if len(agent_pos) > 0:
+        # Plot line connecting future points
+        future_waypoints = np.vstack([[[0, 0]], agent_pos])
+        plt.plot(future_waypoints[:, 1], future_waypoints[:, 0], 'r--', 
+                linewidth=2, alpha=0.6, label='Predicted trajectory', zorder=2)
+        
+        # Plot each future waypoint as discrete point
+        for i, waypoint in enumerate(agent_pos, 1):
+            plt.plot(waypoint[1], waypoint[0], 'r^', markersize=10, 
+                    markeredgecolor='darkred', markeredgewidth=1, zorder=4)
+            # Add time label
+            plt.text(waypoint[1] - 0.3, waypoint[0] - 0.3, f't+{i}', 
+                    fontsize=9, ha='center', color='red', fontweight='bold')
+    
+    # ========== Plot Target Point ==========
     if target_point is not None:
         if target_point.ndim == 2:
             target_point = target_point[0]
-        plt.plot(target_point[1], target_point[0], 'g*', markersize=15, 
-                label='Target point', markeredgecolor='black', markeredgewidth=1)
-        y_values.append(target_point[1])
-
-    # 加入原点y值
-    y_values.append(0)
-
-    # 自动扩展y轴范围
-    if len(y_values) > 0:
-        y_min = min(y_values)
-        y_max = max(y_values)
-        margin = max(1.0, 0.2 * (y_max - y_min))  # 至少1，或20%区间
-        plt.ylim(y_min - margin, y_max + margin)
-
-    plt.xlabel('Y (ego frame, lateral)', fontsize=12)
-    plt.ylabel('X (ego frame, longitudinal)', fontsize=12)
-    plt.title(f'Sample {rand_idx}: Predicted Trajectory\n'
-              f'(Ego coordinate frame, origin at current position)', fontsize=14)
-    plt.legend(fontsize=10, loc='best')
-    plt.grid(True, alpha=0.3)
+        plt.plot(target_point[1], target_point[0], 'g*', markersize=25, 
+                label='Target point', markeredgecolor='darkgreen', markeredgewidth=1.5, zorder=6)
+        plt.text(target_point[1] + 0.5, target_point[0] + 0.5, 'Goal', 
+                fontsize=10, ha='center', color='green', fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.7))
+    
+    # ========== Formatting ==========
+    plt.xlabel('Y (ego frame, lateral / m)', fontsize=12, fontweight='bold')
+    plt.ylabel('X (ego frame, longitudinal / m)', fontsize=12, fontweight='bold')
+    plt.title(f'Sample {rand_idx}: Trajectory Visualization\n(History + Future Predictions in Ego Coordinate Frame)', 
+              fontsize=13, fontweight='bold')
+    
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     plt.axis('equal')
     plt.gca().set_aspect('equal', adjustable='box')
-
-    plt.plot(0, 0, 'ko', markersize=10, label='Current position (origin)', zorder=5)
-    plt.legend(fontsize=10, loc='best')
-    plt.tight_layout()
-
+    
+    # Add legend with custom formatting
+    plt.legend(fontsize=10, loc='best', framealpha=0.95, edgecolor='black')
+    
+    # Add axis line at origin
+    plt.axhline(y=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    plt.axvline(x=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    
+    # Set minimum axis range (at least 1m on each side)
+    xlim = plt.gca().get_xlim()
+    ylim = plt.gca().get_ylim()
+    
+    # Ensure minimum range of 1m in each direction from origin
+    x_range = max(1.0, abs(xlim[1] - xlim[0]) / 2)
+    y_range = max(1.0, abs(ylim[1] - ylim[0]) / 2)
+    
+    plt.xlim(-x_range, x_range)
+    plt.ylim(-y_range, y_range)
+    
+    plt.subplots_adjust(left=0.1, right=0.95, top=0.93, bottom=0.1)
+    
+    # Save figure
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'sample_{rand_idx}_agent_pos.png')
+    save_path = os.path.join(save_dir, f'sample_{rand_idx}_trajectory.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
+    plt.show()
+    print(f"✓ 保存轨迹可视化到: {save_path}")    # ========== Formatting ==========
+    plt.xlabel('Y (ego frame, lateral / m)', fontsize=13, fontweight='bold')
+    plt.ylabel('X (ego frame, longitudinal / m)', fontsize=13, fontweight='bold')
+    plt.title(f'Sample {rand_idx}: Trajectory Visualization\n'
+              f'(History + Future Predictions in Ego Coordinate Frame)', 
+              fontsize=14, fontweight='bold')
+    
+    plt.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+
+    
+    # Add legend with custom formatting
+    plt.legend(fontsize=11, loc='best', framealpha=0.95, edgecolor='black')
+    
+    # Add axis line at origin
+    plt.axhline(y=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    plt.axvline(x=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'sample_{rand_idx}_trajectory.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
-    print(f"保存agent_pos图像到: {save_path}")
+    print(f"✓ 保存轨迹可视化到: {save_path}")
 
 
 def visualize_observation_images(sample, obs_horizon, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
@@ -399,11 +472,11 @@ def visualize_observation_images(sample, obs_horizon, rand_idx, save_dir='/home/
         else:
             img_vis = img_arr.astype(np.uint8)
         
-        plt.figure(figsize=(8, 2))
+        plt.figure(figsize=(20, 5))
         plt.imshow(img_vis)
-        plt.title(f'Random Sample {rand_idx} - Obs Image t={t}')
+        plt.title(f'Random Sample {rand_idx} - Obs Image t={t}', fontsize=12)
         plt.axis('off')
-        plt.tight_layout()
+        plt.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.05)
 
         save_path = os.path.join(save_dir, f'sample_{rand_idx}_obs_image_t{t}.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -516,11 +589,11 @@ def visualize_vqa_on_image(sample, obs_horizon, rand_idx, max_qa_pairs=5,
     
     canvas_np = np.array(canvas)
     
-    plt.figure(figsize=(16, 8))
+    plt.figure(figsize=(18, 10))
     plt.imshow(canvas_np)
-    plt.title(f'Sample {rand_idx} - Image with Meta Actions')
+    plt.title(f'Sample {rand_idx} - Image with Meta Actions', fontsize=12, fontweight='bold')
     plt.axis('off')
-    plt.tight_layout()
+    plt.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.01)
     
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f'sample_{rand_idx}_meta_actions.png')
@@ -667,15 +740,15 @@ def test_b2d():
 def test():
     """Test with default configuration."""
     import random
-    
-    # dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data'
-    dataset_path = '/root/data/z_projects/PDM_Lite_processed_2obs_4hz'
+
+    dataset_path = '/home/wang/Project/carla_garage/tmp_data'
+    # dataset_path = '/root/data/z_projects/PDM_Lite_processed_2obs_4hz'
     obs_horizon = 2
     
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        # image_data_root='/home/wang/Dataset/b2d_10scene'
-        image_data_root= '/root/data/pdm_lite/'
+        image_data_root='/home/wang/Project/carla_garage/data' 
+        # image_data_root= '/root/data/pdm_lite/'
     )
 
     print(f"\n总样本数: {len(dataset)}")

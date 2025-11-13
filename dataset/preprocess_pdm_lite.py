@@ -100,6 +100,43 @@ def command_to_one_hot(command):
     cmd_one_hot[command] = 1.0
     return np.array(cmd_one_hot)
 
+def get_history_waypoints(measurements, current_idx, obs_horizon):
+    """
+    Transform historical waypoints to be relative to the current ego position.
+    
+    Args:
+        measurements: List of measurement dicts for the entire sample
+        current_idx: Index of the current frame in measurements list
+        obs_horizon: Number of history frames to extract
+    
+    Returns:
+        waypoints_hist: List of waypoints in current ego frame (BEV, 2D), length = obs_horizon
+                       Each waypoint represents the relative position of ego at that past frame
+                       in the coordinate system of the current frame
+    """
+    current_anno = measurements[current_idx]
+    current_matrix = np.array(current_anno['ego_matrix'])[:3]
+    current_translation = current_matrix[:, 3:4]
+    current_rotation = current_matrix[:, :3]
+    
+    waypoints_hist = []
+    
+    # Extract history waypoints from past to current (current is always [0, 0])
+    for j in range(max(0, current_idx - obs_horizon + 1), current_idx + 1):
+        past_anno = measurements[j]
+        past_matrix = np.array(past_anno['ego_matrix'])[:3]
+        past_translation = past_matrix[:, 3:4]
+        
+        # Transform past position to current ego frame
+        waypoint_ego_frame = current_rotation.T @ (past_translation - current_translation)
+        waypoints_hist.append(waypoint_ego_frame[:2, 0])
+    
+    # Pad if we don't have enough history frames
+    while len(waypoints_hist) < obs_horizon:
+        waypoints_hist.insert(0, waypoints_hist[0])
+    
+    return waypoints_hist
+
 def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmentation=0.0):
     """
     Transform waypoints to be origin at current ego position.
@@ -301,26 +338,56 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             frame_data['route'] = route
 
             # --- Low dimensional state History ---
+            '''
+            Includes: speed, theta, throttle, brake, command (one-hot)
+            Note: acceleration and angular_velocity are not available in the raw data,
+            so we use throttle/brake as control signals instead.
+            '''
             sped_hist = []
             theta_hist = []
+            throttle_hist = []
+            brake_hist = []
+            command_hist = []  # one-hot command history
             
             for j in range(0, current_idx_in_list + 1):          # no need for hz_interval here because the loaded measurements already account for it
                 anno_j = loaded_measurements[j]
                 if anno_j is not None:
-                    sped_hist.append(anno_j['speed'])
-                    theta_hist.append(anno_j['theta'])
+                    sped_hist.append(anno_j.get('speed', 0.0))
+                    theta_hist.append(anno_j.get('theta', 0.0))
+                    throttle_hist.append(float(anno_j.get('throttle', 0.0)))
+                    brake_hist.append(float(anno_j.get('brake', 0.0)))
+                    command_hist.append(command_to_one_hot(anno_j.get('command', -1)))
                 else:
                     # If the specific frame is missing, repeat the last valid state
                     if sped_hist:
                         sped_hist.append(sped_hist[-1])
                         theta_hist.append(theta_hist[-1])
+                        throttle_hist.append(throttle_hist[-1])
+                        brake_hist.append(brake_hist[-1])
+                        command_hist.append(command_hist[-1])
                     else:
                         sped_hist.append(0.0)
                         theta_hist.append(0.0)
+                        throttle_hist.append(0.0)
+                        brake_hist.append(0.0)
+                        command_hist.append(command_to_one_hot(-1))  # Default command
+            
             frame_data['speed_hist'] = np.array(sped_hist)
             frame_data['theta_hist'] = np.array(theta_hist)
+            frame_data['throttle_hist'] = np.array(throttle_hist)
+            frame_data['brake_hist'] = np.array(brake_hist)
+            frame_data['command_hist'] = np.array(command_hist)
             assert frame_data['speed_hist'].shape == (obs_horizon,)
             assert frame_data['theta_hist'].shape == (obs_horizon,)
+            assert frame_data['throttle_hist'].shape == (obs_horizon,)
+            assert frame_data['brake_hist'].shape == (obs_horizon,)
+            assert frame_data['command_hist'].shape == (obs_horizon, 6)  # 6 one-hot command dimensions
+            
+            # --- Historical Waypoints (relative positions in BEV) ---
+            # Convert past ego positions to relative displacements in current ego frame coordinate
+            waypoints_hist = get_history_waypoints(loaded_measurements, current_idx_in_list, obs_horizon)
+            frame_data['waypoints_hist'] = np.array(waypoints_hist)
+            assert frame_data['waypoints_hist'].shape == (obs_horizon, 2)
 
             # --- Image History ---
             rgb_hist = []
@@ -502,7 +569,7 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
     argparser.add_argument('--data-root', type=str, default='/home/wang/Project/carla_garage/data/' , help='Root directory of raw PDM Lite data')
     argparser.add_argument('--out-dir', type=str, default='/home/wang/Project/carla_garage/tmp_data', help='Output directory for processed data')
-    argparser.add_argument('--obs-horizon', type=int, default=2, help='Number of observation history frames')
+    argparser.add_argument('--obs-horizon', type=int, default=4, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=8, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
     argparser.add_argument('--sample-interval', type=int, default=2, help='Interval between training samples (e.g., 10 frames)')
     argparser.add_argument('--hz-interval', type=int, default=2, help='Interval within a sample to match frequency (e.g., 2 for 2Hz from 4Hz data)')

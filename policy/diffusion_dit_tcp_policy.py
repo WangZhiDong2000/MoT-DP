@@ -242,14 +242,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
 
         if self.obs_as_global_cond:
-            obs_features_list = []
-            for t in range(To):
-                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
-                step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
-                obs_features_list.append(step_features)
-            
-            # 堆叠所有时间步的特征: (B, To, feature_dim)
-            cond = torch.stack(obs_features_list, dim=1).float()  
+            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
+            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
+            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
+            feature_dim = batch_features.shape[-1]
+            cond = batch_features.reshape(batch_size, To, feature_dim).float()  # (B, To, feature_dim)  
         else:
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
             nobs_features = self.extract_tcp_features(this_nobs)
@@ -358,26 +355,22 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond_data = None
         cond_mask = None
         if self.obs_as_global_cond:
-            obs_features_list = []
-            for t in range(To):
-                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
-                step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
-                obs_features_list.append(step_features)
-            cond = torch.stack(obs_features_list, dim=1)
+            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
+            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
+            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
+            feature_dim = batch_features.shape[-1]
+            cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
             shape = (B, T, Da)
            
             cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            obs_features_list = []
-            for t in range(To):
-                this_step_nobs = dict_apply(nobs, lambda x: x[:, t, ...])
-                step_features = self.extract_tcp_features(this_step_nobs)  # (B, feature_dim)
-                obs_features_list.append(step_features)
-            
-            # 堆叠所有时间步的特征: (B, To, feature_dim)
-            nobs_features = torch.stack(obs_features_list, dim=1)
+            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
+            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
+            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
+            feature_dim = batch_features.shape[-1]
+            nobs_features = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
             shape = (B, T, Da+Do)
             cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
