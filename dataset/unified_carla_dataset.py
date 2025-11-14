@@ -409,7 +409,7 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/home/wang/Pro
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f'sample_{rand_idx}_trajectory.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
-    plt.show()
+    plt.close()
     print(f"✓ 保存轨迹可视化到: {save_path}")    # ========== Formatting ==========
     plt.xlabel('Y (ego frame, lateral / m)', fontsize=13, fontweight='bold')
     plt.ylabel('X (ego frame, longitudinal / m)', fontsize=13, fontweight='bold')
@@ -433,8 +433,9 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/home/wang/Pro
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f'sample_{rand_idx}_trajectory.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
+    plt.close()
     print(f"✓ 保存轨迹可视化到: {save_path}")
+
 
 
 def visualize_observation_images(sample, obs_horizon, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
@@ -480,7 +481,7 @@ def visualize_observation_images(sample, obs_horizon, rand_idx, save_dir='/home/
 
         save_path = os.path.join(save_dir, f'sample_{rand_idx}_obs_image_t{t}.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.show()
+        plt.close()
         print(f"保存观测图像到: {save_path}")
 
 
@@ -598,7 +599,7 @@ def visualize_vqa_on_image(sample, obs_horizon, rand_idx, max_qa_pairs=5,
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f'sample_{rand_idx}_meta_actions.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
+    plt.close()
     print(f"保存Meta Actions图像到: {save_path}")
 
 
