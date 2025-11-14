@@ -620,11 +620,17 @@ if __name__ == "__main__":
         print(f"{'='*70}")
         
         import os
+        import random
         os.makedirs('/home/wang/Project/MoT-DP/image/nusc_samples', exist_ok=True)
         
-        for i in range(min(args.num_samples, len(dataset))):
-            sample = dataset[i]
-            save_path = f'/home/wang/Project/MoT-DP/image/nusc_samples/sample_{i:03d}.png'
+        # 随机选择样本索引
+        num_samples_to_visualize = min(args.num_samples, len(dataset))
+        random_indices = random.sample(range(len(dataset)), num_samples_to_visualize)
+        print(f"Randomly selected sample indices: {random_indices}")
+        
+        for idx, sample_idx in enumerate(random_indices):
+            sample = dataset[sample_idx]
+            save_path = f'/home/wang/Project/MoT-DP/image/nusc_samples/sample_{sample_idx:03d}.png'
             visualize_sample(sample, save_path)
         
-        print(f"✓ Saved {min(args.num_samples, len(dataset))} visualizations")
+        print(f"✓ Saved {num_samples_to_visualize} visualizations")
