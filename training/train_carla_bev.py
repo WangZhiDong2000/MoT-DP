@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 import os
 import sys
+
+# 在导入任何库之前设置环境变量，防止wandb多进程冲突
+os.environ['WANDB_START_METHOD'] = 'thread'
+os.environ['WANDB__SERVICE_WAIT'] = '300'
+
 import torch
 import yaml
 import wandb
@@ -50,15 +55,42 @@ def load_action_stats(config):
 
 
 def safe_wandb_log(data, use_wandb=True):
-    """安全地记录wandb日志，处理断网情况"""
+    """安全地记录wandb日志，处理所有异常"""
     if use_wandb:
         try:
+            # 在记录前刷新输出
+            import sys
+            sys.stdout.flush()
+            sys.stderr.flush()
+            
             wandb.log(data)
-        except Exception as e:
-            # 断网或其他错误时，只打印警告但不中断训练
-            if "ConnectionError" in str(e) or "timeout" in str(e).lower():
-                print(f"⚠ WandB connection lost, continuing training without logging...")
-            # 静默处理，不打印过多错误信息
+            
+            # 记录后再次刷新
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except:
+            # 完全静默处理所有异常
+            pass
+
+
+def safe_wandb_finish(use_wandb=True):
+    """安全地结束wandb会话，避免段错误"""
+    if not use_wandb:
+        return
+    
+    try:
+        # 方法1: 使用quiet模式
+        wandb.finish(quiet=True, exit_code=0)
+    except:
+        try:
+            # 方法2: 强制终止wandb进程
+            import signal
+            import subprocess
+            subprocess.run(['pkill', '-9', '-f', 'wandb-service'], 
+                         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        except:
+            # 最后的尝试: 什么都不做，让Python正常退出
+            pass
 
 
 def check_box_collision_2d(boxes1, boxes2):
@@ -576,16 +608,24 @@ def train_nusc_policy(config_path):
         validation_freq = config.get('training', {}).get('validation_freq', 1)
         if (epoch + 1) % validation_freq == 0:
             print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
+            import sys
+            sys.stdout.flush()
+            
             try:
                 val_metrics = validate_model(policy, val_loader, device)
                 print(f"✓ Validation completed")
+                sys.stdout.flush()
             except Exception as e:
                 print(f"✗ Error during validation: {e}")
                 import traceback
                 traceback.print_exc()
+                sys.stdout.flush()
                 continue
         
             try:
+                print("Preparing validation metrics for logging...")
+                sys.stdout.flush()
+                
                 log_dict = {
                     "epoch": epoch,
                     "train/loss": avg_train_loss,
@@ -610,8 +650,11 @@ def train_nusc_policy(config_path):
                         # 其他指标
                         log_dict[f"val/{key.replace('val_', '')}"] = value
         
+                print("Logging to wandb...")
+                sys.stdout.flush()
                 safe_wandb_log(log_dict, use_wandb)
                 print(f"✓ Metrics logged")
+                sys.stdout.flush()
             except Exception as e:
                 print(f"✗ Error during metrics logging: {e}")
                 import traceback
@@ -658,9 +701,9 @@ def train_nusc_policy(config_path):
         "training/final_train_loss": avg_train_loss
     }, use_wandb)
     
-    if use_wandb:
-        wandb.finish()
-        print("✓ WandB session finished")
+    # 使用安全的finish函数
+    safe_wandb_finish(use_wandb)
+    print("✓ Training session finished")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train nuScenes Driving Policy with Diffusion DiT")
