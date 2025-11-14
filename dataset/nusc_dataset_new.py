@@ -210,6 +210,8 @@ def visualize_sample(sample, save_path=None):
         sample: Dictionary containing sample data
         save_path: Path to save the visualization (optional)
     """
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend to avoid display issues
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
     
