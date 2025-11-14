@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-计算数据集中的action_stats (agent_pos统计信息)
-适用于CARLA数据集，统计ego_waypoints/agent_pos的min, max, mean, std
+计算nuScenes数据集中的action_stats (轨迹点统计信息)
+从preprocess_nusc_new.py处理后的数据统计future waypoints的min, max, mean, std
+默认统计/home/wang/Dataset/v1.0-mini/processed_data/中的训练集数据
 """
 import os
 import sys
 import pickle
-import glob
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -16,78 +16,70 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
 
-def compute_action_stats_from_dataset(dataset_path, max_samples=None):
+def compute_action_stats_from_processed_data(pkl_path, max_samples=None):
     """
-    从预处理的pkl文件中统计action (agent_pos) 的统计信息
+    从preprocess_nusc_new.py处理后的pkl文件中统计action (fut_waypoints) 的统计信息
     
     Args:
-        dataset_path: 数据集路径，包含train/val子目录或直接包含pkl文件
+        pkl_path: 处理后的pkl文件路径 (如 nuscenes_processed_train.pkl)
         max_samples: 最多处理多少个样本（None表示处理全部）
     
     Returns:
         stats: 包含min, max, mean, std的字典
     """
     print(f"\n{'='*60}")
-    print(f"Computing action statistics from dataset...")
-    print(f"Dataset path: {dataset_path}")
+    print(f"Computing action statistics from processed nuScenes data...")
+    print(f"Dataset file: {pkl_path}")
     print(f"{'='*60}\n")
     
-    train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
-    val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
-    direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
+    # Load preprocessed data
+    print("Loading preprocessed data...")
+    with open(pkl_path, 'rb') as f:
+        # Handle numpy version compatibility
+        import numpy
+        sys.modules['numpy._core'] = numpy.core
+        sys.modules['numpy._core.multiarray'] = numpy.core.multiarray
+        data = pickle.load(f)
     
-    if train_files or val_files:
-        all_files = sorted(train_files + val_files)
-        print(f"✓ Found {len(all_files)} samples ({len(train_files)} train, {len(val_files)} val)")
-    elif direct_files:
-        all_files = sorted(direct_files)
-        print(f"✓ Found {len(all_files)} samples")
-    else:
-        raise FileNotFoundError(f"No pkl files found in {dataset_path} or its train/val subdirectories")
+    samples = data['samples']
+    print(f"✓ Found {len(samples)} samples")
     
     if max_samples is not None:
-        all_files = all_files[:max_samples]
-        print(f"⚠ Limiting to {len(all_files)} samples for statistics computation")
+        samples = samples[:max_samples]
+        print(f"⚠ Limiting to {len(samples)} samples for statistics computation")
     
     all_actions = []
     failed_samples = 0
     
-    print("\nLoading samples...")
-    for pkl_file in tqdm(all_files, desc="Processing"):
+    print("\nProcessing samples...")
+    for sample in tqdm(samples, desc="Processing"):
         try:
-            with open(pkl_file, 'rb') as f:
-                sample = pickle.load(f)
+            # 获取fut_waypoints (future waypoints)
+            fut_waypoints = sample.get('fut_waypoints')
             
-            # 获取ego_waypoints (agent_pos)
-            ego_waypoints = sample.get('ego_waypoints')
-            
-            if ego_waypoints is None:
+            if fut_waypoints is None:
                 failed_samples += 1
                 continue
             
-            if isinstance(ego_waypoints, torch.Tensor):
-                ego_waypoints = ego_waypoints.cpu().numpy()
-            elif not isinstance(ego_waypoints, np.ndarray):
-                ego_waypoints = np.array(ego_waypoints)
+            if isinstance(fut_waypoints, torch.Tensor):
+                fut_waypoints = fut_waypoints.cpu().numpy()
+            elif not isinstance(fut_waypoints, np.ndarray):
+                fut_waypoints = np.array(fut_waypoints)
             
-            # if len(ego_waypoints) > 1:
-            #     ego_waypoints = ego_waypoints[1:]
-            
-            all_actions.append(ego_waypoints)
+            all_actions.append(fut_waypoints)
             
         except Exception as e:
-            print(f"\n⚠ Error loading {pkl_file}: {e}")
+            print(f"\n⚠ Error processing sample: {e}")
             failed_samples += 1
             continue
     
     if failed_samples > 0:
-        print(f"\n⚠ Failed to load {failed_samples} samples")
+        print(f"\n⚠ Failed to process {failed_samples} samples")
     
     if len(all_actions) == 0:
         raise ValueError("No valid actions found in dataset!")
     
-
-    print(f"\n✓ Successfully loaded {len(all_actions)} samples")
+    print(f"\n✓ Successfully processed {len(all_actions)} samples")
     print("Computing statistics...")
     all_actions_flat = np.concatenate(all_actions, axis=0)
     
@@ -102,7 +94,7 @@ def compute_action_stats_from_dataset(dataset_path, max_samples=None):
     }
     
     print(f"\n{'='*60}")
-    print("Action Statistics (agent_pos):")
+    print("Action Statistics (fut_waypoints):")
     print(f"{'='*60}")
     print(f"Dimensions: {all_actions_flat.shape[1]} (x, y)")
     print(f"\nMin:  {stats['min'].numpy()}")
@@ -124,13 +116,21 @@ def compute_action_stats_from_dataset(dataset_path, max_samples=None):
     return stats
 
 
-def save_stats_to_config(stats, config_path, output_path=None):
-    if output_path is None:
-        output_path = config_path
+def save_stats_to_config(stats, config_path):
+    """
+    将统计信息保存到配置文件
     
+    Args:
+        stats: 统计信息字典
+        config_path: 配置文件路径
+    """
     try:
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
+        # 如果配置文件存在，则加载并更新
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+        else:
+            config = {}
         
         if 'action_stats' not in config:
             config['action_stats'] = {}
@@ -140,31 +140,39 @@ def save_stats_to_config(stats, config_path, output_path=None):
         config['action_stats']['mean'] = stats['mean'].tolist()
         config['action_stats']['std'] = stats['std'].tolist()
         
-        with open(output_path, 'w') as f:
+        with open(config_path, 'w') as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
         
-        print(f"\n✓ Action stats saved to config: {output_path}")
+        print(f"\n✓ Action stats saved to config: {config_path}")
         
     except Exception as e:
         print(f"\n⚠ Failed to save stats to config: {e}")
 
 
 def main():
-    import argparse
+    """
+    主函数：统计nuScenes mini数据集的action statistics
+    默认处理训练集数据并保存到config/nuscenes.yaml
+    """
+    # 默认路径
+    default_train_pkl = '/home/wang/Dataset/v1.0-mini/processed_data/nuscenes_processed_train.pkl'
+    default_config = os.path.join(project_root, 'config', 'nuscenes.yaml')
     
-    parser = argparse.ArgumentParser(description='Compute action statistics from CARLA dataset')
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='Compute action statistics from preprocessed nuScenes data'
+    )
     parser.add_argument(
-        '--dataset_path',
+        '--pkl_path',
         type=str,
-        default='/home/wang/Project/carla_garage/tmp_data/train',
-        # default='/home/wang/Dataset/b2d_10scene/tmp_data/train',
-        help='Path to processed dataset (containing train/val folders or pkl files)'
+        default=default_train_pkl,
+        help=f'Path to processed pkl file (default: {default_train_pkl})'
     )
     parser.add_argument(
         '--config_path',
         type=str,
-        default='/home/wang/Project/MoT-DP/config/carla.yaml',
-        help='Path to config file to save stats'
+        default=default_config,
+        help=f'Path to config file to save stats (default: {default_config})'
     )
     parser.add_argument(
         '--max_samples',
@@ -173,36 +181,36 @@ def main():
         help='Maximum number of samples to process (None = all)'
     )
     parser.add_argument(
-        '--save_to_config',
+        '--no_save',
         action='store_true',
-        help='Save computed stats to config file'
-    )
-    parser.add_argument(
-        '--output_path',
-        type=str,
-        default=None,
-        help='Output path for config file (default: overwrite original)'
+        help='Do not save stats to config file'
     )
     
     args = parser.parse_args()
     
-    if not os.path.exists(args.dataset_path):
-        print(f"❌ Dataset path not found: {args.dataset_path}")
-        print("\nPlease specify the correct path using --dataset_path")
+    # 检查文件是否存在
+    if not os.path.exists(args.pkl_path):
+        print(f"❌ Processed data file not found: {args.pkl_path}")
+        print("\nPlease run preprocess_nusc_new.py first to generate processed data.")
+        print("Or specify a different path using --pkl_path")
         return
     
     try:
-        stats = compute_action_stats_from_dataset(
-            dataset_path=args.dataset_path,
+        # 计算统计信息
+        stats = compute_action_stats_from_processed_data(
+            pkl_path=args.pkl_path,
             max_samples=args.max_samples
         )
         
-        if args.save_to_config:
-            if os.path.exists(args.config_path):
-                save_stats_to_config(stats, args.config_path, args.output_path)
-            else:
-                print(f"⚠ Config file not found: {args.config_path}")
-                print("  Stats not saved to config.")
+        # 保存到配置文件
+        if not args.no_save:
+            # 确保config目录存在
+            config_dir = os.path.dirname(args.config_path)
+            if not os.path.exists(config_dir):
+                os.makedirs(config_dir)
+                print(f"✓ Created config directory: {config_dir}")
+            
+            save_stats_to_config(stats, args.config_path)
         
         print("\n✓ Statistics computation completed successfully!")
         

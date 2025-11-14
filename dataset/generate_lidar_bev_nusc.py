@@ -88,22 +88,50 @@ def makeBVFeature(PointCloud_, BoundaryCond, img_height, img_width, Discretizati
     return RGB_Map
 
 def generate_lidar_bev_images(lidar_pc, saving_name=None, img_height=448, img_width=448):
-    # Coordinate transform
-    lidar_pc[:, 0] = lidar_pc[:, 0] * -1
+    """
+    Generate BEV image from LIDAR point cloud aligned with ego coordinate system.
     
+    nuScenes ego coordinate system:
+    - x-axis: forward (positive forward, negative backward)
+    - y-axis: left (positive left, negative right)
+    - z-axis: up
+    
+    BEV image coordinate system (standard image coordinates):
+    - Row 0: top of image -> should be vehicle FRONT (x_max = +32m)
+    - Row 447: bottom of image -> should be vehicle REAR (x_min = -32m)
+    - Col 0: left of image -> should be vehicle RIGHT (y_min = -32m)
+    - Col 447: right of image -> should be vehicle LEFT (y_max = +32m)
+    
+    makeBVFeature uses heightMap[x_index, y_index]:
+    - First index (x) = row (top to bottom)
+    - Second index (y) = column (left to right)
+    
+    To align correctly:
+    - We need to FLIP x-axis: x_forward(+32) -> row_0, x_backward(-32) -> row_447
+    - Keep y-axis normal: y_left(+32) -> col_447, y_right(-32) -> col_0
+    """
     if lidar_pc.shape[-1] == 3:
         lidar_pc = np.concatenate([lidar_pc, np.ones((*lidar_pc.shape[:-1], 1))], axis=-1)
     lidar_pc = removePoints(lidar_pc, BOUNDARY)
 
     lidar_pc_filtered = np.copy(lidar_pc)
-    lidar_pc_filtered[:, 0] = lidar_pc_filtered[:, 0] + BOUNDARY["maxX"]
-    lidar_pc_filtered[:, 1] = lidar_pc_filtered[:, 1] + BOUNDARY["maxY"]
+    
+    # CRITICAL FIX: Flip x-axis to align with image coordinates
+    # Before: x=-32 -> index=0 (top), x=+32 -> index=64 (bottom) - WRONG!
+    # After: x=+32 -> index=0 (top), x=-32 -> index=64 (bottom) - CORRECT!
+    lidar_pc_filtered[:, 0] = -lidar_pc_filtered[:, 0] + BOUNDARY["maxX"]  # Flip x
+    lidar_pc_filtered[:, 1] = lidar_pc_filtered[:, 1] + BOUNDARY["maxY"]   # Keep y normal
 
     # create Bird's Eye View
     discretization = (BOUNDARY["maxX"] - BOUNDARY["minX"]) / img_height
     lidar_bev = makeBVFeature(lidar_pc_filtered, BOUNDARY, img_height, img_width, discretization)
 
     lidar_bev[:, :, 2] = 0.0
+    
+    # Rotate 90 degrees counterclockwise (left)
+    # k=1 means rotate 90 degrees counterclockwise
+    lidar_bev = np.rot90(lidar_bev, k=1)
+    
     if saving_name is not None:
         imageio.imwrite(saving_name, lidar_bev)
     return lidar_bev

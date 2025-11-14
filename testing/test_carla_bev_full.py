@@ -16,7 +16,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
 from dataset.unified_carla_dataset import CARLAImageDataset
-from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
+from policy.diffusion_dit_nusc_policy import DiffusionDiTCarlaPolicy
 
 
 def load_config(config_path):

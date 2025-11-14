@@ -1,777 +1,630 @@
 """
-Unified CARLA Dataset Loader for PDM Lite and Bench2Drive (B2D) datasets.
+nuScenes Dataset Loader for preprocessed nuScenes data.
 
-This module provides a single CARLAImageDataset class that can handle:
-- PDM Lite dataset (without VQA and meta_action)
-- Bench2Drive (B2D) dataset (with VQA and meta_action)
-
-The dataset automatically handles both types transparently by checking for
-optional fields in the loaded samples.
+This module loads preprocessed nuScenes samples with:
+- BEV features from LIDAR
+- Historical waypoints
+- Future trajectories
+- Navigation commands
+- Ego status (velocity, acceleration, etc.)
 """
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import os
-import io
 import sys
 import pickle
-import glob
-from tqdm import tqdm  
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
-import matplotlib.pyplot as plt
-import textwrap
 
 
 class NUSCDataset(torch.utils.data.Dataset):
     """
-    Unified Dataset for preprocessed PDM Lite and Bench2Drive (B2D) data in 'frame' mode.
+    Dataset for preprocessed nuScenes data with visualization support.
     
-    Each pickle file is a complete training sample with image paths.
-    Images are loaded dynamically in __getitem__.
-    
-    Supports both:
-    - PDM Lite: Basic driving data with waypoints and sensors
-    - Bench2Drive (B2D): Extended driving data with VQA and meta-actions
+    Each sample contains:
+    - lidar_token: BEV features (obs_horizon, 196, 512)
+    - lidar_token_global: Global BEV features (obs_horizon, 1, 512)
+    - hist_waypoints: Historical waypoints in ego frame (obs_horizon, 2)
+    - fut_waypoints: Future waypoints in ego frame (action_horizon, 2)
+    - fut_valid_mask: Valid mask for future waypoints (action_horizon,)
+    - ego_status: Ego vehicle status (10,) - velocity, acceleration, etc.
+    - nav_command: Navigation command (3,) - left, straight, right
     
     Args:
-        dataset_path (str): Directory containing individual frame pkl files
-        image_data_root (str): Base path for images
+        processed_data_path (str): Path to preprocessed pkl file
+        dataset_root (str): Root directory of nuScenes dataset
+        mode (str): 'train' or 'val'
+        load_bev_images (bool): Whether to load BEV images for visualization (default: False for train, True for val)
     """
     
     def __init__(self,
-                 dataset_path: str,
-                 image_data_root: str,
-                 mode: str = 'train'        # train or val
-                 ):
-
-        self.image_data_root = image_data_root
-        self.dataset_path = dataset_path
+                 processed_data_path: str,
+                 dataset_root: str,
+                 mode: str = 'train',
+                 load_bev_images: bool = None):
+        
+        self.dataset_root = dataset_root
         self.mode = mode
-
-        self.image_transform = transforms.Compose([
-            transforms.Resize((256, 928)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
         
-        self.lidar_bev_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+        # Auto-determine whether to load BEV images based on mode
+        if load_bev_images is None:
+            load_bev_images = (mode == 'val')
+        self.load_bev_images = load_bev_images
+        
+        # BEV image transform for visualization
+        if self.load_bev_images:
+            self.lidar_bev_transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225]
+                )
+            ])
+        
+        # Load preprocessed data
+        print(f"Loading preprocessed data from {processed_data_path}...")
+        with open(processed_data_path, 'rb') as f:
+            # Handle numpy version compatibility
+            import sys
+            import numpy
+            sys.modules['numpy._core'] = numpy.core
+            sys.modules['numpy._core.multiarray'] = numpy.core.multiarray
+            
+            data = pickle.load(f)
+        
+        self.samples = data['samples']
+        self.metadata = data['metadata']
+        self.config = data['config']
+        
+        self.obs_horizon = self.config['obs_horizon']
+        self.action_horizon = self.config['action_horizon']
+        
+        print(f"Loaded {len(self.samples)} samples from {self.metadata['version']}")
+        print(f"Config: obs_horizon={self.obs_horizon}, action_horizon={self.action_horizon}")
+        print(f"Load BEV images: {self.load_bev_images}")
     
-        if not os.path.isdir(dataset_path):
-            raise FileNotFoundError(f"Processed data directory not found: {dataset_path}")
-
-        # Load pkl files - support both direct directory and train/val subdirectories
-        train_files = glob.glob(os.path.join(dataset_path, "train", "*.pkl"))
-        val_files = glob.glob(os.path.join(dataset_path, "val", "*.pkl"))
-        direct_files = glob.glob(os.path.join(dataset_path, "*.pkl"))
-        
-        if train_files or val_files:
-            self.sample_files = sorted(train_files + val_files)
-            print(f"Found {len(self.sample_files)} preprocessed samples in '{dataset_path}' "
-                  f"({len(train_files)} train, {len(val_files)} val).")
-        elif direct_files:
-            self.sample_files = sorted(direct_files)
-            print(f"Found {len(self.sample_files)} preprocessed samples in '{dataset_path}'.")
-        else:
-            raise FileNotFoundError(f"No pkl files found in {dataset_path} or its train/val subdirectories.")
-
     def __len__(self):
-        return len(self.sample_files)
-
-    def __getitem__(self, idx):
-        # Load the pickle file
-        sample_path = self.sample_files[idx]
-        with open(sample_path, 'rb') as f:
-            sample = pickle.load(f)
-
-        # load image data for visualization 
-        if self.mode == 'val':
-            image_paths = sample.get('rgb_hist_jpg', [])
-            images_tensor = self.load_image(image_paths, sample_path)
-
-
-        # Load LiDAR BEV features
-        lidar_bev_paths = sample.get('lidar_bev_hist', [])
-        if self.mode == 'val':
-            lidar_bev_tensor = self.load_lidar_bev(lidar_bev_paths, sample_path)
-        
-        lidar_tokens = []
-        lidar_tokens_global = []
-        for bev_path in lidar_bev_paths:
-            if bev_path is None:
-                continue
-            
-            # Infer feature paths from BEV image paths
-            # Example: Town01/data/Route_0/lidar_bev/0000.png 
-            #       -> Town01/data/Route_0/lidar_bev_features/0000_token.pt
-            bev_dir = os.path.dirname(bev_path)
-            frame_id = os.path.splitext(os.path.basename(bev_path))[0]
-            feature_dir = bev_dir.replace('lidar_bev', 'lidar_bev_features')
-                
-            token_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token.pt')
-            token_global_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token_global.pt')
-
-            try:
-                lidar_token = torch.load(token_path, weights_only=True)
-                lidar_token_global = torch.load(token_global_path, weights_only=True)
-                lidar_tokens.append(lidar_token)
-                lidar_tokens_global.append(lidar_token_global)
-            except FileNotFoundError:
-                print(f"Warning: LiDAR feature files not found for {bev_path}")
-                continue
-        
-        if lidar_tokens:
-            lidar_token_tensor = torch.stack(lidar_tokens)  # (obs_horizon, seq_len, 512)
-            lidar_token_global_tensor = torch.stack(lidar_tokens_global)  # (obs_horizon, 1, 512)
-        else:
-            # Fallback if no LiDAR features found
-            lidar_token_tensor = None
-            lidar_token_global_tensor = None
-        
-        # Load VQA features from pt files
-        vqa_paths = sample.get('vqa', [])
-        vqa_features = []
-        for vqa_path in vqa_paths:
-            if vqa_path is None:
-                continue
-            
-            # Load the .pt file
-            full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-            try:
-                vqa_feature = torch.load(full_vqa_path, weights_only=True)
-                vqa_features.append(vqa_feature)
-            except FileNotFoundError:
-                print(f"Warning: VQA feature file not found for {vqa_path}")
-                continue
-        
-        if vqa_features:
-            vqa_feature_tensor = torch.stack(vqa_features)  # (obs_horizon, feature_dim, ...)
-        else:
-            # Fallback if no VQA features found
-            vqa_feature_tensor = None
-        
-        # Convert sample data
-        final_sample = dict()
-        for key, value in sample.items():
-            if key == 'rgb_hist_jpg' and self.mode == 'val':
-                final_sample['rgb_hist_jpg'] = image_paths  
-                final_sample['image'] = images_tensor
-            if key == 'lidar_bev_hist':
-                if self.mode == 'val':
-                    final_sample['lidar_bev'] = lidar_bev_tensor
-                    final_sample['lidar_bev_hist'] = lidar_bev_paths
-                if lidar_token_tensor is not None:
-                    final_sample['lidar_token'] = lidar_token_tensor
-                    final_sample['lidar_token_global'] = lidar_token_global_tensor
-            elif key == 'speed_hist':
-                speed_data = sample['speed_hist']
-                if isinstance(speed_data, np.ndarray):
-                    final_sample['speed'] = torch.from_numpy(speed_data).float()
-                elif isinstance(speed_data, (list, tuple)):
-                    final_sample['speed'] = torch.tensor(speed_data, dtype=torch.float32)
-                else:
-                    final_sample['speed'] = speed_data
-            elif key == 'ego_waypoints':
-                final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
-            elif key == 'vqa':
-                # Load VQA features from pt files
-                if vqa_feature_tensor is not None:
-                    final_sample['vqa'] = vqa_feature_tensor
-                else:
-                    final_sample['vqa'] = None
-            elif isinstance(value, np.ndarray):
-                final_sample[key] = torch.from_numpy(value).float()
-            else:
-                final_sample[key] = value
-        
-        # Get obs_horizon for processing
-        obs_horizon = lidar_token_tensor.shape[0] if lidar_token_tensor is not None else 2
-        final_sample = self.hard_process(final_sample, obs_horizon=obs_horizon)
-
-        return final_sample
-
-    def hard_process(self, final_sample, obs_horizon):
-        """
-        Process sample data:
-        1. Repeat command, next_command, and target_point to match obs_horizon.
-        2. For VQA features, remove time dimension and keep only the last timestep.
-        
-        Args:
-            final_sample (dict): Sample data
-            obs_horizon (int): Number of observation frames
-            
-        Returns:
-            dict: Processed sample with repeated fields and processed VQA
-        """
-        for key in ['command', 'next_command', 'target_point']:
-            if key in final_sample:
-                data = final_sample[key]
-                if isinstance(data, torch.Tensor):
-                    if data.ndim == 1:
-                        data = data.unsqueeze(0)
-                    repeated_data = data.repeat(obs_horizon, 1)
-                    final_sample[key] = repeated_data
-                elif isinstance(data, np.ndarray):
-                    if data.ndim == 1:
-                        data = data[np.newaxis, :]
-                    repeated_data = np.tile(data, (obs_horizon, 1))
-                    final_sample[key] = torch.from_numpy(repeated_data).float()
-                else:
-                    print(f"Warning: Unsupported data type for key '{key}' during hard_process.")
-        
-        # Process VQA features: remove time dimension, keep only last timestep
-        if 'vqa' in final_sample and final_sample['vqa'] is not None:
-            vqa_data = final_sample['vqa']
-            if isinstance(vqa_data, torch.Tensor):
-                if vqa_data.ndim >= 2:
-                    final_sample['vqa'] = vqa_data[-1]  
-                else:
-                    print(f"Warning: VQA data has unexpected shape {vqa_data.shape}")
-            elif isinstance(vqa_data, np.ndarray):
-                if vqa_data.ndim >= 2:
-                    final_sample['vqa'] = torch.from_numpy(vqa_data[-1]).float()
-                else:
-                    print(f"Warning: VQA data has unexpected shape {vqa_data.shape}")
-            else:
-                print(f"Warning: Unsupported data type for VQA during hard_process.")
-        
-        return final_sample
-
-    def load_image(self, image_paths, sample_path):
-        images = []
-        for img_path in image_paths:
-            if img_path is None:
-                # 如果路径为None，创建一个黑色图像
-                images.append(torch.zeros(3, 256, 928))
-                print(f"Warning: Image path is None in sample {sample_path}. Using black image.")
-            else:
-                full_img_path = os.path.join(self.image_data_root, img_path)
-                try:
-                    img = Image.open(full_img_path)
-                    img_tensor = self.image_transform(img)
-                    images.append(img_tensor)
-                except Exception as e:
-                    print(f"Error loading image {full_img_path}: {e}")
-                    images.append(torch.zeros(3, 256, 928))
-        
-        # 堆叠图像
-        if len(images) > 0:
-            images_tensor = torch.stack(images)
-        else:
-            images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
-
-        return images_tensor
-
-    def load_lidar_bev(self, bev_paths, sample_path):
-        images = []
-        for bev_path in bev_paths:
-            if bev_path is None:
-                images.append(torch.zeros(3, 448, 448))
-                print(f"Warning: LiDAR BEV path is None in sample {sample_path}. Using black image.")
-            else:
-                full_bev_path = os.path.join(self.image_data_root, bev_path)
-                bev_image = Image.open(full_bev_path)
-                bev_tensor = self.lidar_bev_transform(bev_image)
-                images.append(bev_tensor)
-
-        if len(images) > 0:
-            images_tensor = torch.stack(images)
-        else:
-            images_tensor = torch.zeros(2, 3, 448, 448)  # 默认obs_horizon=2
-
-        return images_tensor
-
-# ============================================================================
-# Visualization Functions
-# ============================================================================
-
-def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
-    """
-    Visualizes historical waypoints and future predicted waypoints in BEV.
+        return len(self.samples)
     
-    Shows:
-    - Historical waypoints (past ego positions) as blue dots with sequence markers
-    - Future predicted waypoints (agent_pos) as red dots with sequence markers
-    - Current position at origin (0, 0) in black
-    - Target point as green star
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # Load BEV features for all historical frames
+        lidar_tokens = []
+        lidar_token_globals = []
+        
+        if 'hist_bev_token_paths' in sample and 'hist_bev_token_global_paths' in sample:
+            # New format: load historical BEV features
+            for token_path, token_global_path in zip(
+                sample['hist_bev_token_paths'], 
+                sample['hist_bev_token_global_paths']
+            ):
+                try:
+                    token = torch.load(token_path, weights_only=True)
+                    token_global = torch.load(token_global_path, weights_only=True)
+                    lidar_tokens.append(token)
+                    lidar_token_globals.append(token_global)
+                except Exception as e:
+                    print(f"Error loading BEV features from {token_path}: {e}")
+                    # Create dummy features
+                    lidar_tokens.append(torch.zeros(196, 512))
+                    lidar_token_globals.append(torch.zeros(1, 512))
+            
+            # Stack to (obs_horizon, 196, 512) and (obs_horizon, 1, 512)
+            lidar_token = torch.stack(lidar_tokens, dim=0)
+            lidar_token_global = torch.stack(lidar_token_globals, dim=0)
+        else:
+            # Old format: load current frame and repeat (backward compatibility)
+            try:
+                token = torch.load(sample['bev_token_path'], weights_only=True)
+                token_global = torch.load(sample['bev_token_global_path'], weights_only=True)
+            except Exception as e:
+                print(f"Error loading BEV features for sample {idx}: {e}")
+                # Create dummy features
+                token = torch.zeros(196, 512)
+                token_global = torch.zeros(1, 512)
+            
+            # Repeat current frame for obs_horizon
+            # Shape: (196, 512) -> (obs_horizon, 196, 512)
+            lidar_token = token.unsqueeze(0).repeat(self.obs_horizon, 1, 1)
+            # Shape: (1, 512) -> (obs_horizon, 1, 512)
+            lidar_token_global = token_global.unsqueeze(0).repeat(self.obs_horizon, 1, 1)
+        
+        # Convert numpy arrays to tensors (using torch.tensor for compatibility)
+        hist_waypoints = torch.tensor(sample['hist_waypoints'], dtype=torch.float32)  # (obs_horizon, 2)
+        fut_waypoints = torch.tensor(sample['fut_waypoints'], dtype=torch.float32)    # (action_horizon, 2)
+        fut_valid_mask = torch.tensor(sample['fut_valid_mask'], dtype=torch.bool)     # (action_horizon,)
+        
+        # Load historical ego_status and nav_command
+        if 'hist_ego_status' in sample and 'hist_nav_command' in sample:
+            # New format: use historical data
+            ego_status = torch.tensor(sample['hist_ego_status'], dtype=torch.float32)  # (obs_horizon, 10)
+            nav_command = torch.tensor(sample['hist_nav_command'], dtype=torch.float32)  # (obs_horizon, 3)
+        else:
+            # Old format: repeat current frame (backward compatibility)
+            ego_status_single = torch.tensor(sample['ego_status'], dtype=torch.float32)  # (10,)
+            nav_command_single = torch.tensor(sample['nav_command'], dtype=torch.float32)  # (3,)
+            ego_status = ego_status_single.unsqueeze(0).repeat(self.obs_horizon, 1)  # (obs_horizon, 10)
+            nav_command = nav_command_single.unsqueeze(0).repeat(self.obs_horizon, 1)  # (obs_horizon, 3)
+        
+        # Concatenate ego_status and nav_command into single vector
+        # ego_status: (obs_horizon, 10) - [accel(3), rot_rate(3), vel(3), steer(1)]
+        # nav_command: (obs_horizon, 3) - [left, straight, right]
+        # Combined: (obs_horizon, 13)
+        ego_status_with_command = torch.cat([ego_status, nav_command], dim=-1)
+        
+        # Load obstacle information for future frames
+        fut_obstacles = []
+        if 'fut_obstacles' in sample:
+            for obs_dict in sample['fut_obstacles']:
+                fut_obstacles.append({
+                    'gt_boxes': torch.tensor(obs_dict['gt_boxes'], dtype=torch.float32),  # (N, 7)
+                    'gt_names': obs_dict['gt_names'],  # (N,) numpy array of strings
+                    'gt_velocity': torch.tensor(obs_dict['gt_velocity'], dtype=torch.float32),  # (N, 2)
+                })
+        
+        # Prepare output dictionary
+        output = {
+            # BEV features
+            'lidar_token': lidar_token,                    # (obs_horizon, 196, 512)
+            'lidar_token_global': lidar_token_global,      # (obs_horizon, 1, 512)
+            
+            # Waypoints
+            'hist_waypoints': hist_waypoints,              # (obs_horizon, 2)
+            'agent_pos': fut_waypoints,                    # (action_horizon, 2) - target trajectory
+            
+            # Valid mask
+            'fut_valid_mask': fut_valid_mask,              # (action_horizon,)
+            
+            # Ego status with command concatenated (obs_horizon dimension)
+            'ego_status': ego_status_with_command,         # (obs_horizon, 13) - [ego_status(10), command(3)]
+            'command': nav_command,                        # (obs_horizon, 3) - kept for compatibility
+            
+            # Obstacle information for future frames
+            'fut_obstacles': fut_obstacles,                # List of action_horizon dicts with gt_boxes, gt_names, gt_velocity
+            
+            # Metadata
+            'scene_token': sample['scene_token'],
+            'sample_token': sample['sample_token'],
+            'timestamp': sample['timestamp'],
+            'lidar_token_str': sample['lidar_token'],
+        }
+        
+        # Load BEV image for visualization if requested
+        if self.load_bev_images:
+            lidar_token = sample['lidar_token']
+            
+            # Construct BEV image path
+            bev_image_path = os.path.join(
+                self.dataset_root,
+                'samples',
+                'LIDAR_TOP_BEV',
+                f'{lidar_token}.png'
+            )
+            
+            try:
+                bev_image = Image.open(bev_image_path).convert('RGB')
+                # Convert to numpy array then to tensor for compatibility
+                bev_np = np.array(bev_image, dtype=np.float32) / 255.0
+                bev_tensor = torch.tensor(bev_np, dtype=torch.float32).permute(2, 0, 1)
+                # Apply normalization
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                bev_tensor = (bev_tensor - mean) / std
+                # Repeat for obs_horizon
+                output['lidar_bev'] = bev_tensor.unsqueeze(0).repeat(self.obs_horizon, 1, 1, 1)
+                output['lidar_bev_path'] = bev_image_path
+            except Exception as e:
+                print(f"Warning: Could not load BEV image {bev_image_path}: {e}")
+                output['lidar_bev'] = torch.zeros(self.obs_horizon, 3, 448, 448)
+                output['lidar_bev_path'] = None
+        
+        return output
+
+
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def collate_fn(batch):
+    """
+    Custom collate function to handle variable-length sequences.
+    Handles fut_obstacles with variable number of obstacles per frame.
+    """
+    # Stack all tensors in the batch
+    output = {}
+    
+    for key in batch[0].keys():
+        if key == 'fut_obstacles':
+            # Keep fut_obstacles as list of lists (batch, action_horizon)
+            # Each element contains dict with variable-length tensors
+            output[key] = [sample[key] for sample in batch]
+        elif isinstance(batch[0][key], torch.Tensor):
+            output[key] = torch.stack([sample[key] for sample in batch])
+        elif isinstance(batch[0][key], (str, int, float)):
+            output[key] = [sample[key] for sample in batch]
+        else:
+            output[key] = [sample[key] for sample in batch]
+    
+    return output
+
+
+def visualize_sample(sample, save_path=None):
+    """
+    Visualize a single sample with waypoints, obstacles, and BEV image.
     
     Args:
-        sample (dict): Data sample containing 'agent_pos', 'waypoints_hist', 'target_point'
-        obs_horizon (int): Number of observation frames
-        rand_idx (int): Sample index for saving
-        save_dir (str): Directory to save visualization
+        sample: Dictionary containing sample data
+        save_path: Path to save the visualization (optional)
     """
-    agent_pos = sample.get('agent_pos')
-    waypoints_hist = sample.get('waypoints_hist')
-    target_point = sample.get('target_point')
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend to avoid display issues
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
     
-    if agent_pos is None:
-        print("'agent_pos' not in sample. Skipping trajectory visualization.")
-        return
-
-    # Convert to numpy if needed
-    if isinstance(agent_pos, torch.Tensor):
-        agent_pos = agent_pos.numpy()
-    if isinstance(waypoints_hist, torch.Tensor):
-        waypoints_hist = waypoints_hist.numpy()
-    if isinstance(target_point, torch.Tensor):
-        target_point = target_point.numpy()
+    fig, axes = plt.subplots(1, 3, figsize=(27, 7))
     
-    plt.figure(figsize=(10, 10))
+    # Plot 1: Waypoints and Obstacles
+    ax1 = axes[0]
     
-    # ========== Plot Historical Waypoints ==========
-    if waypoints_hist is not None and len(waypoints_hist) > 0:
-        # waypoints_hist shape: (obs_horizon, 2)
-        # Plot line connecting historical points
-        plt.plot(waypoints_hist[:, 1], waypoints_hist[:, 0], 'b-', 
-                linewidth=1.5, alpha=0.5, label='History trajectory', zorder=2)
+    # NOTE: In our data, x is forward (longitudinal), y is lateral
+    # For visualization, we swap them so forward (x) appears upward on the plot
+    # Plot coordinates: horizontal=y (lateral), vertical=x (forward)
+    
+    # Historical waypoints (blue)
+    hist_wp = sample['hist_waypoints'].cpu().numpy()
+    ax1.plot(hist_wp[:, 1], hist_wp[:, 0], 'b.-', label='Historical', markersize=10, linewidth=2)
+    
+    # Future waypoints (red)
+    fut_wp = sample['agent_pos'].cpu().numpy()
+    valid_mask = sample['fut_valid_mask'].cpu().numpy()
+    ax1.plot(fut_wp[:, 1], fut_wp[:, 0], 'r.-', label='Future', markersize=10, linewidth=2)
+    
+    # Mark invalid waypoints
+    invalid_wp = fut_wp[~valid_mask]
+    if len(invalid_wp) > 0:
+        ax1.scatter(invalid_wp[:, 1], invalid_wp[:, 0], c='orange', s=100, 
+                   marker='x', label='Invalid', zorder=10)
+    
+    # Current position (ego vehicle)
+    ax1.scatter(0, 0, c='green', s=200, marker='*', label='Ego (Current)', zorder=10)
+    
+    # Draw ego vehicle as a rectangle
+    # ego_length (x-direction) will be vertical, ego_width (y-direction) will be horizontal
+    ego_length = 4.084
+    ego_width = 1.730
+    ego_rect = patches.Rectangle(
+        (-ego_width/2, -ego_length/2), ego_width, ego_length,
+        linewidth=2, edgecolor='green', facecolor='lightgreen', alpha=0.5, zorder=5
+    )
+    ax1.add_patch(ego_rect)
+    
+    # Visualize obstacles from the first future frame (if available)
+    if 'fut_obstacles' in sample and len(sample['fut_obstacles']) > 0:
+        obstacles_frame_0 = sample['fut_obstacles'][0]  # First future frame
+        gt_boxes = obstacles_frame_0['gt_boxes'].cpu().numpy()  # (N, 7) [x, y, z, w, l, h, yaw]
+        gt_names = obstacles_frame_0['gt_names']  # (N,) string array
         
-        # Plot each historical waypoint as discrete point
-        for i, waypoint in enumerate(waypoints_hist[:-1]):  # Exclude last (current frame)
-            plt.plot(waypoint[1], waypoint[0], 'bo', markersize=8, zorder=3)
-            # Add time label
-            plt.text(waypoint[1] + 0.3, waypoint[0] + 0.3, f't-{obs_horizon-1-i}', 
-                    fontsize=9, ha='center', color='blue', fontweight='bold')
-    
-    # ========== Plot Current Position (Origin) ==========
-    plt.plot(0, 0, 'ko', markersize=15, label='Current position (t=0)', 
-            markeredgecolor='yellow', markeredgewidth=2, zorder=5)
-    plt.text(0.3, -0.5, 't=0', fontsize=10, ha='center', 
-            color='black', fontweight='bold', bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
-    
-    # ========== Plot Future Waypoints (Predictions) ==========
-    if len(agent_pos) > 0:
-        # Plot line connecting future points
-        future_waypoints = np.vstack([[[0, 0]], agent_pos])
-        plt.plot(future_waypoints[:, 1], future_waypoints[:, 0], 'r--', 
-                linewidth=2, alpha=0.6, label='Predicted trajectory', zorder=2)
+        # Color map for different obstacle types
+        color_map = {
+            'car': 'red',
+            'truck': 'darkred',
+            'bus': 'orange',
+            'pedestrian': 'blue',
+            'bicycle': 'cyan',
+            'motorcycle': 'magenta',
+            'traffic_cone': 'yellow',
+            'barrier': 'gray',
+            'construction_vehicle': 'brown',
+            'trailer': 'pink',
+        }
         
-        # Plot each future waypoint as discrete point
-        for i, waypoint in enumerate(agent_pos, 1):
-            plt.plot(waypoint[1], waypoint[0], 'r^', markersize=10, 
-                    markeredgecolor='darkred', markeredgewidth=1, zorder=4)
-            # Add time label
-            plt.text(waypoint[1] - 0.3, waypoint[0] - 0.3, f't+{i}', 
-                    fontsize=9, ha='center', color='red', fontweight='bold')
+        # Limit visualization to nearby obstacles (within 60m)
+        max_dist = 60.0
+        obstacles_drawn = 0
+        
+        for i, (box, name) in enumerate(zip(gt_boxes, gt_names)):
+            # gt_boxes format: [x, y, z, l, w, h, yaw]
+            # where l=length (x-direction), w=width (y-direction)
+            x, y, z, l, w, h, yaw = box
+            
+            # Skip if too far
+            dist = np.sqrt(x**2 + y**2)
+            if dist > max_dist:
+                continue
+            
+            # Get color for this obstacle type
+            color = color_map.get(name, 'purple')
+            
+            # Draw bounding box (2D top-down view)
+            # Data frame: x=forward, y=lateral (left), yaw=rotation around z-axis
+            # Plot frame: horizontal=y (lateral), vertical=x (forward)
+            
+            # Step 1: Compute corners in data frame
+            # gt_boxes format: l=length(x-direction), w=width(y-direction)
+            # Box corners in local frame (before rotation)
+            corners_local = np.array([
+                [l/2,  w/2],   # right-front
+                [l/2, -w/2],   # left-front
+                [-l/2, -w/2],  # left-rear
+                [-l/2,  w/2]   # right-rear
+            ])
+            
+            # Rotation matrix in data frame
+            cos_yaw = np.cos(yaw)
+            sin_yaw = np.sin(yaw)
+            rotation_matrix = np.array([[cos_yaw, -sin_yaw],
+                                       [sin_yaw, cos_yaw]])
+            
+            # Rotate and translate in data frame
+            corners_data = (rotation_matrix @ corners_local.T).T + np.array([x, y])
+            
+            # Step 2: Convert to plot frame by swapping x and y
+            corners_plot = corners_data[:, [1, 0]]  # Swap columns: [x, y] -> [y, x]
+            
+            # Create polygon
+            polygon = patches.Polygon(
+                corners_plot, closed=True,
+                linewidth=1.5, edgecolor=color, facecolor=color, alpha=0.3
+            )
+            ax1.add_patch(polygon)
+            
+            # Add center point (also swap coordinates)
+            ax1.scatter(y, x, c=color, s=20, marker='o', alpha=0.7)
+            
+            obstacles_drawn += 1
+            
+            # Limit total obstacles drawn for clarity
+            if obstacles_drawn >= 30:
+                break
+        
+        # Add legend entry for obstacles
+        if obstacles_drawn > 0:
+            ax1.scatter([], [], c='gray', s=100, marker='s', alpha=0.3, 
+                       label=f'Obstacles (t+1, {obstacles_drawn} shown)')
     
-    # ========== Plot Target Point ==========
-    if target_point is not None:
-        if target_point.ndim == 2:
-            target_point = target_point[0]
-        plt.plot(target_point[1], target_point[0], 'g*', markersize=25, 
-                label='Target point', markeredgecolor='darkgreen', markeredgewidth=1.5, zorder=6)
-        plt.text(target_point[1] + 0.5, target_point[0] + 0.5, 'Goal', 
-                fontsize=10, ha='center', color='green', fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.7))
+    # Axis labels: horizontal is lateral (y), vertical is forward (x)
+    ax1.set_xlabel('Lateral (Y) [meters]', fontsize=12)
+    ax1.set_ylabel('Forward (X) [meters]', fontsize=12)
+    ax1.set_title('Trajectory and Obstacles (Ego Frame)', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    ax1.axis('equal')
+    ax1.set_xlim(-30, 30)   # Lateral range (y-axis in data)
+    ax1.set_ylim(-20, 60)   # Forward range (x-axis in data)
     
-    # ========== Formatting ==========
-    plt.xlabel('Y (ego frame, lateral / m)', fontsize=12, fontweight='bold')
-    plt.ylabel('X (ego frame, longitudinal / m)', fontsize=12, fontweight='bold')
-    plt.title(f'Sample {rand_idx}: Trajectory Visualization\n(History + Future Predictions in Ego Coordinate Frame)', 
-              fontsize=13, fontweight='bold')
+    # Plot 2: Future Obstacle Motion Visualization
+    ax2 = axes[1]
     
-    plt.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-    plt.axis('equal')
-    plt.gca().set_aspect('equal', adjustable='box')
+    # Draw ego trajectory first
+    ax2.plot(hist_wp[:, 1], hist_wp[:, 0], 'b.-', label='Historical', markersize=8, linewidth=1.5, alpha=0.7)
+    ax2.plot(fut_wp[:, 1], fut_wp[:, 0], 'r.-', label='Future Traj', markersize=8, linewidth=1.5, alpha=0.7)
+    ax2.scatter(0, 0, c='green', s=200, marker='*', label='Ego (Current)', zorder=10)
     
-    # Add legend with custom formatting
-    plt.legend(fontsize=10, loc='best', framealpha=0.95, edgecolor='black')
+    # Draw current ego vehicle
+    ego_rect = patches.Rectangle(
+        (-ego_width/2, -ego_length/2), ego_width, ego_length,
+        linewidth=2, edgecolor='green', facecolor='lightgreen', alpha=0.5, zorder=5
+    )
+    ax2.add_patch(ego_rect)
     
-    # Add axis line at origin
-    plt.axhline(y=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
-    plt.axvline(x=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    # Visualize obstacles across all future frames with motion trails
+    if 'fut_obstacles' in sample and len(sample['fut_obstacles']) > 0:
+        # Color gradient for time progression
+        import matplotlib.cm as cm
+        num_future_frames = len(sample['fut_obstacles'])
+        colors = cm.Reds(np.linspace(0.3, 0.9, num_future_frames))
+        
+        # Track obstacle positions across frames to draw motion trails
+        obstacle_tracks = {}  # key: obstacle index in first frame, value: list of positions
+        
+        color_map = {
+            'car': 'red',
+            'truck': 'darkred',
+            'bus': 'orange',
+            'pedestrian': 'blue',
+            'bicycle': 'cyan',
+            'motorcycle': 'magenta',
+            'traffic_cone': 'yellow',
+            'barrier': 'gray',
+            'construction_vehicle': 'brown',
+            'trailer': 'pink',
+        }
+        
+        max_dist = 60.0
+        obstacles_tracked = 0
+        
+        # For simplicity, track obstacles that appear in the first frame
+        # and show their positions in subsequent frames
+        first_frame_obstacles = sample['fut_obstacles'][0]
+        first_gt_boxes = first_frame_obstacles['gt_boxes'].cpu().numpy()
+        first_gt_names = first_frame_obstacles['gt_names']
+        
+        # Iterate through each obstacle in the first frame
+        for obs_idx, (box, name) in enumerate(zip(first_gt_boxes, first_gt_names)):
+            x, y, z, l, w, h, yaw = box
+            dist = np.sqrt(x**2 + y**2)
+            if dist > max_dist:
+                continue
+            
+            # Draw obstacle boxes at each timestep with transparency
+            for frame_idx in range(num_future_frames):
+                if frame_idx < len(sample['fut_obstacles']):
+                    frame_obstacles = sample['fut_obstacles'][frame_idx]
+                    if obs_idx < len(frame_obstacles['gt_boxes']):
+                        box = frame_obstacles['gt_boxes'][obs_idx].cpu().numpy()
+                        x, y, z, l, w, h, yaw = box
+                        
+                        # Compute corners
+                        corners_local = np.array([
+                            [l/2,  w/2],
+                            [l/2, -w/2],
+                            [-l/2, -w/2],
+                            [-l/2,  w/2]
+                        ])
+                        
+                        cos_yaw = np.cos(yaw)
+                        sin_yaw = np.sin(yaw)
+                        rotation_matrix = np.array([[cos_yaw, -sin_yaw],
+                                                   [sin_yaw, cos_yaw]])
+                        
+                        corners_data = (rotation_matrix @ corners_local.T).T + np.array([x, y])
+                        corners_plot = corners_data[:, [1, 0]]
+                        
+                        # Alpha decreases with time (earlier frames more transparent)
+                        alpha = 0.15 + 0.25 * (frame_idx / max(1, num_future_frames - 1))
+                        
+                        polygon = patches.Polygon(
+                            corners_plot, closed=True,
+                            linewidth=1.0, edgecolor=color_map.get(name, 'purple'), 
+                            facecolor=color_map.get(name, 'purple'), alpha=alpha
+                        )
+                        ax2.add_patch(polygon)
+                        
+                        # Add small marker at obstacle center
+                        if frame_idx == 0:  # First frame: larger marker
+                            ax2.scatter(y, x, c=color_map.get(name, 'purple'), s=30, marker='o', alpha=0.8, zorder=3)
+                        else:  # Future frames: smaller markers
+                            ax2.scatter(y, x, c=color_map.get(name, 'purple'), s=15, marker='o', alpha=0.6, zorder=3)
+            
+            obstacles_tracked += 1
+            if obstacles_tracked >= 20:  # Limit for clarity
+                break
+        
+        if obstacles_tracked > 0:
+            # Add legend entry
+            ax2.scatter([], [], c='gray', s=100, marker='s', alpha=0.3, 
+                       label=f'Obstacles Motion ({obstacles_tracked} tracked)')
     
-    # Set minimum axis range (at least 1m on each side)
-    xlim = plt.gca().get_xlim()
-    ylim = plt.gca().get_ylim()
+    ax2.set_xlabel('Lateral (Y) [meters]', fontsize=12)
+    ax2.set_ylabel('Forward (X) [meters]', fontsize=12)
+    ax2.set_title(f'Future Obstacle Motion ({num_future_frames} frames)', fontsize=14, fontweight='bold')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+    ax2.axis('equal')
+    ax2.set_xlim(-30, 30)
+    ax2.set_ylim(-20, 60)
     
-    # Ensure minimum range of 1m in each direction from origin
-    x_range = max(1.0, abs(xlim[1] - xlim[0]) / 2)
-    y_range = max(1.0, abs(ylim[1] - ylim[0]) / 2)
+    # Plot 3: BEV image (if available)
+    ax3 = axes[2]
+    if 'lidar_bev' in sample and sample['lidar_bev'] is not None:
+        # Take the last frame from obs_horizon
+        bev_tensor = sample['lidar_bev'][-1].cpu()
+        # Denormalize
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        bev_tensor = bev_tensor * std + mean
+        bev_tensor = torch.clamp(bev_tensor, 0, 1)
+        bev_img = bev_tensor.numpy().transpose(1, 2, 0)
+        ax3.imshow(bev_img)
+        ax3.set_title('BEV Image (Current Frame)', fontsize=14, fontweight='bold')
+    else:
+        ax3.text(0.5, 0.5, 'No BEV Image', ha='center', va='center', fontsize=20)
+        ax3.set_title('BEV Image (Not Available)', fontsize=14, fontweight='bold')
+    ax3.axis('off')
     
-    plt.xlim(-x_range, x_range)
-    plt.ylim(-y_range, y_range)
+    # Add info text
+    nav_cmd = sample['command'][0].cpu()
+    cmd_names = ['Left', 'Straight', 'Right']
+    cmd_idx = torch.argmax(nav_cmd).item()
+    # ego_status is now (obs_horizon, 13) - [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
+    # Extract velocity from first frame: vel is at indices 6:9
+    ego_status = sample['ego_status'][0].cpu()  # (13,)
+    vel_x, vel_y, vel_z = ego_status[6], ego_status[7], ego_status[8]
+    speed = torch.sqrt(vel_x**2 + vel_y**2 + vel_z**2).item()
     
-    plt.subplots_adjust(left=0.1, right=0.95, top=0.93, bottom=0.1)
+    # Count obstacles
+    num_obstacles = 0
+    if 'fut_obstacles' in sample and len(sample['fut_obstacles']) > 0:
+        num_obstacles = len(sample['fut_obstacles'][0]['gt_boxes'])
     
-    # Save figure
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'sample_{rand_idx}_trajectory.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
-    plt.show()
-    print(f"✓ 保存轨迹可视化到: {save_path}")    # ========== Formatting ==========
-    plt.xlabel('Y (ego frame, lateral / m)', fontsize=13, fontweight='bold')
-    plt.ylabel('X (ego frame, longitudinal / m)', fontsize=13, fontweight='bold')
-    plt.title(f'Sample {rand_idx}: Trajectory Visualization\n'
-              f'(History + Future Predictions in Ego Coordinate Frame)', 
-              fontsize=14, fontweight='bold')
+    info_text = f"Command: {cmd_names[cmd_idx]} | Speed: {speed:.2f} m/s | "
+    info_text += f"Obstacles: {num_obstacles} | Scene: {sample['scene_token'][:8]}..."
     
-    plt.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-
-    
-    # Add legend with custom formatting
-    plt.legend(fontsize=11, loc='best', framealpha=0.95, edgecolor='black')
-    
-    # Add axis line at origin
-    plt.axhline(y=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
-    plt.axvline(x=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    fig.suptitle(info_text, fontsize=13, y=0.98, fontweight='bold')
     
     plt.tight_layout()
     
-    # Save figure
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'sample_{rand_idx}_trajectory.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-    print(f"✓ 保存轨迹可视化到: {save_path}")
-
-
-def visualize_observation_images(sample, obs_horizon, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
-    """
-    Visualizes and saves the observation images from a sample.
-    
-    Args:
-        sample (dict): Data sample
-        obs_horizon (int): Number of observation frames
-        rand_idx (int): Sample index for saving
-        save_dir (str): Directory to save visualization
-    """
-    if 'image' not in sample:
-        print("'image' not in sample. Skipping image visualization.")
-        return
-        
-    images = sample['image']  # shape: (obs_horizon, C, H, W)
-    
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    for t, img_tensor in enumerate(images):
-        if isinstance(img_tensor, torch.Tensor):
-            img_tensor = img_tensor * std + mean
-            img_tensor = torch.clamp(img_tensor, 0, 1)
-            img_arr = img_tensor.numpy()
-        else:
-            img_arr = img_tensor
-            
-        if img_arr.shape[0] == 3:
-            img_vis = np.moveaxis(img_arr, 0, -1)
-            img_vis = (img_vis * 255).astype(np.uint8)
-        else:
-            img_vis = img_arr.astype(np.uint8)
-        
-        plt.figure(figsize=(20, 5))
-        plt.imshow(img_vis)
-        plt.title(f'Random Sample {rand_idx} - Obs Image t={t}', fontsize=12)
-        plt.axis('off')
-        plt.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.05)
-
-        save_path = os.path.join(save_dir, f'sample_{rand_idx}_obs_image_t{t}.png')
+    if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved visualization to {save_path}")
+    else:
         plt.show()
-        print(f"保存观测图像到: {save_path}")
-
-
-def visualize_vqa_on_image(sample, obs_horizon, rand_idx, max_qa_pairs=5, 
-                          save_dir='/home/wang/Project/MoT-DP/image'):
-    """
-    Visualizes VQA content and meta-actions as overlay on the observation image.
     
-    B2D dataset specific visualization that includes VQA and meta-action information.
-    
-    Args:
-        sample (dict): Data sample containing 'image' and optional 'vqa' fields
-        obs_horizon (int): Number of observation frames
-        rand_idx (int): Sample index for saving
-        max_qa_pairs (int): Maximum number of QA pairs to display per category
-        save_dir (str): Directory to save visualization
-    """
-    if 'image' not in sample:
-        print("'image' not in sample. Skipping VQA visualization.")
-        return
-    
-    images = sample['image']
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    
-    # Use the last observation image (most recent frame)
-    img_tensor = images[-1]
-    
-    if isinstance(img_tensor, torch.Tensor):
-        img_tensor = img_tensor * std + mean
-        img_tensor = torch.clamp(img_tensor, 0, 1)
-        img_arr = img_tensor.numpy()
-    else:
-        img_arr = img_tensor
-        
-    if img_arr.shape[0] == 3:
-        img_vis = np.moveaxis(img_arr, 0, -1)
-        img_vis = (img_vis * 255).astype(np.uint8)
-    else:
-        img_vis = img_arr.astype(np.uint8)
-    
-    # Convert to PIL Image for drawing
-    pil_img = Image.fromarray(img_vis)
-    img_width, img_height = pil_img.size
-    
-    canvas_width = img_width + 400
-    canvas_height = img_height
-    canvas = Image.new('RGB', (canvas_width, canvas_height), color=(255, 255, 255))
-    canvas.paste(pil_img, (0, 0))
-    
-    draw = ImageDraw.Draw(canvas)
-    
-    # Load fonts
-    try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
-        font_text = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
-    except:
-        font_title = ImageFont.load_default()
-        font_text = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-    
-    text_x = img_width + 10
-    text_y = 10
-    
-    # Draw Meta Actions
-    draw.text((text_x, text_y), "Meta Actions", fill=(0, 0, 0), font=font_title)
-    text_y += 30
-    text_y += 20
-    draw.text((text_x, text_y), "═══ META ACTIONS ═══", fill=(150, 50, 50), font=font_title)
-    text_y += 25
-    
-    # Display meta_action_direction
-    if 'meta_action_direction' in sample:
-        meta_dir = sample['meta_action_direction']
-        direction_value = _extract_value(meta_dir)
-        
-        direction_map = {
-            'FOLLOW_LANE': 'Follow Lane',
-            'CHANGE_LANE_LEFT': 'Change Lane Left',
-            'CHANGE_LANE_RIGHT': 'Change Lane Right',
-            'GO_STRAIGHT': 'Go Straight',
-            'TURN_LEFT': 'Turn Left',
-            'TURN_RIGHT': 'Turn Right'
-        }
-        direction_str = direction_map.get(direction_value, str(direction_value))
-        draw.text((text_x, text_y), f"Direction: {direction_str}", 
-                 fill=(0, 0, 150), font=font_text)
-        text_y += 20
-    
-    # Display meta_action_speed
-    if 'meta_action_speed' in sample:
-        meta_speed = sample['meta_action_speed']
-        speed_value = _extract_value(meta_speed)
-        
-        speed_map = {
-            'KEEP': 'Keep Speed',
-            'ACCELERATE': 'Accelerate',
-            'DECELERATE': 'Decelerate',
-            'STOP': 'Stop'
-        }
-        speed_str = speed_map.get(speed_value, str(speed_value))
-        draw.text((text_x, text_y), f"Speed: {speed_str}", 
-                 fill=(0, 150, 0), font=font_text)
-        text_y += 20
-    
-    canvas_np = np.array(canvas)
-    
-    plt.figure(figsize=(18, 10))
-    plt.imshow(canvas_np)
-    plt.title(f'Sample {rand_idx} - Image with Meta Actions', fontsize=12, fontweight='bold')
-    plt.axis('off')
-    plt.subplots_adjust(left=0.01, right=0.99, top=0.97, bottom=0.01)
-    
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'sample_{rand_idx}_meta_actions.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-    print(f"保存Meta Actions图像到: {save_path}")
-
-
-def _extract_value(data):
-    """Helper function to extract value from different data types."""
-    if isinstance(data, str):
-        return data
-    elif isinstance(data, (list, np.ndarray)):
-        return data[0]
-    elif isinstance(data, torch.Tensor):
-        if data.numel() == 1:
-            return data.item()
-        else:
-            return data[0].item() if data[0].numel() == 1 else str(data[0])
-    else:
-        return str(data)
-
-
-def print_sample_details(sample, dataset, rand_idx, obs_horizon, 
-                        save_dir='/home/wang/Project/MoT-DP/image'):
-    """
-    Prints detailed information about a sample and the dataset.
-    
-    Args:
-        sample (dict): Data sample
-        dataset (CARLAImageDataset): Dataset object
-        rand_idx (int): Sample index
-        obs_horizon (int): Number of observation frames
-        save_dir (str): Directory for saving visualizations
-    """
-    print(f"\n样本 {rand_idx} 的详细信息:")
-    
-    agent_pos = sample.get('agent_pos')
-    if agent_pos is not None:
-        obs_agent_pos = agent_pos[:obs_horizon]
-        pred_agent_pos = agent_pos[obs_horizon:]
-        print(f"观测位置: {obs_agent_pos}")
-        print(f"预测位置: {pred_agent_pos}")
-
-    target_point = sample.get('target_point')
-    if target_point is not None:
-        if target_point.ndim == 2:
-            target_point = target_point[0]
-        print(f"目标点 (相对): {target_point}")
-        if agent_pos is not None and len(agent_pos) > obs_horizon - 1:
-            last_obs = agent_pos[obs_horizon - 1]
-            distance_to_target = np.linalg.norm(target_point - last_obs)
-            print(f"目标点距离最后观测点的距离: {distance_to_target:.3f}")
-
-    print(f"\nDataset length: {len(dataset)}")
-    first_sample = dataset[0]
-    print("Sample keys:", first_sample.keys())
-    if 'image' in first_sample:
-        print("Image shape:", first_sample['image'].shape)
-    if 'agent_pos' in first_sample:
-        print("Agent pos shape:", first_sample['agent_pos'].shape)
-
-    print("\nKey fields:")
-    for key in ['town_name', 'speed', 'command', 'next_command', 'target_point', 
-                'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed', 'vqa']:
-        if key in first_sample:
-            value = first_sample[key]
-            print(f"  {key}: shape={getattr(value, 'shape', 'N/A')}, type={type(value)}")
-            if hasattr(value, '__len__') and not isinstance(value, str):
-                print(f"    Length: {len(value)}")
+    plt.close()
 
 
 # ============================================================================
-# Test Function
+# Test Code
 # ============================================================================
 
-def test_pdm():
-    """Test with PDM Lite dataset."""
-    import random
-    
-    dataset_path = '/home/wang/Project/carla_garage/tmp_data'
-    obs_horizon = 2
-    
-    print("\n========== Testing PDM Lite Dataset ==========")
-    dataset = NUSCDataset(
-        dataset_path=dataset_path,
-        image_data_root='/home/wang/Project/carla_garage/data'
-    )
-    
-    print(f"\n总样本数: {len(dataset)}")
-    if len(dataset) == 0:
-        print("数据为空，无法进行测试。")
-        return
-
-    rand_idx = random.choice(range(len(dataset)))
-    rand_sample = dataset[rand_idx]
-    print(f"\n随机选择的样本索引: {rand_idx}")
-
-    print("\nSample keys:", rand_sample.keys())
-    for key, value in rand_sample.items():
-        if isinstance(value, torch.Tensor):
-            print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
-        else:
-            print(f"  {key}: type={type(value)}")
-
-    visualize_trajectory(rand_sample, obs_horizon, rand_idx)
-    print_sample_details(rand_sample, dataset, rand_idx, obs_horizon)
-
-
-def test_b2d():
-    """Test with Bench2Drive (B2D) dataset."""
-    import random
-    
-    dataset_path = '/home/wang/Dataset/b2d_10scene/tmp_data'
-    obs_horizon = 2
-    
-    print("\n========== Testing Bench2Drive (B2D) Dataset ==========")
-    dataset = NUSCDataset(
-        dataset_path=dataset_path,
-        image_data_root='/home/wang/Dataset/b2d_10scene'
-    )
-    
-    print(f"\n总样本数: {len(dataset)}")
-    if len(dataset) == 0:
-        print("数据为空，无法进行测试。")
-        return
-
-    rand_idx = random.choice(range(len(dataset)))
-    rand_sample = dataset[rand_idx]
-    print(f"\n随机选择的样本索引: {rand_idx}")
-
-    print("\nSample keys:", rand_sample.keys())
-    for key, value in rand_sample.items():
-        if isinstance(value, torch.Tensor):
-            print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
-        else:
-            print(f"  {key}: type={type(value)}")
-
-    visualize_trajectory(rand_sample, obs_horizon, rand_idx)
-    visualize_vqa_on_image(rand_sample, obs_horizon, rand_idx)
-    print_sample_details(rand_sample, dataset, rand_idx, obs_horizon)
-
-
-def test():
-    """Test with default configuration."""
-    import random
-
-    dataset_path = '/home/wang/Project/carla_garage/tmp_data'
-    # dataset_path = '/root/data/z_projects/PDM_Lite_processed_2obs_4hz'
-    obs_horizon = 2
-    
-    dataset = NUSCDataset(
-        dataset_path=dataset_path,
-        image_data_root='/home/wang/Project/carla_garage/data' 
-        # image_data_root= '/root/data/pdm_lite/'
-    )
-
-    print(f"\n总样本数: {len(dataset)}")
-    if len(dataset) == 0:
-        print("数据为空，无法进行测试。")
-        return
-
-    rand_idx = random.choice(range(len(dataset)))
-    rand_sample = dataset[rand_idx]
-    print(f"\n随机选择的样本索引: {rand_idx}")
-
-    print("\nSample keys:", rand_sample.keys())
-    for key, value in rand_sample.items():
-        if isinstance(value, torch.Tensor):
-            print(f"  {key}: shape={value.shape}, dtype={value.dtype}, device={value.device}")
-        else:
-            print(f"  {key}: value={value}")
-
-    visualize_trajectory(rand_sample, obs_horizon, rand_idx)
-    print_sample_details(rand_sample, dataset, rand_idx, obs_horizon)
-
-    
 if __name__ == "__main__":
-    # test_pdm()
-    # test_b2d()
-    test()
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--processed_data', type=str, 
+                       default='/home/wang/Dataset/v1.0-mini/processed_data/nuscenes_processed_train.pkl',
+                       help='Path to preprocessed data')
+    parser.add_argument('--dataset_root', type=str,
+                       default='/home/wang/Dataset/v1.0-mini',
+                       help='Root directory of nuScenes dataset')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'val'])
+    parser.add_argument('--visualize', default=True, action='store_true', help='Visualize samples')
+    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples to visualize')
+    
+    args = parser.parse_args()
+    
+    # Create dataset
+    dataset = NUSCDataset(
+        processed_data_path=args.processed_data,
+        dataset_root=args.dataset_root,
+        mode=args.mode,
+        load_bev_images=args.visualize  # Load BEV images if visualization is requested
+    )
+    
+    print(f"\n{'='*70}")
+    print(f"Dataset Statistics:")
+    print(f"{'='*70}")
+    print(f"Total samples: {len(dataset)}")
+    print(f"Observation horizon: {dataset.obs_horizon}")
+    print(f"Action horizon: {dataset.action_horizon}")
+    
+    # Test loading a few samples
+    print(f"\n{'='*70}")
+    print(f"Testing Sample Loading:")
+    print(f"{'='*70}")
+    
+    for i in range(min(3, len(dataset))):
+        sample = dataset[i]
+        print(f"\nSample {i}:")
+        for key, value in sample.items():
+            if isinstance(value, torch.Tensor):
+                print(f"  {key:25s}: shape={str(value.shape):25s}, dtype={value.dtype}")
+            elif isinstance(value, list) and key == 'fut_obstacles':
+                print(f"  {key:25s}: {len(value)} frames")
+                for frame_idx, obs_dict in enumerate(value):
+                    num_obs = len(obs_dict['gt_boxes'])
+                    print(f"    Frame {frame_idx}: {num_obs} obstacles")
+            elif isinstance(value, (str, int, float)):
+                value_str = str(value) if len(str(value)) < 50 else str(value)[:50] + '...'
+                print(f"  {key:25s}: {value_str}")
+    
+    # Visualize samples
+    if args.visualize:
+        print(f"\n{'='*70}")
+        print(f"Generating Visualizations:")
+        print(f"{'='*70}")
+        
+        import os
+        os.makedirs('/home/wang/Project/MoT-DP/image/nusc_samples', exist_ok=True)
+        
+        for i in range(min(args.num_samples, len(dataset))):
+            sample = dataset[i]
+            save_path = f'/home/wang/Project/MoT-DP/image/nusc_samples/sample_{i:03d}.png'
+            visualize_sample(sample, save_path)
+        
+        print(f"✓ Saved {min(args.num_samples, len(dataset))} visualizations")

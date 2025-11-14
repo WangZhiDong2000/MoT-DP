@@ -11,34 +11,9 @@ from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
 from collections import OrderedDict
-from collections import deque
 
 VLMDriveBackbone = None
 VLM_AVAILABLE = False
-
-class PIDController(object):
-	def __init__(self, K_P=1.0, K_I=0.0, K_D=0.0, n=20):
-		self._K_P = K_P
-		self._K_I = K_I
-		self._K_D = K_D
-
-		self._window = deque([0 for _ in range(n)], maxlen=n)
-		self._max = 0.0
-		self._min = 0.0
-
-	def step(self, error):
-		self._window.append(error)
-		self._max = max(self._max, abs(error))
-		self._min = -abs(self._max)
-
-		if len(self._window) >= 2:
-			integral = np.mean(self._window)
-			derivative = (self._window[-1] - self._window[-2])
-		else:
-			integral = 0.0
-			derivative = 0.0
-
-		return self._K_P * error + self._K_I * integral + self._K_D * derivative
 
 def dict_apply(
         x: Dict[str, torch.Tensor], 
@@ -99,7 +74,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         bev_encoder_cfg = config.get('bev_encoder', {})
         obs_encoder = InterfuserBEVEncoder(
             perception_backbone=None,
-            state_dim=bev_encoder_cfg.get('state_dim', 9),
+            state_dim=bev_encoder_cfg.get('state_dim', 13),  # 修改为13维以支持拼接后的ego_status
             feature_dim=bev_encoder_cfg.get('feature_dim', 256),
             use_group_norm=bev_encoder_cfg.get('use_group_norm', True),
             freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
@@ -192,27 +167,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
         self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
 
-        # Controller - Initialize PID controllers with config parameters
-        control_cfg = config.get('controller', {})
-        self.turn_controller = PIDController(
-            K_P=control_cfg.get('turn_KP', 0.75), 
-            K_I=control_cfg.get('turn_KI', 0.75), 
-            K_D=control_cfg.get('turn_KD', 0.3), 
-            n=control_cfg.get('turn_n', 40)
-        )
-        self.speed_controller = PIDController(
-            K_P=control_cfg.get('speed_KP', 5.0),
-            K_I=control_cfg.get('speed_KI', 0.5),
-            K_D=control_cfg.get('speed_KD', 1.0),
-            n=control_cfg.get('speed_n', 40)
-        )
-        
-        # Store config for later use in control_pid
-        self.config = config
-        print(f"✓ PID controllers initialized")
-        print(f"  - Turn controller: KP={control_cfg.get('turn_KP', 0.75)}, KI={control_cfg.get('turn_KI', 0.75)}, KD={control_cfg.get('turn_KD', 0.3)}")
-        print(f"  - Speed controller: KP={control_cfg.get('speed_KP', 5.0)}, KI={control_cfg.get('speed_KI', 0.5)}, KD={control_cfg.get('speed_KD', 1.0)}")
-
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """
         Normalize action from original range to [-1, 1]
@@ -267,7 +221,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
                 - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
                 - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                - 'speed', 'target_point', 'next_command': 状态信息
+                - 'ego_status' (B, 13): [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
+                  已经拼接好的13维状态向量，直接作为state输入
             return_attention: 是否返回attention map
             
         Returns:
@@ -275,11 +230,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             如果return_attention=True: (j_ctrl特征, attention_map) 
         """
         try:
-            # 准备状态信息
-            speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
-            target_point = obs_dict['target_point'].to(dtype=torch.float32)
-            command = obs_dict['next_command'].to(dtype=torch.float32)
-            state = torch.cat([speed, target_point, command], 1).to('cuda')
+            # ego_status是13维: [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
+            # 直接作为state使用，不再提取或组合
+            state = obs_dict['ego_status'].to(device='cuda', dtype=torch.float32)  # (B, 13)
             
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
             
@@ -341,26 +294,23 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
-            # 选项1: 预处理好的特征（推荐）
-            'lidar_token': (B, obs_horizon, seq_len, 512) - 预处理的空间特征
-            'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征
+            # BEV特征（二选一）
+            'lidar_token': (B, obs_horizon, seq_len, 512) - 预处理的空间特征（推荐）
+            'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征（推荐）
+            'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
             
-            # 选项2: 原始图像（兼容模式）
-            'lidar_bev': (B, obs_horizon, 3, 448, 448) - LiDAR BEV图像
-            
-            # 其他必需字段
-            'agent_pos': (B, obs_horizon, 2)
-            'next_command': (B, obs_horizon, 6)
-            'speed': (B, obs_horizon)
-            'target_point': (B, obs_horizon, 2)
+            # nuScenes必需字段
+            'agent_pos': (B, horizon, 2) - 未来轨迹点
+            'ego_status': (B, obs_horizon, 13) - 车辆状态 [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
         }
         """
         device = next(self.parameters()).device
         nobs = {}
         
-        # 支持预处理特征和原始图像两种模式
-        carla_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'next_command', 'speed', 'target_point', 'agent_pos']
-        for field in carla_fields:
+        # 收集必需字段
+        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos']
+        
+        for field in required_fields:
             if field in batch:
                 if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
                     nobs[field] = batch[field].to(device=device, dtype=torch.float32)
@@ -958,102 +908,3 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             vl_mask_batch = vl_mask.unsqueeze(0).repeat(batch_size, 1)  # (B, seq_len)
         
         return vlm_features, vl_mask_batch
-
-
-
-    # ===============Copy from TCP=====================
-
-
-    def control_pid(self, waypoints, velocity, target):
-        ''' Predicts vehicle control with a PID controller.
-		Args:
-			waypoints (tensor): output of self.plan()
-			velocity (tensor): speedometer input
-		'''
-        # Read hyperparameters from config
-        control_cfg = self.config.get('controller', {})
-        aim_dist = control_cfg.get('aim_dist', 4.0)  # distance to search around for aim point
-        angle_thresh = control_cfg.get('angle_thresh', 0.3)  # outlier control detection angle
-        dist_thresh = control_cfg.get('dist_thresh', 10.0)  # target point y-distance for outlier filtering
-        brake_speed = control_cfg.get('brake_speed', 0.4)  # desired speed below which brake is triggered
-        brake_ratio = control_cfg.get('brake_ratio', 1.1)  # ratio of speed to desired speed at which brake is triggered
-        clip_delta = control_cfg.get('clip_delta', 0.25)  # maximum change in speed input to longitudinal controller
-        max_throttle = control_cfg.get('max_throttle', 0.75)  # upper limit on throttle signal value in dataset
-
-
-        assert(waypoints.size(0)==1)
-        waypoints = waypoints[0].data.cpu().numpy()
-        target = target.squeeze().data.cpu().numpy()
-        
-        waypoints[:, [0, 1]] = waypoints[:, [1, 0]]  
-        target[[0, 1]] = target[[1, 0]]
-
-		# Downsample waypoints: from 10Hz (20 points in 2s) to 2Hz (take every 5th point)
-		# Original indices: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
-		# Downsampled indices: 4, 9, 14, 19 (starting from index 4)
-		# This matches the original 2Hz assumption: 4 waypoints with 2.5s intervals = 10 seconds
-        downsample_factor = 5
-        downsampled_waypoints = waypoints[4::downsample_factor]
-
-		# iterate over vectors between predicted waypoints
-        num_pairs = len(downsampled_waypoints) - 1
-        best_norm = 1e5
-        desired_speed = 0
-        aim = downsampled_waypoints[0]
-        for i in range(num_pairs):
-            # magnitude of vectors, used for speed
-            desired_speed += np.linalg.norm(
-					downsampled_waypoints[i+1] - downsampled_waypoints[i]) * 2.0 / num_pairs
-            # norm of vector midpoints, used for steering
-            norm = np.linalg.norm((downsampled_waypoints[i+1] + downsampled_waypoints[i]) / 2.0)
-            if abs(aim_dist-best_norm) > abs(aim_dist-norm):
-                aim = downsampled_waypoints[i]
-                best_norm = norm
-        
-        aim_last = downsampled_waypoints[-1] - downsampled_waypoints[-2]
-        angle = np.degrees(np.pi / 2 - np.arctan2(aim[1], aim[0])) / 90
-        angle_last = np.degrees(np.pi / 2 - np.arctan2(aim_last[1], aim_last[0])) / 90
-        angle_target = np.degrees(np.pi / 2 - np.arctan2(target[1], target[0])) / 90
-
-		# choice of point to aim for steering, removing outlier predictions
-		# use target point if it has a smaller angle or if error is large
-		# predicted point otherwise
-		# (reduces noise in eg. straight roads, helps with sudden turn commands)
-        use_target_to_aim = np.abs(angle_target) < np.abs(angle)
-        use_target_to_aim = use_target_to_aim or (np.abs(angle_target-angle_last) > angle_thresh and target[1] < dist_thresh)
-        if use_target_to_aim:
-            angle_final = angle_target
-        else:
-            angle_final = angle
-        
-        steer = self.turn_controller.step(angle_final)
-        steer = np.clip(steer, -1.0, 1.0)
-
-        speed = velocity[0].data.cpu().numpy()
-        brake = desired_speed < brake_speed or (speed / desired_speed) > brake_ratio
-
-        delta = np.clip(desired_speed - speed, 0.0, clip_delta)
-        throttle = self.speed_controller.step(delta)
-        throttle = np.clip(throttle, 0.0, max_throttle)
-        throttle = throttle if not brake else 0.0
-
-        metadata = {
-			'speed': float(speed.astype(np.float64)),
-			'steer': float(steer),
-			'throttle': float(throttle),
-			'brake': float(brake),
-			'wp_4': tuple(downsampled_waypoints[3].astype(np.float64)) if len(downsampled_waypoints) > 3 else tuple(downsampled_waypoints[-1].astype(np.float64)),
-			'wp_3': tuple(downsampled_waypoints[2].astype(np.float64)) if len(downsampled_waypoints) > 2 else tuple(downsampled_waypoints[-1].astype(np.float64)),
-			'wp_2': tuple(downsampled_waypoints[1].astype(np.float64)) if len(downsampled_waypoints) > 1 else tuple(downsampled_waypoints[-1].astype(np.float64)),
-			'wp_1': tuple(downsampled_waypoints[0].astype(np.float64)),
-			'aim': tuple(aim.astype(np.float64)),
-			'target': tuple(target.astype(np.float64)),
-			'desired_speed': float(desired_speed.astype(np.float64)),
-			'angle': float(angle.astype(np.float64)),
-			'angle_last': float(angle_last.astype(np.float64)),
-			'angle_target': float(angle_target.astype(np.float64)),
-			'angle_final': float(angle_final.astype(np.float64)),
-			'delta': float(delta.astype(np.float64)),
-		}
-
-        return steer, throttle, brake, metadata

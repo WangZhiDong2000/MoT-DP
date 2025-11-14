@@ -94,7 +94,8 @@ def get_history_waypoints(infos, current_idx, scene_token, obs_horizon=4):
         obs_horizon: Number of historical frames
         
     Returns:
-        waypoints_hist: List of historical waypoints [[x, y], ...], length = obs_horizon
+        waypoints_hist: List of historical waypoints [[x, y], ...], length = obs_horizon or None if insufficient
+        has_full_history: Boolean indicating if we have full obs_horizon frames
     """
     current_info = infos[current_idx]
     current_global2ego = ego_to_local_transform(
@@ -117,13 +118,10 @@ def get_history_waypoints(infos, current_idx, scene_token, obs_horizon=4):
             waypoint_ego = transform_waypoint_to_ego(hist_translation, current_global2ego)
             waypoints_hist.insert(0, waypoint_ego)
         else:
-            # Pad with first available waypoint or zeros
-            if waypoints_hist:
-                waypoints_hist.insert(0, waypoints_hist[0].copy())
-            else:
-                waypoints_hist.insert(0, np.array([0.0, 0.0]))
+            # Not enough history - return None to indicate skip
+            return None, False
     
-    return waypoints_hist
+    return waypoints_hist, True
 
 def get_future_waypoints(infos, current_idx, scene_token, action_horizon=6):
     """
@@ -205,31 +203,154 @@ def process_sample(infos, idx, dataset_root, obs_horizon=4, action_horizon=6):
         print(f"Warning: BEV features not found for {lidar_token}")
         return None
     
-    # Get historical waypoints
-    hist_waypoints = get_history_waypoints(infos, idx, scene_token, obs_horizon)
+    # Get historical waypoints (now returns tuple)
+    hist_waypoints, has_full_history = get_history_waypoints(infos, idx, scene_token, obs_horizon)
+    
+    # Skip if we don't have full history
+    if not has_full_history or hist_waypoints is None:
+        return None
+    
+    # Get BEV feature paths for all historical frames
+    hist_bev_token_paths = []
+    hist_bev_token_global_paths = []
+    hist_lidar_tokens = []
+    hist_ego_status = []
+    hist_nav_command = []
+    
+    for offset in range(obs_horizon):
+        hist_idx = idx - (obs_horizon - 1 - offset)  # From oldest to newest
+        hist_info = infos[hist_idx]
+        hist_lidar_token = extract_lidar_token_from_path(hist_info['lidar_path'])
+        hist_token_path, hist_token_global_path = get_bev_feature_path(dataset_root, hist_lidar_token)
+        
+        # Check if historical BEV features exist
+        if not (os.path.exists(hist_token_path) and os.path.exists(hist_token_global_path)):
+            print(f"Warning: Historical BEV features not found for {hist_lidar_token}")
+            return None
+        
+        hist_lidar_tokens.append(hist_lidar_token)
+        hist_bev_token_paths.append(hist_token_path)
+        hist_bev_token_global_paths.append(hist_token_global_path)
+        
+        # Get historical ego status and navigation command
+        hist_ego_status.append(hist_info['ego_status'])  # (10,)
+        hist_nav_command.append(hist_info['gt_ego_fut_cmd'])  # (3,)
     
     # Get future waypoints
     fut_waypoints, fut_valid_mask = get_future_waypoints(infos, idx, scene_token, action_horizon)
     
-    # Get ego status (velocity, acceleration, etc.)
+    # Get current ego status and navigation command (for backward compatibility)
     ego_status = info['ego_status']  # Shape: (10,)
-    
-    # Get navigation command
     nav_command = info['gt_ego_fut_cmd']  # Shape: (3,) one-hot
+    
+    # Get obstacle information for future frames (action_horizon frames)
+    # We need obstacles for each future frame to check collision
+    # Transform all obstacles to CURRENT ego frame (consistent with future waypoints)
+    fut_obstacles_list = []  # List of obstacle dicts for each future frame
+    
+    # Build transformation from current ego to global (for transforming obstacles)
+    current_ego2global = np.eye(4)
+    current_ego2global[:3, 3] = info['ego2global_translation']
+    current_ego2global[:3, :3] = Quaternion(info['ego2global_rotation']).rotation_matrix
+    current_global2ego = np.linalg.inv(current_ego2global)
+    current_global2ego_rot = current_global2ego[:3, :3]
+    
+    for offset in range(1, action_horizon + 1):
+        fut_idx = idx + offset
+        
+        # Check if we're still in the same scene and within bounds
+        if fut_idx < len(infos) and infos[fut_idx]['scene_token'] == scene_token:
+            fut_info = infos[fut_idx]
+            
+            # Get obstacle information from future frame
+            # NOTE: gt_boxes are in LIDAR coordinate system!
+            gt_boxes = fut_info.get('gt_boxes', np.array([])).copy()  # (N, 7) [x, y, z, l, w, h, yaw] in LIDAR frame
+            gt_names = fut_info.get('gt_names', np.array([])).copy()  # (N,) obstacle class names
+            gt_velocity = fut_info.get('gt_velocity', np.array([])).copy()  # (N, 2) [vx, vy] in LIDAR frame
+            valid_flag = fut_info.get('valid_flag', np.array([])).copy()  # (N,) valid mask
+            
+            # Build transformation chain: future_lidar -> future_ego -> global -> current_ego
+            # This matches the transformation used in get_future_waypoints
+            
+            # Future lidar to future ego
+            fut_lidar2ego = np.eye(4)
+            fut_lidar2ego[:3, 3] = fut_info['lidar2ego_translation']
+            fut_lidar2ego[:3, :3] = Quaternion(fut_info['lidar2ego_rotation']).rotation_matrix
+            
+            # Future ego to global
+            fut_ego2global = np.eye(4)
+            fut_ego2global[:3, 3] = fut_info['ego2global_translation']
+            fut_ego2global[:3, :3] = Quaternion(fut_info['ego2global_rotation']).rotation_matrix
+            
+            # Combined transformation: future_lidar -> global -> current_ego
+            fut_lidar2current_ego = current_global2ego @ fut_ego2global @ fut_lidar2ego
+            fut_lidar2current_ego_rot = fut_lidar2current_ego[:3, :3]
+            
+            # Filter valid obstacles
+            if len(valid_flag) > 0 and len(gt_boxes) > 0:
+                valid_mask = valid_flag.astype(bool)
+                gt_boxes = gt_boxes[valid_mask]
+                gt_names = gt_names[valid_mask]
+                gt_velocity = gt_velocity[valid_mask]
+                
+                # Transform box positions and orientations from future lidar frame to CURRENT ego frame
+                for i in range(len(gt_boxes)):
+                    # Box position in future lidar frame
+                    box_pos_fut_lidar = np.array([gt_boxes[i, 0], gt_boxes[i, 1], gt_boxes[i, 2], 1.0])
+                    # Transform to CURRENT ego frame
+                    box_pos_current_ego = fut_lidar2current_ego @ box_pos_fut_lidar
+                    gt_boxes[i, 0] = box_pos_current_ego[0]
+                    gt_boxes[i, 1] = box_pos_current_ego[1]
+                    gt_boxes[i, 2] = box_pos_current_ego[2]
+                    
+                    # Transform yaw angle by rotating the heading vector
+                    # Create heading vector in future LIDAR frame
+                    heading_lidar = np.array([np.cos(gt_boxes[i, 6]), np.sin(gt_boxes[i, 6]), 0.0])
+                    # Transform to CURRENT ego frame (only rotation, no translation)
+                    heading_current_ego = fut_lidar2current_ego_rot @ heading_lidar
+                    # Calculate new yaw angle
+                    gt_boxes[i, 6] = np.arctan2(heading_current_ego[1], heading_current_ego[0])
+                    
+                    # Transform velocity vector (only rotation, no translation)
+                    if len(gt_velocity) > i:
+                        vel_lidar = np.array([gt_velocity[i, 0], gt_velocity[i, 1], 0.0])
+                        vel_current_ego = fut_lidar2current_ego_rot @ vel_lidar
+                        gt_velocity[i, 0] = vel_current_ego[0]
+                        gt_velocity[i, 1] = vel_current_ego[1]
+            
+            fut_obstacles_list.append({
+                'gt_boxes': gt_boxes.astype(np.float32) if len(gt_boxes) > 0 else np.array([], dtype=np.float32).reshape(0, 7),
+                'gt_names': gt_names,
+                'gt_velocity': gt_velocity.astype(np.float32) if len(gt_velocity) > 0 else np.array([], dtype=np.float32).reshape(0, 2),
+            })
+        else:
+            # No valid future frame, append empty obstacles
+            fut_obstacles_list.append({
+                'gt_boxes': np.array([], dtype=np.float32).reshape(0, 7),
+                'gt_names': np.array([]),
+                'gt_velocity': np.array([], dtype=np.float32).reshape(0, 2),
+            })
     
     # Create sample dictionary
     sample = {
         'scene_token': scene_token,
         'sample_token': info['token'],
         'timestamp': info['timestamp'],
-        'lidar_token': lidar_token,
-        'bev_token_path': token_path,
-        'bev_token_global_path': token_global_path,
+        'lidar_token': lidar_token,  # Current frame token
+        'bev_token_path': token_path,  # Current frame BEV path (for backward compatibility)
+        'bev_token_global_path': token_global_path,  # Current frame BEV global path
+        'hist_lidar_tokens': hist_lidar_tokens,  # (obs_horizon,) historical lidar tokens
+        'hist_bev_token_paths': hist_bev_token_paths,  # (obs_horizon,) historical BEV feature paths
+        'hist_bev_token_global_paths': hist_bev_token_global_paths,  # (obs_horizon,) historical BEV global paths
+        'hist_ego_status': np.array(hist_ego_status, dtype=np.float32),  # (obs_horizon, 10)
+        'hist_nav_command': np.array(hist_nav_command, dtype=np.float32),  # (obs_horizon, 3)
         'hist_waypoints': np.array(hist_waypoints, dtype=np.float32),  # (obs_horizon, 2)
         'fut_waypoints': np.array(fut_waypoints, dtype=np.float32),    # (action_horizon, 2)
         'fut_valid_mask': np.array(fut_valid_mask, dtype=bool),        # (action_horizon,)
-        'ego_status': ego_status.astype(np.float32),                   # (10,)
-        'nav_command': nav_command.astype(np.float32),                 # (3,)
+        'ego_status': ego_status.astype(np.float32),                   # (10,) - current frame (backward compatibility)
+        'nav_command': nav_command.astype(np.float32),                 # (3,) - current frame (backward compatibility)
+        # Obstacle information for each future frame (action_horizon frames)
+        'fut_obstacles': fut_obstacles_list,  # List of action_horizon dicts, each with gt_boxes, gt_names, gt_velocity
     }
     
     return sample
