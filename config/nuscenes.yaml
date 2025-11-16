@@ -90,7 +90,7 @@ noise_scheduler:
   clip_sample: false
   prediction_type: epsilon
 training:
-  num_epochs: 500
+  num_epochs: 1000
   max_grad_norm: 1.0
   dataset_path: /home/wang/Project/carla_garage/tmp_data
   image_data_root: /home/wang/Project/carla_garage/data

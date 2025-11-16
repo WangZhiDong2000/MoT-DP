@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-计算nuScenes数据集中的action_stats (轨迹点统计信息)
-从preprocess_nusc_new.py处理后的数据统计future waypoints的min, max, mean, std
-默认统计/home/wang/Dataset/v1.0-mini/processed_data/中的训练集数据
-"""
 import os
 import sys
 import pickle
@@ -11,6 +6,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import yaml
+import argparse
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
@@ -18,8 +14,6 @@ sys.path.append(project_root)
 
 def compute_action_stats_from_processed_data(pkl_path, max_samples=None):
     """
-    从preprocess_nusc_new.py处理后的pkl文件中统计action (fut_waypoints) 的统计信息
-    
     Args:
         pkl_path: 处理后的pkl文件路径 (如 nuscenes_processed_train.pkl)
         max_samples: 最多处理多少个样本（None表示处理全部）
@@ -35,10 +29,8 @@ def compute_action_stats_from_processed_data(pkl_path, max_samples=None):
     # Load preprocessed data
     print("Loading preprocessed data...")
     with open(pkl_path, 'rb') as f:
-        # Handle numpy version compatibility
-        import numpy
-        sys.modules['numpy._core'] = numpy.core
-        sys.modules['numpy._core.multiarray'] = numpy.core.multiarray
+        sys.modules['numpy._core'] = np.core
+        sys.modules['numpy._core.multiarray'] = np.core.multiarray
         data = pickle.load(f)
     
     samples = data['samples']
@@ -54,7 +46,6 @@ def compute_action_stats_from_processed_data(pkl_path, max_samples=None):
     print("\nProcessing samples...")
     for sample in tqdm(samples, desc="Processing"):
         try:
-            # 获取fut_waypoints (future waypoints)
             fut_waypoints = sample.get('fut_waypoints')
             
             if fut_waypoints is None:
@@ -117,15 +108,7 @@ def compute_action_stats_from_processed_data(pkl_path, max_samples=None):
 
 
 def save_stats_to_config(stats, config_path):
-    """
-    将统计信息保存到配置文件
-    
-    Args:
-        stats: 统计信息字典
-        config_path: 配置文件路径
-    """
     try:
-        # 如果配置文件存在，则加载并更新
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
@@ -150,15 +133,8 @@ def save_stats_to_config(stats, config_path):
 
 
 def main():
-    """
-    主函数：统计nuScenes mini数据集的action statistics
-    默认处理训练集数据并保存到config/nuscenes.yaml
-    """
-    # 默认路径
     default_train_pkl = '/home/wang/Dataset/v1.0-mini/processed_data/nuscenes_processed_train.pkl'
     default_config = os.path.join(project_root, 'config', 'nuscenes.yaml')
-    
-    import argparse
     parser = argparse.ArgumentParser(
         description='Compute action statistics from preprocessed nuScenes data'
     )
@@ -188,7 +164,6 @@ def main():
     
     args = parser.parse_args()
     
-    # 检查文件是否存在
     if not os.path.exists(args.pkl_path):
         print(f"❌ Processed data file not found: {args.pkl_path}")
         print("\nPlease run preprocess_nusc_new.py first to generate processed data.")
@@ -196,22 +171,17 @@ def main():
         return
     
     try:
-        # 计算统计信息
         stats = compute_action_stats_from_processed_data(
             pkl_path=args.pkl_path,
             max_samples=args.max_samples
         )
         
-        # 保存到配置文件
         if not args.no_save:
-            # 确保config目录存在
             config_dir = os.path.dirname(args.config_path)
             if not os.path.exists(config_dir):
                 os.makedirs(config_dir)
                 print(f"✓ Created config directory: {config_dir}")
-            
             save_stats_to_config(stats, args.config_path)
-        
         print("\n✓ Statistics computation completed successfully!")
         
     except Exception as e:
