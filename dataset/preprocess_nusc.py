@@ -24,14 +24,13 @@ from tqdm import tqdm
 import argparse
 from pathlib import Path
 from pyquaternion import Quaternion
+import sys
+
 
 def load_nuscenes_infos(infos_path):
     """Load nuScenes infos file"""
-    # Compatibility fix for numpy version mismatch
-    import sys
-    import numpy
-    sys.modules['numpy._core'] = numpy.core
-    sys.modules['numpy._core.multiarray'] = numpy.core.multiarray
+    sys.modules['numpy._core'] = np.core
+    sys.modules['numpy._core.multiarray'] = np.core.multiarray
     
     with open(infos_path, 'rb') as f:
         data = pickle.load(f)
@@ -244,8 +243,6 @@ def process_sample(infos, idx, dataset_root, obs_horizon=4, action_horizon=6):
     nav_command = info['gt_ego_fut_cmd']  # Shape: (3,) one-hot
     
     # Get obstacle information for future frames (action_horizon frames)
-    # We need obstacles for each future frame to check collision
-    # Transform all obstacles to CURRENT ego frame (consistent with future waypoints)
     fut_obstacles_list = []  # List of obstacle dicts for each future frame
     
     # Build transformation from current ego to global (for transforming obstacles)
@@ -268,9 +265,6 @@ def process_sample(infos, idx, dataset_root, obs_horizon=4, action_horizon=6):
             gt_names = fut_info.get('gt_names', np.array([])).copy()  # (N,) obstacle class names
             gt_velocity = fut_info.get('gt_velocity', np.array([])).copy()  # (N, 2) [vx, vy] in LIDAR frame
             valid_flag = fut_info.get('valid_flag', np.array([])).copy()  # (N,) valid mask
-            
-            # Build transformation chain: future_lidar -> future_ego -> global -> current_ego
-            # This matches the transformation used in get_future_waypoints
             
             # Future lidar to future ego
             fut_lidar2ego = np.eye(4)
@@ -349,7 +343,6 @@ def process_sample(infos, idx, dataset_root, obs_horizon=4, action_horizon=6):
         'fut_valid_mask': np.array(fut_valid_mask, dtype=bool),        # (action_horizon,)
         'ego_status': ego_status.astype(np.float32),                   # (10,) - current frame (backward compatibility)
         'nav_command': nav_command.astype(np.float32),                 # (3,) - current frame (backward compatibility)
-        # Obstacle information for each future frame (action_horizon frames)
         'fut_obstacles': fut_obstacles_list,  # List of action_horizon dicts, each with gt_boxes, gt_names, gt_velocity
     }
     
