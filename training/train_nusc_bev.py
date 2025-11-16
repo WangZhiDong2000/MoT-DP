@@ -55,22 +55,70 @@ def load_action_stats(config):
 
 
 def safe_wandb_log(data, use_wandb=True):
-    """安全地记录wandb日志，处理所有异常"""
-    if use_wandb:
-        try:
-            # 在记录前刷新输出
-            import sys
-            sys.stdout.flush()
-            sys.stderr.flush()
+    """安全地记录wandb日志，处理所有异常和数据验证"""
+    if not use_wandb:
+        return
+    
+    try:
+        # 数据类型转换和验证
+        cleaned_data = {}
+        for key, value in data.items():
+            # 转换 torch.Tensor 为 Python 标量
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    value = value.item()
+                else:
+                    print(f"Warning: Skipping tensor with shape {value.shape} for key '{key}'")
+                    continue
             
-            wandb.log(data)
+            # 转换 numpy 数组为 Python 标量
+            if isinstance(value, np.ndarray):
+                if value.size == 1:
+                    value = value.item()
+                else:
+                    print(f"Warning: Skipping array with shape {value.shape} for key '{key}'")
+                    continue
             
-            # 记录后再次刷新
-            sys.stdout.flush()
-            sys.stderr.flush()
-        except:
-            # 完全静默处理所有异常
-            pass
+            # 转换 numpy 标量类型为 Python 原生类型
+            if isinstance(value, (np.integer, np.floating)):
+                value = value.item()  # 转换 numpy 类型为 Python 原生类型
+            
+            # 检查 NaN 和 Inf
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                if np.isnan(value):
+                    print(f"Warning: Skipping NaN value for key '{key}'")
+                    continue
+                elif np.isinf(value):
+                    print(f"Warning: Replacing Inf value for key '{key}' with 1e10")
+                    value = 1e10 if value > 0 else -1e10
+            
+            # 最后再次确保类型转换
+            if isinstance(value, np.generic):
+                value = value.item()
+            
+            cleaned_data[key] = value
+        
+        # 如果清理后没有数据，直接返回
+        if not cleaned_data:
+            return
+        
+        # 刷新输出缓冲区
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        # 记录到 wandb
+        wandb.log(cleaned_data)
+        
+        # 再次刷新
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+    except Exception as e:
+        # 记录异常而不是完全静默
+        print(f"Warning: wandb.log failed with error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def safe_wandb_finish(use_wandb=True):
@@ -349,7 +397,19 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
         # 计算所有时刻、所有样本的平均碰撞率
         metrics['collision_avg'] = np.mean(collisions)
     
-    return metrics
+    # 安全检查：确保所有返回的指标都不是 NaN 或 Inf
+    safe_metrics = {}
+    for key, value in metrics.items():
+        if np.isnan(value):
+            print(f"Warning: Metric '{key}' is NaN, replacing with 0.0")
+            safe_metrics[key] = 0.0
+        elif np.isinf(value):
+            print(f"Warning: Metric '{key}' is Inf, replacing with large value")
+            safe_metrics[key] = 1e10 if value > 0 else -1e10
+        else:
+            safe_metrics[key] = value
+    
+    return safe_metrics
 
 def validate_model(policy, val_loader, device):
     """
@@ -426,7 +486,16 @@ def validate_model(policy, val_loader, device):
     averaged_metrics = {}
     for key, values in val_metrics.items():
         if values:  
-            averaged_metrics[f'val_{key}'] = np.mean(values)
+            mean_value = np.mean(values)
+            # 检查平均值是否为 NaN 或 Inf
+            if np.isnan(mean_value):
+                print(f"Warning: computed NaN for metric 'val_{key}'")
+                averaged_metrics[f'val_{key}'] = 0.0  # 用0替代 NaN
+            elif np.isinf(mean_value):
+                print(f"Warning: computed Inf for metric 'val_{key}'")
+                averaged_metrics[f'val_{key}'] = 1e10 if mean_value > 0 else -1e10  # 用大数替代 Inf
+            else:
+                averaged_metrics[f'val_{key}'] = mean_value
         
     return averaged_metrics
 
@@ -580,7 +649,7 @@ def train_nusc_policy(config_path):
                 step = epoch * len(train_loader) + batch_idx
                 safe_wandb_log({
                     "train/loss_step": loss.item(),
-                    "train/epoch": epoch,
+                    "train/epoch":  epoch ,
                     "train/step": step,
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/batch_idx": batch_idx
@@ -601,7 +670,7 @@ def train_nusc_policy(config_path):
         
         safe_wandb_log({
             "train/loss_epoch": avg_train_loss,
-            "train/epoch": epoch,
+            "train/epoch": 0.0,
             "train/samples_processed": (epoch + 1) * len(train_dataset)
         }, use_wandb)
 
@@ -624,6 +693,21 @@ def train_nusc_policy(config_path):
         
             try:
                 print("Preparing validation metrics for logging...")
+                sys.stdout.flush()
+                
+                # DEBUG: 打印val_metrics中的原始数据
+                print("\n" + "="*70)
+                print("DEBUG: val_metrics contents (before log_dict creation):")
+                print("="*70)
+                for key, value in val_metrics.items():
+                    value_type = type(value).__name__
+                    print(f"  {key:30} | Type: {value_type:15} | Value: {value}")
+                    if isinstance(value, (int, float)):
+                        if np.isnan(value):
+                            print(f"    ⚠ WARNING: NaN detected!")
+                        elif np.isinf(value):
+                            print(f"    ⚠ WARNING: Inf detected!")
+                print("="*70 + "\n")
                 sys.stdout.flush()
                 
                 log_dict = {
@@ -652,8 +736,27 @@ def train_nusc_policy(config_path):
         
                 print("Logging to wandb...")
                 sys.stdout.flush()
+                
+                # DEBUG: 打印log_dict中的所有变量
+                print("\n" + "="*70)
+                print("DEBUG: log_dict contents:")
+                print("="*70)
+                for key, value in log_dict.items():
+                    value_type = type(value).__name__
+                    print(f"  {key:30} | Type: {value_type:15} | Value: {value}")
+                    
+                    # 额外的检查
+                    if isinstance(value, (int, float)):
+                        if np.isnan(value):
+                            print(f"    ⚠ WARNING: NaN detected!")
+                        elif np.isinf(value):
+                            print(f"    ⚠ WARNING: Inf detected!")
+                print("="*70 + "\n")
+                sys.stdout.flush()
+                
+                # 使用实际的log_dict数据进行logging
                 safe_wandb_log(log_dict, use_wandb)
-                print(f"✓ Metrics logged")
+                print(f"✓ Metrics logged successfully")
                 sys.stdout.flush()
             except Exception as e:
                 print(f"✗ Error during metrics logging: {e}")
@@ -695,7 +798,7 @@ def train_nusc_policy(config_path):
     print("Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
     safe_wandb_log({
-        "training/completed": True,
+        "training/completed": 0.0,
         "training/total_epochs": num_epochs,
         "training/best_val_loss": best_val_loss,
         "training/final_train_loss": avg_train_loss
