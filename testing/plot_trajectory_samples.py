@@ -6,7 +6,6 @@
 2. 未来障碍物运动
 3. BEV图像
 
-按照nusc_dataset.py的visualize_sample方法
 """
 import os
 import sys
@@ -105,7 +104,7 @@ def get_all_samples_with_predictions(policy, test_loader, config, device='cuda')
                     sample_data = {
                         'hist_waypoints': torch.zeros((obs_horizon, 2)),
                         'agent_pos': target_actions[i].cpu(),
-                        'fut_valid_mask': batch.get('fut_valid_mask', torch.ones(predicted_actions.shape[1])).cpu() if i == 0 else torch.ones(predicted_actions.shape[1]),
+                        'fut_valid_mask': torch.ones(predicted_actions.shape[1], dtype=torch.bool),
                         'ego_status': batch['ego_status'][i, :obs_horizon].cpu() if 'ego_status' in batch else torch.zeros((obs_horizon, 13)),
                         'command': batch.get('command', torch.zeros((obs_horizon, 3)))[i, :obs_horizon].cpu() if 'command' in batch else torch.zeros((obs_horizon, 3)),
                         'fut_obstacles': batch['fut_obstacles'][i] if 'fut_obstacles' in batch else [],
@@ -156,9 +155,13 @@ def plot_sample_with_three_subplots(sample, save_path=None):
     # Mark invalid waypoints
     if 'fut_valid_mask' in sample:
         valid_mask = sample['fut_valid_mask'].cpu().numpy() if isinstance(sample['fut_valid_mask'], torch.Tensor) else sample['fut_valid_mask']
-        invalid_wp = fut_wp[~valid_mask]
-        if len(invalid_wp) > 0:
-            ax1.scatter(invalid_wp[:, 1], invalid_wp[:, 0], c='orange', s=100, marker='x', label='Invalid', zorder=10)
+        # Ensure valid_mask is boolean
+        if valid_mask.dtype != bool:
+            valid_mask = valid_mask.astype(bool)
+        if len(valid_mask) == len(fut_wp) and not np.all(valid_mask):
+            invalid_wp = fut_wp[~valid_mask]
+            if len(invalid_wp) > 0:
+                ax1.scatter(invalid_wp[:, 1], invalid_wp[:, 0], c='orange', s=100, marker='x', label='Invalid', zorder=10)
     
     # Current position
     ax1.scatter(0, 0, c='black', s=200, marker='*', label='Ego (Current)', zorder=10)
@@ -367,7 +370,6 @@ def plot_sample_with_three_subplots(sample, save_path=None):
 
 
 def plot_trajectory_samples_with_predictions(samples_data, num_samples=20, save_dir='./trajectory_plots'):
-    """绘制轨迹样本，每个样本三个子图"""
     os.makedirs(save_dir, exist_ok=True)
     
     total_samples = min(len(samples_data), num_samples)
@@ -388,7 +390,6 @@ def plot_trajectory_samples_with_predictions(samples_data, num_samples=20, save_
 
 
 def main():
-    """主函数"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
