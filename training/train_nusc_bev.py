@@ -566,7 +566,7 @@ def train_nusc_policy(config_path):
                 safe_wandb_log(log_dict, use_wandb)
                 sys.stdout.flush()
             except Exception as e:
-                import traceback
+                import tracebackbest
                 traceback.print_exc()
         
             print(f"Validation metrics:")

@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, Callable
-from collections import defaultdict
 import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
@@ -10,7 +9,6 @@ from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskG
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
-from collections import OrderedDict
 
 VLMDriveBackbone = None
 VLM_AVAILABLE = False
@@ -28,16 +26,12 @@ def dict_apply(
     return result
 
 def normalize_data(data, stats):
-    # nomalize to [0,1]
     ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-    # normalize to [-1, 1]
     ndata = ndata * 2 - 1
     return ndata
 
 def unnormalize_data(ndata, stats):
-    # unnormalize from [-1, 1] to [0, 1]
     ndata = (ndata + 1) / 2
-    # unnormalize to original range
     data = ndata * (stats['max'] - stats['min']) + stats['min']
     return data
 
@@ -112,20 +106,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         else:
             print("⚠ VLM backbone not available, using simulated features")
         self._init_fixed_vlm_features()
-        # self.feature_encoder = nn.Linear(2560, 1536)
-        # self.feature_encoder.eval()
-        # self._init_loaded_vlm_features()
 
-
-        # create diffusion model
-        # TCP模型输出特征维度（j_ctrl）为256，修改相应维度
         obs_feature_dim = 256  
-        
-        # Optional GroupNorm for j_ctrl features (recommended for training stability)
-        # self.use_j_ctrl_norm = policy_cfg.get('use_j_ctrl_norm', False)
-        # if self.use_j_ctrl_norm:
-        #     self.j_ctrl_norm = nn.GroupNorm(num_groups=8, num_channels=256)
-        #     print("✓ GroupNorm enabled for j_ctrl features")  
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
@@ -168,44 +150,24 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize action from original range to [-1, 1]
-        Args:
-            action: tensor of shape (..., action_dim)
-        Returns:
-            normalized action in range [-1, 1]
-        """
         if not self.enable_action_normalization or self.action_stats is None:
             return action
         
         device = action.device
         action_min = self.action_stats['min'].to(device)
-        action_max = self.action_stats['max'].to(device)
-        
-        # Normalize to [0, 1]
+        action_max = self.action_stats['max'].to(device)   
         normalized = (action - action_min) / (action_max - action_min + 1e-8)
-        # Normalize to [-1, 1]
         normalized = normalized * 2 - 1
         return normalized
 
     def unnormalize_action(self, normalized_action: torch.Tensor) -> torch.Tensor:
-        """
-        Unnormalize action from [-1, 1] back to original range
-        Args:
-            normalized_action: tensor of shape (..., action_dim) in range [-1, 1]
-        Returns:
-            action in original range
-        """
         if not self.enable_action_normalization or self.action_stats is None:
             return normalized_action
         
         device = normalized_action.device
         action_min = self.action_stats['min'].to(device)
         action_max = self.action_stats['max'].to(device)
-        
-        # Unnormalize from [-1, 1] to [0, 1]
         unnormalized = (normalized_action + 1) / 2
-        # Unnormalize to original range
         unnormalized = unnormalized * (action_max - action_min) + action_min
         return unnormalized
 
@@ -230,14 +192,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             如果return_attention=True: (j_ctrl特征, attention_map) 
         """
         try:
-            # ego_status是13维: [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
-            # 直接作为state使用，不再提取或组合
             state = obs_dict['ego_status'].to(device='cuda', dtype=torch.float32)  # (B, 13)
-            
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
-            
             if use_precomputed:
-                # 模式1: 使用预处理好的BEV特征（快速）
                 lidar_token = obs_dict['lidar_token'].to(device='cuda', dtype=torch.float32)
                 lidar_token_global = obs_dict['lidar_token_global'].to(device='cuda', dtype=torch.float32)
                 
@@ -259,12 +216,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                     )
                     attention_map = None
             else:
-                # 模式2: 使用原始lidar_bev图像（兼容模式，慢）
                 if 'lidar_bev' not in obs_dict:
                     raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
                 
                 lidar_bev_img = obs_dict['lidar_bev'].to(device='cuda', dtype=torch.float32)
-                
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
                         image=lidar_bev_img,
@@ -306,8 +261,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         device = next(self.parameters()).device
         nobs = {}
-        
-        # 收集必需字段
         required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos']
         
         for field in required_fields:
@@ -335,7 +288,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
 
         if self.obs_as_global_cond:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -345,8 +297,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             nobs_features = self.extract_tcp_features(this_nobs)
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
 
-        # generate impainting mask
-        # condition_mask = self.mask_generator(trajectory.shape)
         condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
 
         # Sample noise that we'll add to the images
@@ -465,7 +415,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond_data = None
         cond_mask = None
         if self.obs_as_global_cond:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -476,7 +425,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -490,7 +438,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # run sampling
         # Extract VQA features from obs_dict if available
         if 'vqa' not in nobs or nobs['vqa'] is None:
-            # 如果vqa为None或不存在，使用初始化中生成的模板
             vl_feat, _ = self.generate_simulated_vlm_outputs(
                 batch_size=B, 
                 device=device,
@@ -538,38 +485,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         return result
 
     def extract_attention_map(self, obs_dict: Dict[str, torch.Tensor]) -> np.ndarray:
-        """
-        提取最后一帧观测的attention map
-        
-        Args:
-            obs_dict: 观测字典
-            
-        Returns:
-            attention_map: (H, W) numpy数组
-        """
         device = next(self.parameters()).device
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
-        
-        # 获取最后一帧观测
         last_obs = dict_apply(nobs, lambda x: x[:, -1, ...])
-        
-        # 提取特征和attention map
         with torch.no_grad():
             _, attention_map = self.extract_tcp_features(last_obs, return_attention=True)
-        
-        # 转换为numpy
         attention_map_np = attention_map[0].cpu().numpy()  # (H, W)
         
         return attention_map_np
 
     def predict_action_with_steps(self, obs_dict: Dict[str, torch.Tensor]):
-        """
-        预测动作并返回去噪过程的中间步骤
-        
-        Returns:
-            result: 预测结果字典
-            denoising_steps: 去噪过程中的轨迹列表
-        """
+  
         device = next(self.parameters()).device
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
@@ -585,7 +511,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond_data = None
         cond_mask = None
         if self.obs_as_global_cond:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -594,7 +519,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -605,10 +529,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
-        # 运行采样并捕获中间步骤
-        # Extract VQA features from obs_dict if available
+
         if 'vqa' not in nobs or nobs['vqa'] is None:
-            # 如果vqa为None或不存在，使用初始化中生成的模板
             vl_feat, _ = self.generate_simulated_vlm_outputs(
                 batch_size=B, 
                 device=device,
@@ -627,7 +549,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         naction_pred = nsample[...,:Da]
         naction_pred = torch.clamp(naction_pred, -1.0, 1.0)
         
-        # 反归一化去噪步骤用于可视化
+
         denoising_steps_unnormalized = []
         if self.enable_action_normalization and self.action_stats is not None:
             for step in denoising_steps:
@@ -742,13 +664,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
 
     def _init_fixed_vlm_features(self):
-        """
-        初始化真实的VLM特征,从实际的VLM模型中提取隐藏层特征
-        如果VLM模型不可用,则使用固定的随机特征作为备用
-        """
         print("Initializing VLM features...")
         
-        # 检查VLM backbone是否可用
         if self.vlm_backbone is not None:
             try:
                 print("Attempting to use real VLM model...")
