@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+
 import numpy as np
 import imageio
-import os
 import glob
-from pathlib import Path
-import sys
-sys.path.append(Path(__file__).resolve().parent.parent)
 
 BOUNDARY = {
     "minX": -32,
@@ -226,29 +229,40 @@ def process_nuscenes_dataset(dataset_root, output_dir=None, process_all=False, s
 
 if __name__ == "__main__":
     import argparse
-    
+    from dataset.config_loader import load_config
+
     parser = argparse.ArgumentParser(description='Generate LiDAR BEV images from nuScenes dataset')
-    parser.add_argument('--input_dir', type=str, default='/home/wang/Dataset/v1.0-mini',
-                       help='Input directory containing the nuScenes dataset')
+    parser.add_argument('--input_dir', type=str, default=None,
+                        help='Input directory containing the nuScenes dataset')
     parser.add_argument('--output_dir', type=str, default=None,
-                       help='Output directory for BEV images (only used if --save_in_place is not set)')
-    parser.add_argument('--save_in_place', action='store_true', default=True,
-                       help='Save BEV images in the original dataset structure')
-    parser.add_argument('--process_all', action='store_true', default=True,
-                       help='Process all frames (default: only first 10 frames for testing)')
-    parser.add_argument('--img_size', type=int, default=448,
-                       help='BEV image size (height and width)')
-    
+                        help='Output directory for BEV images (only used if --save_in_place is not set)')
+    parser.add_argument('--save_in_place', action='store_true', default=None,
+                        help='Save BEV images in the original dataset structure')
+    parser.add_argument('--process_all', action='store_true', default=None,
+                        help='Process all frames (default: only first 10 frames for testing)')
+    parser.add_argument('--img_size', type=int, default=None,
+                        help='BEV image size (height and width)')
+
     args = parser.parse_args()
-    
-    if not os.path.exists(args.input_dir):
-        print(f"Error: Input directory '{args.input_dir}' does not exist!")
+
+    defaults = {
+        'input_dir': '/mnt/data2/nuscenes',
+        'output_dir': None,
+        'save_in_place': True,
+        'process_all': False,
+        'img_size': 448,
+    }
+
+    cfg = load_config('generate_lidar_bev_nusc', vars(args), defaults=defaults)
+
+    if not os.path.exists(cfg['input_dir']):
+        print(f"Error: Input directory '{cfg['input_dir']}' does not exist!")
         sys.exit(1)
-    
+
     process_nuscenes_dataset(
-        dataset_root=args.input_dir,
-        output_dir=args.output_dir,
-        process_all=args.process_all,
-        save_in_place=args.save_in_place,
-        img_size=args.img_size
+        dataset_root=cfg['input_dir'],
+        output_dir=cfg.get('output_dir'),
+        process_all=cfg.get('process_all', False),
+        save_in_place=cfg.get('save_in_place', True),
+        img_size=cfg.get('img_size', 448)
     )

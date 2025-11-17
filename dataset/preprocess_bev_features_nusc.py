@@ -32,10 +32,10 @@ from tqdm import tqdm
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root))
 
 from model.interfuser_bev_encoder import InterfuserBEVEncoder, load_lidar_submodules
+from dataset.config_loader import load_config
 
 
 def load_bev_encoder(pretrained_path, device='cuda'):
@@ -288,58 +288,66 @@ def verify_features(feature_dir, frame_id):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Preprocess BEV features for nuScenes dataset')
-    parser.add_argument('--input_dir', type=str,
-                       default='/home/wang/Dataset/v1.0-mini',
-                       help='Root directory of the nuScenes dataset')
-    parser.add_argument('--pretrained_path', type=str,
-                       default='/home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth',
-                       help='Path to pretrained encoder weights')
-    parser.add_argument('--device', type=str, default='cuda',
-                       choices=['cuda', 'cpu'],
-                       help='Device to run inference on')
-    parser.add_argument('--force_reprocess', action='store_true', default=False,
-                       help='Force reprocessing even if features already exist')
-    parser.add_argument('--verify', type=str,
-                       help='Verify features for a specific frame (format: frame_id)')
-    
+    parser.add_argument('--input_dir', type=str, default=None,
+                        help='Root directory of the nuScenes dataset')
+    parser.add_argument('--pretrained_path', type=str, default=None,
+                        help='Path to pretrained encoder weights')
+    parser.add_argument('--device', type=str, default=None,
+                        choices=['cuda', 'cpu'],
+                        help='Device to run inference on')
+    parser.add_argument('--force_reprocess', action='store_true', default=None,
+                        help='Force reprocessing even if features already exist')
+    parser.add_argument('--verify', type=str, default=None,
+                        help='Verify features for a specific frame (format: frame_id)')
+
     args = parser.parse_args()
-    
+
+    # Load merged config: defaults <- config/dataset.yaml <- CLI
+    defaults = {
+        'input_dir': '/mnt/data2/nuscenes',
+        'pretrained_path': os.path.join(str(project_root), 'checkpoints', 'interfuser', 'lidar_bev_encoder_only.pth'),
+        'device': 'cuda',
+        'force_reprocess': False,
+        'verify': None,
+    }
+    cfg = load_config('preprocess_bev_features_nusc', vars(args), defaults=defaults)
+
     # Verify mode
-    if args.verify:
-        feature_dir = os.path.join(args.input_dir, 'samples', 'LIDAR_TOP_BEV_FEATURES')
-        verify_features(feature_dir, args.verify)
+    if cfg.get('verify'):
+        feature_dir = os.path.join(cfg['input_dir'], 'samples', 'LIDAR_TOP_BEV_FEATURES')
+        verify_features(feature_dir, cfg['verify'])
         sys.exit(0)
-    
+
     # Check if input directory exists
-    if not os.path.exists(args.input_dir):
-        print(f"✗ Error: Input directory '{args.input_dir}' does not exist!")
+    if not os.path.exists(cfg['input_dir']):
+        print(f"✗ Error: Input directory '{cfg['input_dir']}' does not exist!")
         sys.exit(1)
-    
+
     # Check if pretrained weights exist
-    if not os.path.exists(args.pretrained_path):
-        print(f"⚠ Warning: Pretrained weights not found at '{args.pretrained_path}'")
+    if not os.path.exists(cfg['pretrained_path']):
+        print(f"⚠ Warning: Pretrained weights not found at '{cfg['pretrained_path']}'")
         response = input("Continue with random initialization? (y/n): ")
         if response.lower() != 'y':
             sys.exit(1)
-    
+
     # Check CUDA availability
-    if args.device == 'cuda' and not torch.cuda.is_available():
+    if cfg['device'] == 'cuda' and not torch.cuda.is_available():
         print("⚠ Warning: CUDA not available, falling back to CPU")
-        args.device = 'cpu'
-    
+        cfg['device'] = 'cpu'
+
     print("\n" + "=" * 70)
     print("nuScenes BEV Feature Preprocessing")
     print("=" * 70)
-    print(f"Input directory: {args.input_dir}")
-    print(f"Pretrained weights: {args.pretrained_path}")
-    print(f"Device: {args.device}")
-    print(f"Force reprocess: {args.force_reprocess}")
+    print(f"Input directory: {cfg['input_dir']}")
+    print(f"Pretrained weights: {cfg['pretrained_path']}")
+    print(f"Device: {cfg['device']}")
+    print(f"Force reprocess: {cfg['force_reprocess']}")
     print("=" * 70)
-    
+
     # Process nuScenes dataset
     process_nuscenes_dataset(
-        dataset_root=args.input_dir,
-        pretrained_path=args.pretrained_path,
-        device=args.device,
-        force_reprocess=args.force_reprocess
+        dataset_root=cfg['input_dir'],
+        pretrained_path=cfg['pretrained_path'],
+        device=cfg['device'],
+        force_reprocess=cfg.get('force_reprocess', False)
     )

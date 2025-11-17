@@ -380,12 +380,25 @@ def train_nusc_policy(config_path):
     
     if use_wandb:
         try:
-            # wandb.login(key="bddb5a05a0820c1157702750c9f0ce60bcac2bba", anonymous="must")
-            wandb.init(
-                project=config.get('logging', {}).get('wandb_project', "carla-diffusion-policy"),
-                name=config.get('logging', {}).get('run_name', "carla_dit_full_validation"),
-                mode=wandb_mode, 
-                resume='allow',  
+            # 支持从config动态读取wandb账号信息并自动登录（谨慎：不要把真实api key提交到仓库）
+            logging_cfg = config.get('logging', {})
+            wandb_entity = logging_cfg.get('wandb_entity')
+            wandb_api_key = logging_cfg.get('wandb_api_key')
+
+            if wandb_api_key:
+                # 优先通过环境变量注入，然后尝试login，这样在CI中也能工作
+                os.environ['WANDB_API_KEY'] = str(wandb_api_key)
+                try:
+                    wandb.login(key=str(wandb_api_key))
+                    print("✓ WandB login succeeded using provided api key")
+                except Exception as e:
+                    print(f"⚠ WandB login failed: {e}")
+
+            init_kwargs = dict(
+                project=logging_cfg.get('wandb_project', "carla-diffusion-policy"),
+                name=logging_cfg.get('run_name', "carla_dit_full_validation"),
+                mode=wandb_mode,
+                resume='allow',
                 config={
                     "learning_rate": config.get('optimizer', {}).get('lr', 5e-5),
                     "epochs": config.get('training', {}).get('num_epochs', 50),
@@ -400,13 +413,31 @@ def train_nusc_policy(config_path):
                     "num_workers": config.get('dataloader', {}).get('num_workers', 4)
                 }
             )
+
+            # 如果config里指定了entity（账号/组织），把它传给wandb.init
+            if wandb_entity:
+                init_kwargs['entity'] = wandb_entity
+
+            wandb.init(**init_kwargs)
             print(f"✓ WandB initialized in {wandb_mode} mode")
         except Exception as e:
             print(f"⚠ WandB initialization failed: {e}")
             use_wandb = False
     else:
         use_wandb = False
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 从config读取GPU ID配置
+    device_config = config.get('device', {})
+    gpu_ids = device_config.get('gpu_ids', [0])
+    
+    # 设置GPU和CUDA相关环境变量
+    if torch.cuda.is_available() and gpu_ids:
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
+        device = torch.device(f'cuda:{gpu_ids[0]}')
+        print(f"✓ Using GPU(s): {gpu_ids}")
+    else:
+        device = torch.device('cpu')
+        print("✓ Using CPU")
 
     # 加载nuScenes数据集
     print("\n=== Loading nuScenes Dataset ===")
@@ -604,7 +635,7 @@ def train_nusc_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train nuScenes Driving Policy with Diffusion DiT")
-    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/nuscenes.yaml", 
+    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/nuscences_server.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_nusc_policy(config_path=args.config_path)

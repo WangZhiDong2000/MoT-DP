@@ -9,7 +9,9 @@ import yaml
 import argparse
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+sys.path.insert(0, project_root)
+
+from dataset.config_loader import load_config
 
 
 def compute_action_stats_from_processed_data(pkl_path, max_samples=None):
@@ -133,55 +135,50 @@ def save_stats_to_config(stats, config_path):
 
 
 def main():
-    default_train_pkl = '/home/wang/Dataset/v1.0-mini/processed_data/nuscenes_processed_train.pkl'
-    default_config = os.path.join(project_root, 'config', 'nuscenes.yaml')
+    default_train_pkl = '/mnt/data2/nuscenes/processed_data/nuscenes_processed_train.pkl'
+    default_config = os.path.join(project_root, 'config', 'nuscences_server.yaml')
     parser = argparse.ArgumentParser(
         description='Compute action statistics from preprocessed nuScenes data'
     )
-    parser.add_argument(
-        '--pkl_path',
-        type=str,
-        default=default_train_pkl,
-        help=f'Path to processed pkl file (default: {default_train_pkl})'
-    )
-    parser.add_argument(
-        '--config_path',
-        type=str,
-        default=default_config,
-        help=f'Path to config file to save stats (default: {default_config})'
-    )
-    parser.add_argument(
-        '--max_samples',
-        type=int,
-        default=None,
-        help='Maximum number of samples to process (None = all)'
-    )
-    parser.add_argument(
-        '--no_save',
-        action='store_true',
-        help='Do not save stats to config file'
-    )
-    
+    parser.add_argument('--pkl_path', type=str, default=None,
+                        help=f'Path to processed pkl file (overrides config)')
+    parser.add_argument('--config_path', type=str, default=None,
+                        help=f'Path to config file to save stats (overrides config)')
+    parser.add_argument('--max_samples', type=int, default=None,
+                        help='Maximum number of samples to process (None = all)')
+    parser.add_argument('--no_save', action='store_true', default=None,
+                        help='Do not save stats to config file (overrides config)')
+
     args = parser.parse_args()
+
+    # Load merged config: defaults <- config/dataset.yaml <- CLI
+    defaults = {
+        'pkl_path': default_train_pkl,
+        'config_path': default_config,
+        'max_samples': None,
+        'no_save': False,
+    }
+    cfg = load_config('compute_action_stats', vars(args), defaults=defaults)
     
-    if not os.path.exists(args.pkl_path):
-        print(f"❌ Processed data file not found: {args.pkl_path}")
-        print("\nPlease run preprocess_nusc_new.py first to generate processed data.")
-        print("Or specify a different path using --pkl_path")
+    if not os.path.exists(cfg['pkl_path']):
+        print(f"❌ Processed data file not found: {cfg['pkl_path']}")
+        print("\nPlease run preprocess_nusc.py first to generate processed data.")
+        print("Or specify a different path in config/dataset.yaml or via --pkl_path")
         return
     
     try:
         stats = compute_action_stats_from_processed_data(
-            pkl_path=args.pkl_path,
-            max_samples=args.max_samples
+            pkl_path=cfg['pkl_path'],
+            max_samples=cfg.get('max_samples')
         )
-        
-        if not args.no_save:
-            config_dir = os.path.dirname(args.config_path)
+
+        if not cfg.get('no_save', False):
+            config_path = cfg.get('config_path', default_config)
+            config_dir = os.path.dirname(config_path)
             if not os.path.exists(config_dir):
                 os.makedirs(config_dir)
                 print(f"✓ Created config directory: {config_dir}")
-            save_stats_to_config(stats, args.config_path)
+            save_stats_to_config(stats, config_path)
         print("\n✓ Statistics computation completed successfully!")
         
     except Exception as e:

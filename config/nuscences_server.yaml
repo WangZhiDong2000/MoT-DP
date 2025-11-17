@@ -1,9 +1,10 @@
 dataset_type: nuscenes
 nuscenes:
-  processed_data_root: /home/wang/Dataset/v1.0-mini/processed_data
-  dataset_root: /home/wang/Dataset/v1.0-mini
+  processed_data_root: /mnt/data2/nuscenes/processed_data
+  dataset_root: /mnt/data2/nuscenes
 device:
-  gpu_ids: [0]  # GPU ID列表，例如 [0, 1, 2] 表示使用第0、1、2块GPU；[0] 表示只使用第0块GPU
+  gpu_ids:
+  - 0
 dataloader:
   batch_size: 128
   num_workers: 8
@@ -58,7 +59,7 @@ shape_meta:
       type: low_dim
 enable_action_normalization: true
 bev_encoder:
-  pretrained_path: /home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth
+  pretrained_path: /root/z_projects/code/MoT-DP-1/checkpoints/interfuser/lidar_bev_encoder_only.pth
   state_dim: 15
   feature_dim: 256
   use_group_norm: true
@@ -101,17 +102,16 @@ training:
   validation_freq: 5
   save_freq: 5
   early_stopping_patience: 10
-  checkpoint_dir: /home/wang/Project/MoT-DP/checkpoints/carla_dit_best
+  checkpoint_dir: /root/z_projects/code/MoT-DP-1/checkpoints/nusc_dit_best
 logging:
   use_wandb: true
   wandb_project: carla-diffusion-policy
   run_name: carla_dit_optimized
-  # 可选：指定wandb的entity（账号或组织），以及api key以便脚本在运行时自动登录
-  wandb_entity: null  # 例如: your-wandb-username 或 your-org
-  wandb_api_key: null # 明文api key或通过CI注入，不建议把实际密钥提交到仓库
-  checkpoint_dir: /home/wang/Project/MoT-DP/checkpoints/carla_dit_best
+  checkpoint_dir: /root/z_projects/code/MoT-DP-1/checkpoints/nusc_dit_best
   save_every: 5
   log_freq: 10
+  wandb_entity: wangzhidong2000-nanyang-technological-university-singapore
+  wandb_api_key: a0d403cb4dc1be3c5c7df4677a1b42d1c3e71b4f
 eval:
   num_episodes: 10
   max_steps: 500
@@ -129,14 +129,14 @@ model_optimization:
   lr_scheduler: cosine
 action_stats:
   min:
-  - -0.019322488456964493
-  - -1.1484386920928955
+  - -2.024064064025879
+  - -11.107964515686035
   max:
-  - 45.14558029174805
-  - 7.632166385650635
+  - 55.828826904296875
+  - 13.316089630126953
   mean:
-  - 9.865570068359375
-  - 0.10973117500543594
+  - 8.636817932128906
+  - -0.07355713099241257
   std:
-  - 11.043007850646973
-  - 0.6907913088798523
+  - 8.046710968017578
+  - 0.930279016494751

@@ -17,14 +17,19 @@ Output:
 """
 
 import os
+import sys
+from pathlib import Path
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
 import pickle
 import numpy as np
 import torch
 from tqdm import tqdm
 import argparse
-from pathlib import Path
 from pyquaternion import Quaternion
-import sys
+from dataset.config_loader import load_config
 
 
 def load_nuscenes_infos(infos_path):
@@ -401,50 +406,58 @@ def process_dataset(infos_path, dataset_root, output_dir, obs_horizon=4, action_
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Preprocess nuScenes dataset for training')
-    parser.add_argument('--infos_dir', type=str, 
-                       default='/home/wang/Project/MoT-DP/data/infos/mini',
-                       help='Directory containing nuScenes infos files')
-    parser.add_argument('--dataset_root', type=str,
-                       default='/home/wang/Dataset/v1.0-mini',
-                       help='Root directory of nuScenes dataset')
-    parser.add_argument('--output_dir', type=str,
-                       default='/home/wang/Dataset/v1.0-mini/processed_data',
-                       help='Output directory for processed samples')
-    parser.add_argument('--obs_horizon', type=int, default=4,
-                       help='Number of historical frames')
-    parser.add_argument('--action_horizon', type=int, default=6,
-                       help='Number of future frames to predict')
-    parser.add_argument('--split', type=str, choices=['train', 'val', 'both'], default='both',
-                       help='Which split to process')
-    
+    parser.add_argument('--infos_dir', type=str, default=None,
+                        help='Directory containing nuScenes infos files')
+    parser.add_argument('--dataset_root', type=str, default=None,
+                        help='Root directory of nuScenes dataset')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Output directory for processed samples')
+    parser.add_argument('--obs_horizon', type=int, default=None,
+                        help='Number of historical frames')
+    parser.add_argument('--action_horizon', type=int, default=None,
+                        help='Number of future frames to predict')
+    parser.add_argument('--split', type=str, choices=['train', 'val', 'both'], default=None,
+                        help='Which split to process')
+
     args = parser.parse_args()
-    
+
+    defaults = {
+        'infos_dir': os.path.join(project_root, 'data', 'infos'),
+        'dataset_root': '/mnt/data2/nuscenes',
+        'output_dir': '/mnt/data2/nuscenes/processed_data',
+        'obs_horizon': 4,
+        'action_horizon': 6,
+        'split': 'both',
+    }
+
+    cfg = load_config('preprocess_nusc', vars(args), defaults=defaults)
+
     # Process train and/or val splits
     splits_to_process = []
-    if args.split in ['train', 'both']:
+    if cfg['split'] in ['train', 'both']:
         splits_to_process.append('train')
-    if args.split in ['val', 'both']:
+    if cfg['split'] in ['val', 'both']:
         splits_to_process.append('val')
-    
+
     for split in splits_to_process:
         print(f"\n{'='*70}")
         print(f"Processing {split} split")
         print(f"{'='*70}")
-        
-        infos_path = os.path.join(args.infos_dir, f'nuscenes_infos_{split}.pkl')
-        
+
+        infos_path = os.path.join(cfg['infos_dir'], f'nuscenes_infos_{split}.pkl')
+
         if not os.path.exists(infos_path):
             print(f"Warning: {infos_path} not found, skipping {split} split")
             continue
-        
+
         process_dataset(
             infos_path=infos_path,
-            dataset_root=args.dataset_root,
-            output_dir=args.output_dir,
-            obs_horizon=args.obs_horizon,
-            action_horizon=args.action_horizon
+            dataset_root=cfg['dataset_root'],
+            output_dir=cfg['output_dir'],
+            obs_horizon=cfg['obs_horizon'],
+            action_horizon=cfg['action_horizon']
         )
-    
+
     print(f"\n{'='*70}")
     print("✓ All processing complete!")
     print(f"{'='*70}")

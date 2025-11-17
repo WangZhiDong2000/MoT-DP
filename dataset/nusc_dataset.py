@@ -9,12 +9,15 @@ This module loads preprocessed nuScenes samples with:
 - Ego status (velocity, acceleration, etc.)
 """
 
-import numpy as np
-from PIL import Image
 import os
 import sys
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+import numpy as np
+from PIL import Image
 import pickle
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torchvision.transforms as transforms
 import matplotlib
@@ -493,31 +496,41 @@ def visualize_sample(sample, save_path=None):
 
 if __name__ == "__main__":
     import argparse
-    
+    from dataset.config_loader import load_config
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--processed_data', type=str, 
-                       default='/home/wang/Dataset/v1.0-mini/processed_data/nuscenes_processed_train.pkl',
-                       help='Path to preprocessed data')
-    parser.add_argument('--dataset_root', type=str,
-                       default='/home/wang/Dataset/v1.0-mini',
-                       help='Root directory of nuScenes dataset')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'val'])
-    parser.add_argument('--visualize', default=True, action='store_true', help='Visualize samples')
-    parser.add_argument('--num_samples', type=int, default=5, help='Number of samples to visualize')
-    parser.add_argument('--output_dir', type=str,
-                       default='/home/wang/Project/MoT-DP/image/nusc_samples',
-                       help='Directory to save visualization images')
-    parser.add_argument('--save_prefix', type=str, default='sample',
-                       help='Prefix for saved visualization filenames')
-    
+    parser.add_argument('--processed_data', type=str, default=None,
+                        help='Path to preprocessed data')
+    parser.add_argument('--dataset_root', type=str, default=None,
+                        help='Root directory of nuScenes dataset')
+    parser.add_argument('--mode', type=str, default=None, choices=['train', 'val'])
+    parser.add_argument('--visualize', action='store_true', default=None, help='Visualize samples')
+    parser.add_argument('--num_samples', type=int, default=None, help='Number of samples to visualize')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Directory to save visualization images')
+    parser.add_argument('--save_prefix', type=str, default=None,
+                        help='Prefix for saved visualization filenames')
+
     args = parser.parse_args()
-    
+
+    defaults = {
+        'processed_data': '/mnt/data2/nuscenes/processed_data/nuscenes_processed_train.pkl',
+        'dataset_root': '/mnt/data2/nuscenes',
+        'mode': 'train',
+        'visualize': True,
+        'num_samples': 5,
+        'output_dir': os.path.join(project_root, 'image', 'nusc_samples'),
+        'save_prefix': 'sample',
+    }
+
+    cfg = load_config('nusc_dataset', vars(args), defaults=defaults)
+
     # Create dataset
     dataset = NUSCDataset(
-        processed_data_path=args.processed_data,
-        dataset_root=args.dataset_root,
-        mode=args.mode,
-        load_bev_images=args.visualize  
+        processed_data_path=cfg['processed_data'],
+        dataset_root=cfg['dataset_root'],
+        mode=cfg['mode'],
+        load_bev_images=cfg.get('visualize', False)
     )
     
     print(f"\n{'='*70}")
@@ -548,18 +561,19 @@ if __name__ == "__main__":
                 print(f"  {key:25s}: {value_str}")
     
     # Visualize samples
-    if args.visualize:
+    if cfg.get('visualize', False):
         print(f"\n{'='*70}")
         print(f"Generating Visualizations:")
         print(f"{'='*70}")
-        os.makedirs(args.output_dir, exist_ok=True)
-        num_samples_to_visualize = min(args.num_samples, len(dataset))
+        output_dir = cfg.get('output_dir')
+        os.makedirs(output_dir, exist_ok=True)
+        num_samples_to_visualize = min(cfg.get('num_samples', 5), len(dataset))
         random_indices = random.sample(range(len(dataset)), num_samples_to_visualize)
         print(f"Randomly selected sample indices: {random_indices}")
         
         for idx, sample_idx in enumerate(random_indices):
             sample = dataset[sample_idx]
-            save_path = os.path.join(args.output_dir, f'{args.save_prefix}_{sample_idx:03d}.png')
+            save_path = os.path.join(output_dir, f'{cfg.get("save_prefix", "sample")}_{sample_idx:03d}.png')
             visualize_sample(sample, save_path)
         
-        print(f"✓ Saved {num_samples_to_visualize} visualizations to {args.output_dir}")
+        print(f"✓ Saved {num_samples_to_visualize} visualizations to {output_dir}")
