@@ -118,6 +118,7 @@ class NUSCDataset(torch.utils.data.Dataset):
         ego_status = torch.tensor(sample['hist_ego_status'], dtype=torch.float32)  # (obs_horizon, 10)
         nav_command = torch.tensor(sample['hist_nav_command'], dtype=torch.float32)  # (obs_horizon, 3)
         ego_status_with_command = torch.cat([ego_status, nav_command], dim=-1)
+        ego_status_with_command=torch.cat([ego_status_with_command, hist_waypoints], dim=-1)  # (obs_horizon, 15)
         
         # Load obstacle information for future frames
         fut_obstacles = []
@@ -143,7 +144,7 @@ class NUSCDataset(torch.utils.data.Dataset):
             'fut_valid_mask': fut_valid_mask,              # (action_horizon,)
             
             # Ego status with command concatenated (obs_horizon dimension)
-            'ego_status': ego_status_with_command,         # (obs_horizon, 13) - [ego_status(10), command(3)]
+            'ego_status': ego_status_with_command,         # (obs_horizon, 15) - [accel(3), rot_rate(3), vel(3), steer(1), command(3), waypoint(2)]
             'command': nav_command,                        # (obs_horizon, 3) - kept for compatibility
             
             # Obstacle information for future frames
