@@ -538,36 +538,34 @@ def train_nusc_policy(config_path):
                 traceback.print_exc()
                 sys.stdout.flush()
                 continue
-            try:
-                sys.stdout.flush()
+
+            sys.stdout.flush()
                 
-                log_dict = {
+            log_dict = {
                     "epoch": epoch,
                     "train/loss": avg_train_loss,
                 }
         
-                if 'val_loss' in val_metrics:
-                    log_dict["val/loss"] = val_metrics['val_loss']
+            if 'val_loss' in val_metrics:
+                log_dict["val/loss"] = val_metrics['val_loss']
         
-                for key, value in val_metrics.items():
-                    if key == 'val_loss':
-                        continue  
-                    elif 'L2' in key:
-                        metric_name = key.replace('val_', '')
-                        log_dict[f"val/L2/{metric_name}"] = value
-                    elif 'collision' in key:
-                        metric_name = key.replace('val_', '')
-                        log_dict[f"val/collision/{metric_name}"] = value
-                    else:
-                        log_dict[f"val/{key.replace('val_', '')}"] = value
+            for key, value in val_metrics.items():
+                if key == 'val_loss':
+                    continue  
+                elif 'L2' in key:
+                    metric_name = key.replace('val_', '')
+                    log_dict[f"val/L2/{metric_name}"] = value
+                elif 'collision' in key:
+                    metric_name = key.replace('val_', '')
+                    log_dict[f"val/collision/{metric_name}"] = value
+                else:
+                    log_dict[f"val/{key.replace('val_', '')}"] = value
         
-                print("Logging to wandb...")
-                sys.stdout.flush()
-                safe_wandb_log(log_dict, use_wandb)
-                sys.stdout.flush()
-            except Exception as e:
-                import tracebackbest
-                traceback.print_exc()
+            print("Logging to wandb...")
+            sys.stdout.flush()
+            safe_wandb_log(log_dict, use_wandb)
+            sys.stdout.flush()
+
         
             print(f"Validation metrics:")
             for key, value in val_metrics.items():
