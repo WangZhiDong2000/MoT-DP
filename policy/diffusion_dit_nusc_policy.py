@@ -149,6 +149,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
         self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
 
+        # anchor
+        plan_anchor_path = '/root/z_projects/code/MoT-DP-1/data/kmeans/kmeans_plan_vocab_6.npy'
+        plan_anchor = np.load(plan_anchor_path)
+
+        self.plan_anchor = nn.Parameter(
+            torch.tensor(plan_anchor, dtype=torch.float32),
+            requires_grad=False,
+        ) # 6,8,2
+
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         if not self.enable_action_normalization or self.action_stats is None:
             return action
@@ -589,15 +598,30 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             **kwargs):
         """
         条件采样并返回中间去噪步骤
+        噪声加在归一化后的plan_anchor上（参考transfuser_model_v2.py的forward_train方法）
         """
         model = self.model
         scheduler = self.noise_scheduler
+        device = condition_data.device
+        bs = condition_data.shape[0]
 
-        trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
-            generator=generator)
+        # 1. 准备 plan_anchor：加噪声到归一化后的 plan_anchor
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs, 1, 1, 1)  # (bs, 6, 8, 2)
+        odo_info_fut = self.normalize_action(plan_anchor)  # 归一化到[-1, 1]
+        
+        # 添加噪声到归一化后的 plan_anchor
+        noise = torch.randn(odo_info_fut.shape, device=device)
+        timesteps = torch.randint(
+            0, self.noise_scheduler.config.get('num_train_timesteps', 100),
+            (bs,), device=device
+        ).long()
+        noisy_trajectory = scheduler.add_noise(
+            original_samples=odo_info_fut,
+            noise=noise,
+            timesteps=timesteps
+        ).float()
+        noisy_trajectory = torch.clamp(noisy_trajectory, min=-1, max=1)
+        trajectory = self.unnormalize_action(noisy_trajectory)  # 反归一化回原始范围
     
         scheduler.set_timesteps(self.num_inference_steps)
         
@@ -613,7 +637,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         # 保存去噪步骤
         denoising_steps = []
-        denoising_steps.append(trajectory.clone())  # 初始噪声
         
         total_steps = len(scheduler.timesteps)
         for i, t in enumerate(scheduler.timesteps):
@@ -630,13 +653,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 **kwargs
                 ).prev_sample
             
-            # 保存关键步骤（初始、33%、66%、最终）
-            if i == total_steps // 3 or i == 2 * total_steps // 3:
-                denoising_steps.append(trajectory.clone())
         
         # 最终结果
         trajectory[condition_mask] = condition_data[condition_mask]
-        denoising_steps.append(trajectory.clone())
 
         return trajectory, denoising_steps
 
