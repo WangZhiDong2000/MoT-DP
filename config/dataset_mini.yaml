@@ -1,0 +1,36 @@
+compute_action_stats:
+  pkl_path: /mnt/data2/nuscenes_mini/processed_data/nuscenes_processed_train.pkl
+  config_path: config/nuscences_mini_server.yaml
+  max_samples: null
+  no_save: false
+
+preprocess_nusc:
+  infos_dir: data/infos_mini
+  dataset_root: /mnt/data2/nuscenes_mini
+  output_dir: /mnt/data2/nuscenes_mini/processed_data
+  obs_horizon: 4
+  action_horizon: 6
+  split: both
+
+generate_lidar_bev_nusc:
+  input_dir: /mnt/data2/nuscenes_mini
+  output_dir: null
+  save_in_place: true
+  process_all: true
+  img_size: 448
+
+nusc_dataset:
+  processed_data: /mnt/data2/nuscenes_mini/processed_data/nuscenes_processed_train.pkl
+  dataset_root: /mnt/data2/nuscenes_mini
+  mode: train
+  visualize: True
+  num_samples: 5
+  output_dir: image/nusc_samples
+  save_prefix: sample
+
+preprocess_bev_features_nusc:
+  input_dir: /mnt/data2/nuscenes_mini
+  pretrained_path: checkpoints/interfuser/lidar_bev_encoder_only.pth
+  device: cuda
+  force_reprocess: false
+  verify: null

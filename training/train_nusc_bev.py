@@ -215,7 +215,19 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     if T >= 6: 
         metrics['L2_3s'] = np.mean(l2_errors[:, 5])
     
-    metrics['L2_avg'] = np.mean(l2_errors)
+    # L2_avg: 只计算1s, 2s, 3s时间步的平均
+    l2_avg_values = []
+    if T >= 2:
+        l2_avg_values.append(l2_errors[:, 1])
+    if T >= 4:
+        l2_avg_values.append(l2_errors[:, 3])
+    if T >= 6:
+        l2_avg_values.append(l2_errors[:, 5])
+    
+    if len(l2_avg_values) > 0:
+        metrics['L2_avg'] = np.mean(np.concatenate(l2_avg_values))
+    else:
+        metrics['L2_avg'] = 0.0
     
     # === 碰撞率指标（基于边界框重叠检测）===
     if fut_obstacles is not None:
@@ -288,7 +300,19 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
         if T >= 6:
             metrics['collision_3s'] = np.mean(collisions[:, 5])
         
-        metrics['collision_avg'] = np.mean(collisions)
+        # collision_avg: 只计算1s, 2s, 3s时间步的平均
+        collision_avg_values = []
+        if T >= 2:
+            collision_avg_values.append(collisions[:, 1])
+        if T >= 4:
+            collision_avg_values.append(collisions[:, 3])
+        if T >= 6:
+            collision_avg_values.append(collisions[:, 5])
+        
+        if len(collision_avg_values) > 0:
+            metrics['collision_avg'] = np.mean(np.concatenate(collision_avg_values))
+        else:
+            metrics['collision_avg'] = 0.0
     
     safe_metrics = {}
     for key, value in metrics.items():

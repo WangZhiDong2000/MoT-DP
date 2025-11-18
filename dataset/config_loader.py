@@ -17,7 +17,7 @@ def find_project_root(start_path=None):
 def load_dataset_yaml(yaml_path=None):
     if yaml_path is None:
         project_root = find_project_root()
-        yaml_path = os.path.join(project_root, 'config', 'dataset.yaml')
+        yaml_path = os.path.join(project_root, 'config', 'dataset_mini.yaml')
 
     if not os.path.exists(yaml_path):
         return {}
