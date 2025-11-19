@@ -1,5 +1,11 @@
 compute_action_stats:
-  pkl_path: /mnt/data2/nuscenes/processed_data/nuscenes_processed_train.pkl
+  # 统计模式1: 使用单一pkl文件
+  pkl_path: null
+  
+  # 统计模式2: 合并train和val统计（推荐）
+  train_pkl: /mnt/data2/nuscenes/processed_data/nuscenes_processed_train.pkl
+  val_pkl: /mnt/data2/nuscenes/processed_data/nuscenes_processed_val.pkl
+  
   config_path: config/nuscences_server.yaml
   max_samples: null
   no_save: false

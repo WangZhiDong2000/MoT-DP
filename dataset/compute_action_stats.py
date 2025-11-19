@@ -14,29 +14,49 @@ sys.path.insert(0, project_root)
 from dataset.config_loader import load_config
 
 
-def compute_action_stats_from_processed_data(pkl_path, max_samples=None):
+def compute_action_stats_from_processed_data(pkl_paths, max_samples=None):
     """
     Args:
-        pkl_path: 处理后的pkl文件路径 (如 nuscenes_processed_train.pkl)
+        pkl_paths: 处理后的pkl文件路径或路径列表 (如 nuscenes_processed_train.pkl 或 [train.pkl, val.pkl])
         max_samples: 最多处理多少个样本（None表示处理全部）
     
     Returns:
         stats: 包含min, max, mean, std的字典
     """
+    # 支持单个路径或路径列表
+    if isinstance(pkl_paths, str):
+        pkl_paths = [pkl_paths]
+    
     print(f"\n{'='*60}")
     print(f"Computing action statistics from processed nuScenes data...")
-    print(f"Dataset file: {pkl_path}")
+    print(f"Dataset files:")
+    for pkl_path in pkl_paths:
+        print(f"  - {pkl_path}")
     print(f"{'='*60}\n")
     
-    # Load preprocessed data
-    print("Loading preprocessed data...")
-    with open(pkl_path, 'rb') as f:
-        sys.modules['numpy._core'] = np.core
-        sys.modules['numpy._core.multiarray'] = np.core.multiarray
-        data = pickle.load(f)
+    all_samples = []
+    total_loaded = 0
     
-    samples = data['samples']
-    print(f"✓ Found {len(samples)} samples")
+    # Load preprocessed data from all files
+    for pkl_path in pkl_paths:
+        print(f"Loading preprocessed data from: {pkl_path}...")
+        if not os.path.exists(pkl_path):
+            print(f"⚠ File not found: {pkl_path}, skipping...")
+            continue
+            
+        with open(pkl_path, 'rb') as f:
+            sys.modules['numpy._core'] = np.core
+            sys.modules['numpy._core.multiarray'] = np.core.multiarray
+            data = pickle.load(f)
+        
+        samples = data['samples']
+        print(f"✓ Found {len(samples)} samples in this file")
+        all_samples.extend(samples)
+        total_loaded += len(samples)
+    
+    print(f"\n✓ Total loaded {total_loaded} samples from all files")
+    
+    samples = all_samples
     
     if max_samples is not None:
         samples = samples[:max_samples]
@@ -136,12 +156,17 @@ def save_stats_to_config(stats, config_path):
 
 def main():
     default_train_pkl = '/mnt/data2/nuscenes/processed_data/nuscenes_processed_train.pkl'
+    default_val_pkl = '/mnt/data2/nuscenes/processed_data/nuscenes_processed_val.pkl'
     default_config = os.path.join(project_root, 'config', 'nuscences_server.yaml')
     parser = argparse.ArgumentParser(
-        description='Compute action statistics from preprocessed nuScenes data'
+        description='Compute action statistics from preprocessed nuScenes data (train+val combined)'
     )
     parser.add_argument('--pkl_path', type=str, default=None,
-                        help=f'Path to processed pkl file (overrides config)')
+                        help=f'Path to single processed pkl file (overrides config)')
+    parser.add_argument('--train_pkl', type=str, default=None,
+                        help=f'Path to training pkl file')
+    parser.add_argument('--val_pkl', type=str, default=None,
+                        help=f'Path to validation pkl file')
     parser.add_argument('--config_path', type=str, default=None,
                         help=f'Path to config file to save stats (overrides config)')
     parser.add_argument('--max_samples', type=int, default=None,
@@ -153,22 +178,48 @@ def main():
 
     # Load merged config: defaults <- config/dataset.yaml <- CLI
     defaults = {
-        'pkl_path': default_train_pkl,
+        'pkl_path': None,
+        'train_pkl': default_train_pkl,
+        'val_pkl': default_val_pkl,
         'config_path': default_config,
         'max_samples': None,
         'no_save': False,
     }
     cfg = load_config('compute_action_stats', vars(args), defaults=defaults)
     
-    if not os.path.exists(cfg['pkl_path']):
-        print(f"❌ Processed data file not found: {cfg['pkl_path']}")
+    # 确定要使用的pkl文件路径
+    if cfg.get('pkl_path'):
+        # 如果指定了单一文件，只用那个
+        pkl_paths = [cfg['pkl_path']]
+        print("Using single pkl file from --pkl_path")
+    else:
+        # 否则使用 train + val 合并
+        pkl_paths = []
+        if cfg.get('train_pkl') and os.path.exists(cfg['train_pkl']):
+            pkl_paths.append(cfg['train_pkl'])
+        if cfg.get('val_pkl') and os.path.exists(cfg['val_pkl']):
+            pkl_paths.append(cfg['val_pkl'])
+        
+        if not pkl_paths:
+            print(f"❌ No valid pkl files found:")
+            print(f"   Train: {cfg.get('train_pkl')}")
+            print(f"   Val: {cfg.get('val_pkl')}")
+            print("\nPlease run preprocess_nusc.py first to generate processed data.")
+            print("Or specify files via --pkl_path, --train_pkl, --val_pkl or config/dataset.yaml")
+            return
+    
+    if not all(os.path.exists(p) for p in pkl_paths):
+        missing = [p for p in pkl_paths if not os.path.exists(p)]
+        print(f"❌ Processed data files not found:")
+        for p in missing:
+            print(f"   - {p}")
         print("\nPlease run preprocess_nusc.py first to generate processed data.")
-        print("Or specify a different path in config/dataset.yaml or via --pkl_path")
+        print("Or specify different paths in config/dataset.yaml or via CLI arguments")
         return
     
     try:
         stats = compute_action_stats_from_processed_data(
-            pkl_path=cfg['pkl_path'],
+            pkl_paths=pkl_paths,
             max_samples=cfg.get('max_samples')
         )
 
