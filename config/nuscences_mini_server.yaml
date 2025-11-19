@@ -4,7 +4,7 @@ nuscenes:
   dataset_root: /mnt/data2/nuscenes_mini
 device:
   gpu_ids:
-  - 0
+  - 6
 dataloader:
   batch_size: 128
   num_workers: 8
@@ -85,6 +85,7 @@ policy:
   n_cond_layers: 4
   action_horizon: 6
   num_inference_steps: 100
+  use_anchor: false
 noise_scheduler:
   num_diffusion_steps: 100
   beta_start: 0.0001

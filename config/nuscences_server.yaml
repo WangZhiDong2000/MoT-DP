@@ -85,6 +85,7 @@ policy:
   n_cond_layers: 4
   action_horizon: 6
   num_inference_steps: 100
+  use_anchor: false
 noise_scheduler:
   num_diffusion_steps: 100
   beta_start: 0.0001

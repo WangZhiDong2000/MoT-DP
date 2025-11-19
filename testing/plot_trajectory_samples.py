@@ -323,11 +323,11 @@ def plot_sample_with_three_subplots(sample, save_path=None):
     # Add info text
     if 'command' in sample:
         nav_cmd = sample['command'][0].cpu() if isinstance(sample['command'], torch.Tensor) else sample['command'][0]
-        cmd_names = ['Left', 'Straight', 'Right']
+        cmd_names = ['Right', 'Left', 'Straight']
         cmd_idx = torch.argmax(nav_cmd).item() if isinstance(nav_cmd, torch.Tensor) else np.argmax(nav_cmd)
     else:
-        cmd_idx = 1
-        cmd_names = ['Left', 'Straight', 'Right']
+        cmd_idx = 3
+        cmd_names = ['Right', 'Left', 'Straight']
     
     if 'ego_status' in sample:
         ego_status = sample['ego_status'][0].cpu() if isinstance(sample['ego_status'], torch.Tensor) else sample['ego_status'][0]
@@ -393,7 +393,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
-    config_path = os.path.join(project_root, "config/nuscenes.yaml")
+    config_path = os.path.join(project_root, "config/nuscences_mini_server.yaml")
     config = load_config(config_path)
     
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")

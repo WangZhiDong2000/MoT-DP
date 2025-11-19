@@ -85,7 +85,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             print("  Continuing with random initialization...")
         
         self.obs_encoder = obs_encoder
-        self.obs_encoder.cuda()
 
         # TODO load vlm and vlm encoder model）
         self.vlm_backbone = None
@@ -149,18 +148,33 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
         self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
 
-        # anchor
-        plan_anchor_path = '/root/z_projects/code/MoT-DP-1/data/kmeans/kmeans_plan_vocab_6.npy'
-        plan_anchor = np.load(plan_anchor_path)  # (6, 8, 2)
+        # anchor - optional based on config
+        use_anchor = policy_cfg.get('use_anchor', False)
+        self.use_anchor = use_anchor
         
-        # 只保留第0条轨迹，并交换x和y坐标
-        plan_anchor = plan_anchor[0:1]  # (1, 6, 2)
-        plan_anchor = plan_anchor[..., [1, 0]]  # 交换x和y
+        if use_anchor:
+            plan_anchor_path = policy_cfg.get('plan_anchor_path', '/root/z_projects/code/MoT-DP-1/data/kmeans/kmeans_plan_vocab_6.npy')
+            if os.path.exists(plan_anchor_path):
+                plan_anchor = np.load(plan_anchor_path)  # (6, 8, 2)
+                
+                # 只保留第0条轨迹，并交换x和y坐标
+                plan_anchor = plan_anchor[0:1]  # (1, 8, 2)
+                plan_anchor = plan_anchor[..., [1, 0]]  # 交换x和y
 
-        self.plan_anchor = nn.Parameter(
-            torch.tensor(plan_anchor, dtype=torch.float32),
-            requires_grad=False,
-        ) 
+                self.plan_anchor = nn.Parameter(
+                    torch.tensor(plan_anchor, dtype=torch.float32),
+                    requires_grad=False,
+                )
+                print(f"✓ Plan anchor loaded from: {plan_anchor_path}")
+                print(f"  Anchor shape: {plan_anchor.shape}")
+            else:
+                print(f"⚠ Plan anchor path not found: {plan_anchor_path}")
+                print("  Disabling anchor-based sampling")
+                self.use_anchor = False
+                self.plan_anchor = None
+        else:
+            print("⚠ Anchor-based sampling disabled")
+            self.plan_anchor = None 
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         if not self.enable_action_normalization or self.action_stats is None:
@@ -205,11 +219,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             如果return_attention=True: (j_ctrl特征, attention_map) 
         """
         try:
-            state = obs_dict['ego_status'].to(device='cuda', dtype=torch.float32)  # (B, 13)
+            device = next(self.parameters()).device
+            state = obs_dict['ego_status'].to(device=device, dtype=torch.float32)  # (B, 13)
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
             if use_precomputed:
-                lidar_token = obs_dict['lidar_token'].to(device='cuda', dtype=torch.float32)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device='cuda', dtype=torch.float32)
+                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=torch.float32)
+                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=torch.float32)
                 
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
@@ -232,7 +247,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 if 'lidar_bev' not in obs_dict:
                     raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
                 
-                lidar_bev_img = obs_dict['lidar_bev'].to(device='cuda', dtype=torch.float32)
+                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=torch.float32)
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
                         image=lidar_bev_img,
@@ -376,22 +391,31 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         device = condition_data.device
         bs = condition_data.shape[0]
 
-        # 1. 准备 plan_anchor：使用anchor轨迹，加噪声到归一化后的anchor
-        plan_anchor = self.plan_anchor.repeat(bs, 1, 1)  # (bs, 6, 2)
-        odo_info_fut = self.normalize_action(plan_anchor)  # 归一化到[-1, 1]
-        
-        # 添加噪声到归一化后的 plan_anchor
-        noise = torch.randn(odo_info_fut.shape, device=device)
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.get('num_train_timesteps', 100),
-            (bs,), device=device
-        ).long()
-        noisy_trajectory = scheduler.add_noise(
-            original_samples=odo_info_fut,
-            noise=noise,
-            timesteps=timesteps
-        ).float()
-        trajectory = torch.clamp(noisy_trajectory, min=-1, max=1)
+        # Initialize trajectory based on anchor configuration
+        if self.use_anchor and self.plan_anchor is not None:
+            # 1. 准备 plan_anchor：使用anchor轨迹，加噪声到归一化后的anchor
+            plan_anchor = self.plan_anchor.to(device).repeat(bs, 1, 1)  # (bs, 8, 2)
+            odo_info_fut = self.normalize_action(plan_anchor)  # 归一化到[-1, 1]
+            
+            # 添加噪声到归一化后的 plan_anchor
+            noise = torch.randn(odo_info_fut.shape, device=device)
+            timesteps = torch.randint(
+                0, self.noise_scheduler.config.get('num_train_timesteps', 100),
+                (bs,), device=device
+            ).long()
+            noisy_trajectory = scheduler.add_noise(
+                original_samples=odo_info_fut,
+                noise=noise,
+                timesteps=timesteps
+            ).float()
+            trajectory = torch.clamp(noisy_trajectory, min=-1, max=1)
+        else:
+            # 直接从高斯分布采样
+            trajectory = torch.randn(
+                size=condition_data.shape, 
+                dtype=condition_data.dtype,
+                device=device,
+                generator=generator)
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)

@@ -463,7 +463,7 @@ def visualize_sample(sample, save_path=None):
     
     # Add info text
     nav_cmd = sample['command'][0].cpu()
-    cmd_names = ['Left', 'Straight', 'Right']
+    cmd_names = ['Right', 'Left', 'Straight']
     cmd_idx = torch.argmax(nav_cmd).item()
     ego_status = sample['ego_status'][0].cpu()  # (13,)
     vel_x, vel_y, vel_z = ego_status[6], ego_status[7], ego_status[8]
