@@ -664,7 +664,7 @@ def train_nusc_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train nuScenes Driving Policy with Diffusion DiT")
-    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/nuscences_mini_server.yaml", 
+    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/nuscences_server.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_nusc_policy(config_path=args.config_path)

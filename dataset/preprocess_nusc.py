@@ -140,6 +140,7 @@ def get_future_waypoints(infos, current_idx, scene_token, action_horizon=6):
     Returns:
         waypoints_fut: List of future waypoints [[x, y], ...], length = action_horizon
         valid_mask: Boolean mask indicating valid waypoints
+        None if any future frame is missing (no padding)
     """
     current_info = infos[current_idx]
     current_global2ego = ego_to_local_transform(
@@ -164,12 +165,8 @@ def get_future_waypoints(infos, current_idx, scene_token, action_horizon=6):
             waypoints_fut.append(waypoint_ego)
             valid_mask.append(True)
         else:
-            # Pad with last valid waypoint or zeros
-            if waypoints_fut:
-                waypoints_fut.append(waypoints_fut[-1].copy())
-            else:
-                waypoints_fut.append(np.array([0.0, 0.0]))
-            valid_mask.append(False)
+            # Missing future frame - return None to skip this sample
+            return None, None
     
     return waypoints_fut, valid_mask
 
@@ -192,8 +189,8 @@ def process_sample(infos, idx, dataset_root, obs_horizon=4, action_horizon=6):
         else:
             break
     
-    # Skip if we don't have at least half of the required future frames
-    if num_future < action_horizon // 2:
+    # Skip if we don't have ALL required future frames (no padding allowed)
+    if num_future < action_horizon:
         return None
     
     # Extract lidar token
@@ -242,6 +239,10 @@ def process_sample(infos, idx, dataset_root, obs_horizon=4, action_horizon=6):
     
     # Get future waypoints
     fut_waypoints, fut_valid_mask = get_future_waypoints(infos, idx, scene_token, action_horizon)
+    
+    # Skip if any future frame is missing
+    if fut_waypoints is None or fut_valid_mask is None:
+        return None
     
     # Get current ego status and navigation command (for backward compatibility)
     ego_status = info['ego_status']  # Shape: (10,)

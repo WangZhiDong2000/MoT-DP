@@ -393,7 +393,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
-    config_path = os.path.join(project_root, "config/nuscences_mini_server.yaml")
+    config_path = os.path.join(project_root, "config/nuscences_server.yaml")
     config = load_config(config_path)
     
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")

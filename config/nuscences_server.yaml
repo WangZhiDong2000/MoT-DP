@@ -13,7 +13,7 @@ dataloader:
   prefetch_factor: 2
   shuffle: true
 obs_horizon: 4
-pred_horizon: 6
+pred_horizon: 10
 action_horizon: 6
 n_obs_steps: 4
 ema:
@@ -74,15 +74,15 @@ policy:
   n_obs_steps: 4
   cond_dim: 256
   obs_as_global_cond: true
-  n_layer: 8
-  n_head: 8
-  n_emb: 512
+  n_layer: 12
+  n_head: 16
+  n_emb: 1024
   p_drop_emb: 0.1
   p_drop_attn: 0.1
   causal_attn: true
   time_as_cond: true
   obs_as_cond: true
-  n_cond_layers: 4
+  n_cond_layers: 6
   action_horizon: 6
   num_inference_steps: 100
   use_anchor: false
@@ -136,8 +136,8 @@ action_stats:
   - 55.828826904296875
   - 13.316089630126953
   mean:
-  - 8.73056697845459
-  - -0.07620766013860703
+  - 8.855836868286133
+  - -0.07721711695194244
   std:
-  - 8.043583869934082
-  - 0.9240672588348389
+  - 8.16093921661377
+  - 0.948141872882843
