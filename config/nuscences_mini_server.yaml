@@ -4,7 +4,7 @@ nuscenes:
   dataset_root: /mnt/data2/nuscenes_mini
 device:
   gpu_ids:
-  - 6
+  - 5
 dataloader:
   batch_size: 128
   num_workers: 8

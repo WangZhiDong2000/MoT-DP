@@ -527,7 +527,7 @@ def train_nusc_policy(config_path):
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
-    best_l2_avg = float('inf')  # Track best L2_avg for model selection
+    best_l2_3s = float('inf')  # Track best L2_3s for model selection
     val_loss = None  
     val_metrics = {}  
     
@@ -628,11 +628,11 @@ def train_nusc_policy(config_path):
                 print(f"  {key}: {value:.4f}")
         
             val_loss = val_metrics.get('val_loss', float('inf'))
-            l2_avg = val_metrics.get('val_L2_avg', float('inf'))
+            l2_3s = val_metrics.get('val_L2_3s', float('inf'))
             
-            # Save best model based on L2_avg instead of val_loss
-            if l2_avg < best_l2_avg:
-                best_l2_avg = l2_avg
+            # Save best model based on L2_3s instead of val_loss
+            if l2_3s < best_l2_3s:
+                best_l2_3s = l2_3s
                 torch.save({
                         'model_state_dict': policy.state_dict(),
                         'config': config,
@@ -641,21 +641,21 @@ def train_nusc_policy(config_path):
                         'train_loss': avg_train_loss,
                         'val_metrics': val_metrics
                         }, os.path.join(checkpoint_dir, "carla_policy_best.pt"))
-                print(f"✓ New best model saved with L2_avg: {l2_avg:.4f} (val_loss: {val_loss:.4f})")
+                print(f"✓ New best model saved with L2_3s: {l2_3s:.4f} (val_loss: {val_loss:.4f})")
                
                 safe_wandb_log({
                         "best_model/epoch": epoch,
-                        "best_model/L2_avg": l2_avg,
+                        "best_model/L2_3s": l2_3s,
                         "best_model/val_loss": val_loss,
                         "best_model/train_loss": avg_train_loss
                     }, use_wandb)
     
     print("Training completed!")
-    print(f"Best L2_avg: {best_l2_avg:.4f}")
+    print(f"Best L2_3s: {best_l2_3s:.4f}")
     safe_wandb_log({
         "training/completed": 0.0,
         "training/total_epochs": num_epochs,
-        "training/best_l2_avg": best_l2_avg,
+        "training/best_l2_3s": best_l2_3s,
         "training/final_train_loss": avg_train_loss
     }, use_wandb)
     
