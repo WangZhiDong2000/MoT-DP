@@ -128,7 +128,7 @@ class NUSCDataset(torch.utils.data.Dataset):
         waypoint_max = torch.tensor([55.828826904296875, 13.316089630126953], dtype=torch.float32)
         hist_waypoints_normalized = (hist_waypoints - waypoint_min) / (waypoint_max - waypoint_min)
         
-        ego_status_with_command=torch.cat([ego_status_with_command, hist_waypoints_normalized], dim=-1)  # (obs_horizon, 15)
+        ego_status_with_waypoints=torch.cat([ego_status_with_command, hist_waypoints_normalized], dim=-1)  # (obs_horizon, 15)
         
         # Load obstacle information for future frames
         fut_obstacles = []
@@ -154,7 +154,7 @@ class NUSCDataset(torch.utils.data.Dataset):
             'fut_valid_mask': fut_valid_mask,              # (action_horizon,)
             
             # Ego status with command concatenated (obs_horizon dimension)
-            'ego_status': ego_status_with_command,         # (obs_horizon, 15) - [accel(3), rot_rate(3), vel(3), steer(1), command(3), waypoint(2)]
+            'ego_status': ego_status_with_waypoints,         # (obs_horizon, 15) - [accel(3), rot_rate(3), vel(3), steer(1), command(3), waypoint(2)]
             'command': nav_command,                        # (obs_horizon, 3) - kept for compatibility
             
             # Obstacle information for future frames

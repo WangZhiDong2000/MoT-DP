@@ -240,32 +240,77 @@ class CustomDecoderLayer(nn.Module):
         self.norm4 = nn.LayerNorm(d_model)
         
         self.activation = torch.nn.functional.gelu
+        
+        # AdaLN modulation - 生成 12 个参数：4组 (shift, scale, gate) 分别用于4个norm
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 12 * d_model, bias=True)
+        )
     
-    def forward(self, tgt, memory, vl_features, tgt_mask=None, memory_mask=None, 
+    def modulate(self, x, shift, scale):
+        """AdaLN modulation function"""
+        if shift is None:
+            return x * (1 + scale.unsqueeze(1))
+        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    
+    def forward(self, tgt, memory, vl_features, conditioning=None, tgt_mask=None, memory_mask=None, 
                 vl_key_padding_mask=None):
         
-        # three masks are used: tgt_mask, memory_mask, vl_key_padding_mask
-        # 1. Self-attention on trajectory 
-        tgt2 = self.norm1(tgt)
-        tgt2, _ = self.self_attn(tgt2, tgt2, tgt2, attn_mask=tgt_mask, key_padding_mask=None)
-        tgt = tgt + self.dropout1(tgt2)
+        # 如果提供了 conditioning，生成调制参数
+        if conditioning is not None:
+            mod_params = self.adaLN_modulation(conditioning)
+            shift_self, scale_self, gate_self, \
+            shift_mem_vl, scale_mem_vl, gate_mem_vl, \
+            shift_traj_mem, scale_traj_mem, gate_traj_mem, \
+            shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(12, dim=1)
+        else:
+            # 如果没有 conditioning，使用默认值（不进行modulation）
+            shift_self = scale_self = gate_self = None
+            shift_mem_vl = scale_mem_vl = gate_mem_vl = None
+            shift_traj_mem = scale_traj_mem = gate_traj_mem = None
+            shift_ffn = scale_ffn = gate_ffn = None
         
-        # 2. Memory-VL cross attention 
+        # 1. Self-attention on trajectory with modulation
+        tgt2 = self.norm1(tgt)
+        if conditioning is not None:
+            tgt2 = self.modulate(tgt2, shift_self, scale_self)
+        tgt2, _ = self.self_attn(tgt2, tgt2, tgt2, attn_mask=tgt_mask, key_padding_mask=None)
+        if conditioning is not None:
+            tgt = tgt + gate_self.unsqueeze(1) * tgt2
+        else:
+            tgt = tgt + self.dropout1(tgt2)
+        
+        # 2. Memory-VL cross attention with modulation
         memory2 = self.norm2(memory)
+        if conditioning is not None:
+            memory2 = self.modulate(memory2, shift_mem_vl, scale_mem_vl)
         enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, vl_features, vl_features, 
                                                       key_padding_mask=vl_key_padding_mask)
-        enhanced_memory = memory + self.dropout2(enhanced_memory_output)
+        if conditioning is not None:
+            enhanced_memory = memory + gate_mem_vl.unsqueeze(1) * enhanced_memory_output
+        else:
+            enhanced_memory = memory + self.dropout2(enhanced_memory_output)
         
-        # 3. Trajectory-Memory cross attention 
+        # 3. Trajectory-Memory cross attention with modulation
         tgt2 = self.norm3(tgt)
+        if conditioning is not None:
+            tgt2 = self.modulate(tgt2, shift_traj_mem, scale_traj_mem)
         tgt2, _ = self.traj_memory_cross_attn(tgt2, enhanced_memory, enhanced_memory, 
                                              attn_mask=memory_mask, key_padding_mask=None)
-        tgt = tgt + self.dropout3(tgt2)
+        if conditioning is not None:
+            tgt = tgt + gate_traj_mem.unsqueeze(1) * tgt2
+        else:
+            tgt = tgt + self.dropout3(tgt2)
         
-        # 4. Feed forward
+        # 4. Feed forward with modulation
         tgt2 = self.norm4(tgt)
+        if conditioning is not None:
+            tgt2 = self.modulate(tgt2, shift_ffn, scale_ffn)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout(tgt2)
+        if conditioning is not None:
+            tgt = tgt + gate_ffn.unsqueeze(1) * tgt2
+        else:
+            tgt = tgt + self.dropout(tgt2)
             
         return tgt
 
@@ -318,14 +363,15 @@ class CustomTransformerDecoder(nn.Module):
         return memory_mask
         
     def forward(self, tgt, memory, vl_features, cond=None, tgt_mask=None, 
-                vl_key_padding_mask=None):
+                vl_key_padding_mask=None, conditioning=None):
         # Generate dynamic memory mask
         memory_mask = self._generate_memory_mask(tgt, memory, cond, tgt_mask)
         
         # Decoder layers
         output = tgt
         for layer in self.layers:
-            output = layer(output, memory, vl_features, tgt_mask=tgt_mask, memory_mask=memory_mask,
+            output = layer(output, memory, vl_features, conditioning=conditioning, 
+                          tgt_mask=tgt_mask, memory_mask=memory_mask,
                           vl_key_padding_mask=vl_key_padding_mask)
         return output
 
@@ -359,7 +405,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             causal_attn: bool=False,
             obs_as_cond: bool=False,
             n_cond_layers: int = 4,
-            vl_emb_dim: int = 1536
+            vl_emb_dim: int = 1536,
+            status_dim: int = 15  # ego_status 的维度 (默认15以匹配nuScenes配置)
         ) -> None:
         super().__init__()
 
@@ -382,6 +429,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
+        
+        # AdaLN components for ego_status modulation
+        self.status_proj = nn.Linear(status_dim, n_emb)  # 投影 ego_status 到 n_emb 维度
+        self.time_emb = SinusoidalPosEmb(n_emb)  # 时间步编码
 
         # Custom encoder block that handles all condition processing
         self.encoder_block = CustomEncoderBlock(
@@ -434,6 +485,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.vl_emb_dim = vl_emb_dim
 
         self.apply(self._init_weights)
+        
+        # Initialize AdaLN modulation weights to zero (like in recogdrive.py)
+        def zero_out_init(module: nn.Module):
+            if isinstance(module, nn.Linear):
+                nn.init.constant_(module.weight, 0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        
+        # Zero out adaLN_modulation in all decoder layers
+        for layer in self.decoder.layers:
+            if hasattr(layer, 'adaLN_modulation'):
+                layer.adaLN_modulation.apply(zero_out_init)
+        
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
@@ -447,6 +511,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.TransformerEncoder,
             nn.TransformerDecoder,
             nn.GELU,
+            nn.SiLU,  # 添加 SiLU
             nn.Sequential,
             CustomEncoderBlock,
             CustomDecoderLayer,
@@ -562,12 +627,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
         vl_embeds: torch.Tensor,
-        cond: torch.Tensor, **kwargs):
+        cond: torch.Tensor,
+        current_status: Optional[torch.Tensor] = None,  # 新增参数: (B, 13)
+        **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
-        vl_embeds: (B, T_vl, D_vl) 
+        vl_embeds: (B, T_vl, D_vl)
+        current_status: (B, status_dim) ego status for AdaLN modulation
         output: (B,T,input_dim)
         """
         sample = sample.contiguous()
@@ -582,7 +650,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
             timesteps = timesteps[None].to(sample.device)
         timesteps = timesteps.expand(sample.shape[0])
         
-        # 2. Check VL padding
+        # 2. Generate conditioning from timestep and current_status (AdaLN)
+        time_embedding = self.time_emb(timesteps)  # (B, n_emb)
+        conditioning = None
+        if current_status is not None:
+            status_embedding = self.status_proj(current_status)  # (B, n_emb)
+            conditioning = time_embedding + status_embedding  # (B, n_emb)
+
+        
+        # 3. Check VL padding
         vl_padding_mask = None
         if 'vl_mask' in kwargs and kwargs['vl_mask'] is not None:
             vl_padding_mask = ~kwargs['vl_mask']  
@@ -590,31 +666,33 @@ class TransformerForDiffusion(ModuleAttrMixin):
             vl_norm = torch.norm(vl_embeds, dim=-1)  # (B, T_vl)
             vl_padding_mask = (vl_norm == 0) 
         
-        # 3. Process conditions through encoder block to get memory
+        # 4. Process conditions through encoder block to get memory
         memory, vl_features = self.encoder_block(
             timestep=timesteps, 
             vl_embeds=vl_embeds, 
             cond=cond, 
             vl_padding_mask=vl_padding_mask)
         
-        # 4. Pre-decoder processing
+        # 5. Pre-decoder processing
         token_embeddings = self.input_emb(sample)
         t = token_embeddings.shape[1]
         position_embeddings = self.pos_emb[:, :t, :]
         x = self.drop(token_embeddings + position_embeddings)
         x = self.pre_decoder_norm(x)
         
-        # 5. Decoder with integrated memory mask handling and VL cross attention
+        # 6. Decoder with integrated memory mask handling and VL cross attention
+        # Pass conditioning to decoder for AdaLN modulation
         x = self.decoder(
             tgt=x,
             memory=memory,
             vl_features=vl_features,
             cond=cond,
             tgt_mask=self.mask,
-            vl_key_padding_mask=vl_padding_mask
+            vl_key_padding_mask=vl_padding_mask,
+            conditioning=conditioning  # 传递 conditioning
         )        
         
-        # 6. trajectory head 
+        # 7. trajectory head 
         x = self.trajectory_head(x)
         return x
 
@@ -630,7 +708,8 @@ def test():
         cond_dim=10,
         causal_attn=True,
         n_cond_layers=4,
-        vl_emb_dim=1536
+        vl_emb_dim=1536,
+        status_dim=13  # ego_status 维度
     )
     opt = transformer.configure_optimizers()
     
@@ -638,8 +717,29 @@ def test():
     sample = torch.zeros((4,8,16))
     cond = torch.zeros((4,4,10))
     vl_embeds = torch.ones((4,36,1536))
+    
+    # Test 1: Without current_status (backward compatibility)
+    print("Test 1: Without current_status")
     out = transformer(sample, timestep, vl_embeds, cond)
-    print(out.shape)
+    print(f"Output shape: {out.shape}")
+    
+    # Test 2: With current_status (AdaLN modulation)
+    print("\nTest 2: With current_status (AdaLN modulation)")
+    current_status = torch.randn((4, 13))  # (B, 13)
+    out_with_status = transformer(sample, timestep, vl_embeds, cond, current_status=current_status)
+    print(f"Output shape with status: {out_with_status.shape}")
+    
+    # Test 3: Verify outputs are different with/without status
+    print("\nTest 3: Verify modulation effect")
+    diff = torch.abs(out - out_with_status).mean()
+    print(f"Mean difference between outputs: {diff:.6f}")
+    if diff > 0:
+        print("✓ AdaLN modulation is working!")
+    else:
+        print("⚠ Warning: Outputs are identical (modulation may not be working)")
+    
+    print("\n✓ All tests passed!")
+
 
     
 if __name__ == "__main__":
