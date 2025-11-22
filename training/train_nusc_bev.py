@@ -519,13 +519,23 @@ def train_nusc_policy(config_path):
     
     print("Initializing policy model...")
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)  
-    lr = config.get('optimizer', {}).get('lr', 5e-5)
+    lr = config.get('optimizer', {}).get('lr', 1e-4)  # Changed default from 5e-5 to 1e-4
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    # Add cosine learning rate scheduler
+    num_epochs = config.get('training', {}).get('num_epochs', 50)
+    min_lr = 1e-6  # Minimum learning rate for cosine annealing
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=num_epochs, 
+        eta_min=min_lr
+    )
+    print(f"✓ Cosine LR scheduler initialized: {lr:.2e} -> {min_lr:.2e} over {num_epochs} epochs")
+    
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
     best_l2_3s = float('inf')  # Track best L2_3s for model selection
     val_loss = None  
@@ -565,6 +575,11 @@ def train_nusc_policy(config_path):
         
         avg_train_loss = np.mean(train_losses)
         print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
+        
+        # Step the learning rate scheduler
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
         torch.save({
                     'model_state_dict': policy.state_dict(),
                     'config': config,

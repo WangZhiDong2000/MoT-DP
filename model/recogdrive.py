@@ -14,10 +14,10 @@ from diffusers.models.embeddings import (
     Timesteps,
 )
 
-from .blocks.rmsnorm import RMSNorm
-from .blocks.attention import Attention
-from .blocks.rope import RotaryEmbedding
-from .blocks.encoder import SwiGLUFFN
+# from .blocks.rmsnorm import RMSNorm
+# from .blocks.attention import Attention
+# from .blocks.rope import RotaryEmbedding
+# from .blocks.encoder import SwiGLUFFN
 
 class TimestepEncoder(nn.Module):
     """Encodes scalar timesteps into a high-dimensional vector."""
@@ -264,8 +264,8 @@ from torch import nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from .rmsnorm import RMSNorm
-from .rope import RotaryEmbedding, rotate_half
+# from .rmsnorm import RMSNorm
+# from .rope import RotaryEmbedding, rotate_half
 
 class Attention(nn.Module):
     """

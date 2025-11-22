@@ -7,6 +7,323 @@ import math
 logger = logging.getLogger(__name__)
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # x: (..., dim)
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    Rotates half the hidden dimensions of the input tensor.
+    Splits the last dimension into two halves, negates the second half,
+    and concatenates them back together.
+    """
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) module.
+    Pre-computes sine and cosine values for efficient rotary embeddings.
+    """
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 2048,
+        theta: float = 10000.0
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.theta = theta
+
+        inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.dim, 2).float() / self.dim)
+        )
+        self.register_buffer("inv_freq", inv_freq)
+        self._set_cos_sin_cache(max_position_embeddings, self.inv_freq.device)
+
+    def _set_cos_sin_cache(self, seq_len: int, device: torch.device):
+        """Updates the sine and cosine cache."""
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
+
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generates rotary embeddings for the given positions.
+        Args:
+            x: Dummy tensor for device/dtype
+            position_ids: Token positions, shape (batch_size, sequence_length)
+        Returns:
+            Tuple of (cos, sin) embeddings, shape (batch_size, 1, sequence_length, dim)
+        """
+        seq_len = position_ids.max().item() + 1
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device)
+
+        # Extract embeddings using indexing instead of gather
+        # cos_cached: [1, 1, max_seq, dim], position_ids: [B, seq_len]
+        B, seq_len = position_ids.shape
+        cos = self.cos_cached[:, :, position_ids[0], :]  # Use first batch's positions
+        sin = self.sin_cached[:, :, position_ids[0], :]
+        
+        # Expand to batch size: [1, 1, seq_len, dim] -> [B, 1, seq_len, dim]
+        cos = cos.expand(B, -1, -1, -1)
+        sin = sin.expand(B, -1, -1, -1)
+        
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class MultiheadAttentionWithQKNorm(nn.Module):
+    """
+    Wrapper around nn.MultiheadAttention with Query-Key Normalization and RoPE support.
+    QK-Norm improves training stability and RoPE provides better positional encoding.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        batch_first: bool = False,
+        norm_type: str = "rmsnorm",  # "rmsnorm" or "layernorm"
+        use_rope: bool = True,  # Enable RoPE
+        rope_theta: float = 10000.0,
+        max_position_embeddings: int = 2048
+    ):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            bias=bias,
+            batch_first=batch_first
+        )
+        
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        
+        # QK Normalization layers
+        if norm_type == "rmsnorm":
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        elif norm_type == "layernorm":
+            self.q_norm = nn.LayerNorm(self.head_dim)
+            self.k_norm = nn.LayerNorm(self.head_dim)
+        else:
+            raise ValueError(f"Unknown norm_type: {norm_type}")
+        
+        # RoPE (optional)
+        self.use_rope = use_rope
+        if use_rope:
+            self.rope = RotaryEmbedding(
+                dim=self.head_dim,
+                max_position_embeddings=max_position_embeddings,
+                theta=rope_theta
+            )
+        
+        self.batch_first = batch_first
+    
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply QK normalization to query and key tensors.
+        Args:
+            q, k: (B, num_heads, seq_len, head_dim) if batch_first=True
+                  or (seq_len, B, num_heads, head_dim) if batch_first=False
+        """
+        # Reshape for normalization: apply norm on head_dim
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        return q, k
+    
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply RoPE to query and key tensors.
+        Args:
+            q: (B, num_heads, seq_len_q, head_dim)
+            k: (B, num_heads, seq_len_k, head_dim)
+        Returns:
+            q, k with RoPE applied (only if seq_len_q == seq_len_k, i.e., self-attention)
+        """
+        B = q.shape[0]
+        seq_len_q = q.shape[2]
+        seq_len_k = k.shape[2]
+        device = q.device
+        
+        # Only apply RoPE for self-attention (when query and key have same sequence length)
+        # For cross-attention, skip RoPE since positional relationship between different sequences isn't meaningful
+        if seq_len_q != seq_len_k:
+            return q, k
+        
+        # Generate position ids
+        position_ids = torch.arange(seq_len_q, device=device).unsqueeze(0).expand(B, -1)
+        
+        # Get cos/sin embeddings: (B, 1, seq_len, head_dim)
+        cos, sin = self.rope(q, position_ids)
+        
+        # Broadcast cos/sin to match q/k shape: (B, 1, seq_len, head_dim) -> (B, num_heads, seq_len, head_dim)
+        # cos and sin will automatically broadcast across num_heads dimension
+        
+        # Apply rotation
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
+        
+        return q, k
+    
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[torch.Tensor] = None,
+        average_attn_weights: bool = True
+    ):
+        """
+        Forward pass with QK-Norm and optional RoPE.
+        Note: This is a simplified implementation that works with batch_first=True.
+        For full compatibility, a custom attention implementation would be needed.
+        """
+        # For now, apply QK-Norm in embedding space (before splitting heads)
+        # This is a compromise since we're wrapping nn.MultiheadAttention
+        
+        # Reshape to apply per-head normalization
+        # query: (B, seq_len, embed_dim) -> (B, seq_len, num_heads, head_dim)
+        if self.batch_first:
+            B, seq_len_q, embed_dim = query.shape
+            _, seq_len_k, _ = key.shape
+            
+            # Reshape for per-head operations
+            q = query.view(B, seq_len_q, self.num_heads, self.head_dim).transpose(1, 2)
+            k = key.view(B, seq_len_k, self.num_heads, self.head_dim).transpose(1, 2)
+            
+            # Apply QK-Norm: (B, num_heads, seq_len, head_dim)
+            q, k = self._apply_qk_norm(q, k)
+            
+            # Apply RoPE if enabled (will skip for cross-attention)
+            if self.use_rope:
+                q, k = self._apply_rope(q, k)
+            
+            # Reshape back
+            query = q.transpose(1, 2).reshape(B, seq_len_q, embed_dim)
+            key = k.transpose(1, 2).reshape(B, seq_len_k, embed_dim)
+        else:
+            # Handle seq_first case
+            query = self.q_norm(query)
+            key = self.k_norm(key)
+        
+        # Call standard MultiheadAttention
+        return self.attn(
+            query=query,
+            key=key,
+            value=value,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            attn_mask=attn_mask,
+            average_attn_weights=average_attn_weights
+        )
+
+
+class StateAttentionEncoder(nn.Module):
+    """
+    Encodes a flat state vector into a fixed-size embedding using a
+    multi-head attention pooling mechanism.
+    """
+    def __init__(
+        self,
+        state_dim: int,
+        embed_dim: int,
+        num_kinematic_states: int,
+        state_dropout: float = 0.75,
+        num_heads: int = 4
+    ):
+        super().__init__()
+        assert state_dim > num_kinematic_states, \
+            "state_dim must be greater than num_kinematic_states"
+
+        self.state_dim = state_dim
+        self.num_kinematic_states = num_kinematic_states
+        self.state_dropout = state_dropout
+
+        self.linears = nn.ModuleList([
+            nn.Linear(1, embed_dim) for _ in range(state_dim)
+        ])
+        self.attn = MultiheadAttentionWithQKNorm(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True, norm_type="rmsnorm"
+        )
+        self.pos_embed = nn.Parameter(torch.Tensor(1, state_dim, embed_dim))
+        self.query = nn.Parameter(torch.Tensor(1, 1, embed_dim))
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initializes learnable embeddings."""
+        nn.init.normal_(self.pos_embed, std=0.02)
+        nn.init.normal_(self.query, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): The flat state vector. Shape: (B, state_dim).
+
+        Returns:
+            torch.Tensor: The encoded state embedding. Shape: (B, embed_dim).
+        """
+        x_embed_list = [
+            linear(x[:, i, None]) for i, linear in enumerate(self.linears)
+        ]
+        x_embed = torch.stack(x_embed_list, dim=1)
+        x_embed = x_embed + self.pos_embed
+
+        key_padding_mask = None
+        if self.training and self.state_dropout > 0:
+            kinematic_mask = torch.rand(
+                (x_embed.shape[0], self.num_kinematic_states), device=x.device
+            ) < self.state_dropout
+
+            num_command_states = self.state_dim - self.num_kinematic_states
+            command_mask = torch.zeros(
+                (x_embed.shape[0], num_command_states),
+                device=x.device,
+                dtype=torch.bool
+            )
+            key_padding_mask = torch.cat([kinematic_mask, command_mask], dim=1)
+
+        query = self.query.expand(x_embed.shape[0], -1, -1)
+        x_state, _ = self.attn(
+            query=query,
+            key=x_embed,
+            value=x_embed,
+            key_padding_mask=key_padding_mask,
+        )
+
+        return x_state.squeeze(1)
+
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -119,11 +436,12 @@ class CustomEncoderBlock(nn.Module):
         # VL features processing
         self.vl_emb_proj = nn.Linear(vl_emb_dim, n_emb)
         self.vl_emb_norm = nn.LayerNorm(n_emb)
-        self.vl_attention_pooling = nn.MultiheadAttention(
+        self.vl_attention_pooling = MultiheadAttentionWithQKNorm(
             embed_dim=n_emb,
             num_heads=n_head,
             dropout=p_drop_attn,
-            batch_first=True
+            batch_first=True,
+            norm_type="rmsnorm"
         )
         self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
         
@@ -168,31 +486,27 @@ class CustomEncoderBlock(nn.Module):
         )
         return pooled_features  # (B, 1, n_emb)
     
-    def forward(self, timestep: torch.Tensor, vl_embeds: torch.Tensor, cond: Optional[torch.Tensor] = None, 
+    def forward(self, vl_embeds: torch.Tensor, cond: Optional[torch.Tensor] = None, 
                 vl_padding_mask: Optional[torch.Tensor] = None):
         """
-        timestep: (B,) timestep tensor
         vl_embeds: (B, T_vl, D_vl) vision-language embeddings
         cond: (B, T_cond, cond_dim) condition tensor
         vl_padding_mask: (B, T_vl) padding mask for VL features
+        Note: timestep is removed - memory generation does not use timesteps
         """
         
-        # 1. Time embedding
-        time_emb = self.time_emb(timestep).unsqueeze(1)  # (B, 1, n_emb)
-        
-        # 2. Process VL features
+        # 1. Process VL features
         vl_features = self.vl_emb_proj(vl_embeds)  # (B, T_vl, n_emb)
         vl_features = self.vl_emb_norm(vl_features)
         vl_features_processed = self._attention_pool_vl_features(vl_features, vl_padding_mask)
         
-        # 3. Combine condition embeddings
-        cond_embeddings = time_emb
+        # 2. Combine condition embeddings (no timestep here)
+        cond_embeddings = vl_features_processed
         if self.obs_as_cond and cond is not None:
             cond_obs_emb = self.cond_obs_emb(cond)
-            cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
-        cond_embeddings = torch.cat([cond_embeddings, vl_features_processed], dim=1)
+            cond_embeddings = torch.cat([cond_obs_emb, cond_embeddings], dim=1)
         
-        # 4. Add position embedding
+        # 3. Add position embedding
         tc = cond_embeddings.shape[1]
         if tc <= self.cond_pos_emb.shape[1]:
             position_embeddings = self.cond_pos_emb[:, :tc, :]
@@ -203,14 +517,14 @@ class CustomEncoderBlock(nn.Module):
             if tc > self.cond_pos_emb.shape[1]:
                 torch.nn.init.normal_(position_embeddings[:, self.cond_pos_emb.shape[1]:, :], mean=0.0, std=0.02)
         
-        # 5. Apply dropout and pre-norm
+        # 4. Apply dropout and pre-norm
         x = self.drop(cond_embeddings + position_embeddings)
         x = self.pre_encoder_norm(x)
         
-        # 6. Transformer encoder
+        # 5. Transformer encoder
         x = self.encoder(x)
         
-        # 7. Memory processing
+        # 6. Memory processing
         memory = self.memory_norm(x)
         memory = memory + self.memory_proj(memory)
         
@@ -223,9 +537,15 @@ class CustomDecoderLayer(nn.Module):
     """
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, batch_first=False):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        self.memory_vl_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        self.traj_memory_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
+        self.self_attn = MultiheadAttentionWithQKNorm(
+            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
+        )
+        self.memory_vl_cross_attn = MultiheadAttentionWithQKNorm(
+            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
+        )
+        self.traj_memory_cross_attn = MultiheadAttentionWithQKNorm(
+            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
+        )
         
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -390,6 +710,51 @@ class TrajectoryHead(nn.Module):
         return x
 
 
+class TrajectoryRefinementHead(nn.Module):
+    """
+    Improved Trajectory Head with Residual Refinement and Temporal Smoothing.
+    Structure: Base Prediction + (Temporal Conv -> Activation -> Refinement Projection)
+    """
+    def __init__(self, n_emb, output_dim, p_drop_emb):
+        super().__init__()
+        self.ln_f = nn.LayerNorm(n_emb)
+        self.drop = nn.Dropout(p_drop_emb)
+        
+        # 1. Coarse Prediction (Base branch)
+        self.coarse_head = nn.Linear(n_emb, output_dim)
+        
+        # 2. Refinement Module (Residual branch)
+        # Uses Conv1d to enforce local smoothness and consistency
+        self.refine_conv = nn.Conv1d(n_emb, n_emb, kernel_size=3, padding=1)
+        self.act = nn.GELU()
+        self.refine_head = nn.Linear(n_emb, output_dim)
+        
+        # Initialize refinement head to output near zero initially
+        # This allows the model to start with coarse predictions and learn to refine
+        nn.init.zeros_(self.refine_head.weight)
+        nn.init.zeros_(self.refine_head.bias)
+
+    def forward(self, x):
+        # x: (B, T, n_emb)
+        x = self.ln_f(x)
+        x = self.drop(x)
+        
+        # Base prediction
+        coarse_out = self.coarse_head(x)
+        
+        # Refinement
+        # Transpose for Conv1d: (B, T, C) -> (B, C, T)
+        x_t = x.transpose(1, 2)
+        x_ref = self.refine_conv(x_t)
+        x_ref = x_ref.transpose(1, 2)  # Back to (B, T, C)
+        
+        x_ref = self.act(x_ref)
+        residual = self.refine_head(x_ref)
+        
+        # Final output = Coarse + Residual
+        return coarse_out + residual
+
+
 class TransformerForDiffusion(ModuleAttrMixin):
     def __init__(self,
             input_dim: int,
@@ -406,7 +771,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             obs_as_cond: bool=False,
             n_cond_layers: int = 4,
             vl_emb_dim: int = 1536,
-            status_dim: int = 15  # ego_status 的维度 (默认15以匹配nuScenes配置)
+            status_dim: int = 15,  # ego_status 的维度 (默认15以匹配nuScenes配置)
+            ego_status_seq_len: int = 1  # ego_status 序列长度 (历史帧数)
         ) -> None:
         super().__init__()
 
@@ -431,8 +797,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
         
         # AdaLN components for ego_status modulation
-        self.status_proj = nn.Linear(status_dim, n_emb)  # 投影 ego_status 到 n_emb 维度
         self.time_emb = SinusoidalPosEmb(n_emb)  # 时间步编码
+        
+        # StateAttentionEncoder for ego_status history encoding
+        self.ego_status_seq_len = ego_status_seq_len
+        self.status_dim = status_dim
+        # For flattened input: (B, ego_status_seq_len * status_dim)
+        self.state_attention_encoder = StateAttentionEncoder(
+            state_dim=ego_status_seq_len * status_dim,
+            embed_dim=n_emb,
+            num_kinematic_states=min(ego_status_seq_len * status_dim, ego_status_seq_len * 10),  # Approximate kinematic states
+            state_dropout=0.0,  # No dropout during training by default
+            num_heads=4
+        )
 
         # Custom encoder block that handles all condition processing
         self.encoder_block = CustomEncoderBlock(
@@ -474,8 +851,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.mask = None
             self.memory_mask = None
 
-        # trajectory head block
-        self.trajectory_head = TrajectoryHead(n_emb, output_dim, p_drop_emb)
+        # trajectory head block (with Residual Refinement and Temporal Smoothing)
+        self.trajectory_head = TrajectoryRefinementHead(n_emb, output_dim, p_drop_emb)
         
         # constants
         self.T = T
@@ -517,11 +894,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
             CustomDecoderLayer,
             CustomTransformerDecoder,
             TrajectoryHead,
+            TrajectoryRefinementHead,
+            StateAttentionEncoder,
             nn.ModuleList
         )  #
         if isinstance(module, (nn.Linear, nn.Embedding)):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Conv1d):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.MultiheadAttention):
             weight_names = [
@@ -539,12 +922,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
+        elif isinstance(module, RMSNorm):
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, RotaryEmbedding):
+            # RotaryEmbedding has its own initialization with buffers
+            pass
+        elif isinstance(module, MultiheadAttentionWithQKNorm):
+            # QK-Norm wrapper - let it handle its own submodules
+            pass
         elif isinstance(module, TransformerForDiffusion):
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
             if hasattr(module, 'vl_pool_query'):
                 torch.nn.init.normal_(module.vl_pool_query, mean=0.0, std=0.02)
             if hasattr(module, 'cond_pos_emb') and module.cond_pos_emb is not None:
                 torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
+        elif isinstance(module, StateAttentionEncoder):
+            # StateAttentionEncoder has its own initialization in _initialize_weights
+            pass
         elif isinstance(module, ignore_types):
             pass
         else:
@@ -561,8 +955,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention)
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention, torch.nn.Conv1d)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
@@ -586,6 +980,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
             if 'pos_emb' in name or '_dummy_variable' in name:
                 no_decay.add(name)
             elif 'vl_pool_query' in name or 'cond_pos_emb' in name:
+                no_decay.add(name)
+            elif 'state_attention_encoder.query' in name or 'state_attention_encoder.pos_embed' in name:
+                # StateAttentionEncoder's learnable parameters should not be decayed
                 no_decay.add(name)
 
         # validate that we considered every parameter
@@ -628,14 +1025,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         timestep: Union[torch.Tensor, float, int], 
         vl_embeds: torch.Tensor,
         cond: torch.Tensor,
-        current_status: Optional[torch.Tensor] = None,  # 新增参数: (B, 13)
+        ego_status_history: Optional[torch.Tensor] = None,  # Changed: (B, T_ego, status_dim) - full history
         **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
         vl_embeds: (B, T_vl, D_vl)
-        current_status: (B, status_dim) ego status for AdaLN modulation
+        ego_status_history: (B, T_ego, status_dim) full ego status history for encoding
         output: (B,T,input_dim)
         """
         sample = sample.contiguous()
@@ -650,11 +1047,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
             timesteps = timesteps[None].to(sample.device)
         timesteps = timesteps.expand(sample.shape[0])
         
-        # 2. Generate conditioning from timestep and current_status (AdaLN)
+        # 2. Generate conditioning from timestep and ego_status_history (AdaLN)
         time_embedding = self.time_emb(timesteps)  # (B, n_emb)
         conditioning = None
-        if current_status is not None:
-            status_embedding = self.status_proj(current_status)  # (B, n_emb)
+        if ego_status_history is not None:
+            # Flatten ego_status_history: (B, T_ego, status_dim) -> (B, T_ego * status_dim)
+            B = ego_status_history.shape[0]
+            flattened_status = ego_status_history.reshape(B, -1)  # (B, T_ego * status_dim)
+            # Encode using StateAttentionEncoder
+            status_embedding = self.state_attention_encoder(flattened_status)  # (B, n_emb)
+            # Concatenate with timestep embedding
             conditioning = time_embedding + status_embedding  # (B, n_emb)
 
         
@@ -666,9 +1068,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             vl_norm = torch.norm(vl_embeds, dim=-1)  # (B, T_vl)
             vl_padding_mask = (vl_norm == 0) 
         
-        # 4. Process conditions through encoder block to get memory
+        # 4. Process conditions through encoder block to get memory (no timestep)
         memory, vl_features = self.encoder_block(
-            timestep=timesteps, 
             vl_embeds=vl_embeds, 
             cond=cond, 
             vl_padding_mask=vl_padding_mask)
@@ -709,7 +1110,8 @@ def test():
         causal_attn=True,
         n_cond_layers=4,
         vl_emb_dim=1536,
-        status_dim=13  # ego_status 维度
+        status_dim=13,  # ego_status 维度
+        ego_status_seq_len=4  # 历史帧数
     )
     opt = transformer.configure_optimizers()
     
@@ -718,15 +1120,15 @@ def test():
     cond = torch.zeros((4,4,10))
     vl_embeds = torch.ones((4,36,1536))
     
-    # Test 1: Without current_status (backward compatibility)
-    print("Test 1: Without current_status")
+    # Test 1: Without ego_status_history (backward compatibility)
+    print("Test 1: Without ego_status_history")
     out = transformer(sample, timestep, vl_embeds, cond)
     print(f"Output shape: {out.shape}")
     
-    # Test 2: With current_status (AdaLN modulation)
-    print("\nTest 2: With current_status (AdaLN modulation)")
-    current_status = torch.randn((4, 13))  # (B, 13)
-    out_with_status = transformer(sample, timestep, vl_embeds, cond, current_status=current_status)
+    # Test 2: With ego_status_history (AdaLN modulation with StateAttentionEncoder)
+    print("\nTest 2: With ego_status_history (AdaLN modulation)")
+    ego_status_history = torch.randn((4, 4, 13))  # (B, T_ego=4, status_dim=13)
+    out_with_status = transformer(sample, timestep, vl_embeds, cond, ego_status_history=ego_status_history)
     print(f"Output shape with status: {out_with_status.shape}")
     
     # Test 3: Verify outputs are different with/without status

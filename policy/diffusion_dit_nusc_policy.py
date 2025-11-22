@@ -110,6 +110,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         # Get status_dim from bev_encoder config
         status_dim = bev_encoder_cfg.get('state_dim', 15)
+        
+        # Get ego_status_seq_len from policy config (defaults to n_obs_steps)
+        ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
@@ -125,7 +128,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             causal_attn=policy_cfg.get('causal_attn', True),
             obs_as_cond=obs_as_global_cond,
             n_cond_layers=policy_cfg.get('n_cond_layers', 4),
-            status_dim=status_dim  # 传入 ego_status 维度
+            status_dim=status_dim,  # 传入 ego_status 维度
+            ego_status_seq_len=ego_status_seq_len  # 传入 ego_status 序列长度
         )
 
         self.model = model
@@ -364,10 +368,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=device)
         vl_embeds = self.feature_encoder(vl_features)
         
-        # Extract current_status (last timestep of ego_status)
-        current_status = nobs['ego_status'][:, -1, :]  # (B, 13)
+        # Use full ego_status history instead of just the last timestep
+        ego_status_history = nobs['ego_status']  # (B, T_ego, 13)
         
-        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask, current_status=current_status)
+        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask, ego_status_history=ego_status_history)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -391,7 +395,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None, vl_features=None,
-            current_status=None,  # 新增参数
+            ego_status_history=None,  # Changed parameter name
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -443,7 +447,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask, current_status=current_status)
+            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask, ego_status_history=ego_status_history)
 
 
             # 3. compute previous image: x_t -> x_t-1
@@ -505,15 +509,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         else:
             vl_feat = nobs['vqa'].to(dtype=torch.float32)
         
-        # Extract current_status (last timestep of ego_status)
-        current_status = nobs['ego_status'][:, -1, :]  # (B, 13)
+        # Use full ego_status history instead of just the last timestep
+        ego_status_history = nobs['ego_status']  # (B, T_ego, 13)
         
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             cond=cond,
             vl_features=vl_feat,
-            current_status=current_status
+            ego_status_history=ego_status_history
             )
         
         naction_pred = nsample[...,:Da]
