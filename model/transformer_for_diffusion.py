@@ -248,80 +248,6 @@ class MultiheadAttentionWithQKNorm(nn.Module):
         )
 
 
-class StateAttentionEncoder(nn.Module):
-    """
-    Encodes a flat state vector into a fixed-size embedding using a
-    multi-head attention pooling mechanism.
-    """
-    def __init__(
-        self,
-        state_dim: int,
-        embed_dim: int,
-        num_kinematic_states: int,
-        state_dropout: float = 0.75,
-        num_heads: int = 4
-    ):
-        super().__init__()
-        assert state_dim > num_kinematic_states, \
-            "state_dim must be greater than num_kinematic_states"
-
-        self.state_dim = state_dim
-        self.num_kinematic_states = num_kinematic_states
-        self.state_dropout = state_dropout
-
-        self.linears = nn.ModuleList([
-            nn.Linear(1, embed_dim) for _ in range(state_dim)
-        ])
-        self.attn = MultiheadAttentionWithQKNorm(
-            embed_dim=embed_dim, num_heads=num_heads, batch_first=True, norm_type="rmsnorm"
-        )
-        self.pos_embed = nn.Parameter(torch.Tensor(1, state_dim, embed_dim))
-        self.query = nn.Parameter(torch.Tensor(1, 1, embed_dim))
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        """Initializes learnable embeddings."""
-        nn.init.normal_(self.pos_embed, std=0.02)
-        nn.init.normal_(self.query, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): The flat state vector. Shape: (B, state_dim).
-
-        Returns:
-            torch.Tensor: The encoded state embedding. Shape: (B, embed_dim).
-        """
-        x_embed_list = [
-            linear(x[:, i, None]) for i, linear in enumerate(self.linears)
-        ]
-        x_embed = torch.stack(x_embed_list, dim=1)
-        x_embed = x_embed + self.pos_embed
-
-        key_padding_mask = None
-        if self.training and self.state_dropout > 0:
-            kinematic_mask = torch.rand(
-                (x_embed.shape[0], self.num_kinematic_states), device=x.device
-            ) < self.state_dropout
-
-            num_command_states = self.state_dim - self.num_kinematic_states
-            command_mask = torch.zeros(
-                (x_embed.shape[0], num_command_states),
-                device=x.device,
-                dtype=torch.bool
-            )
-            key_padding_mask = torch.cat([kinematic_mask, command_mask], dim=1)
-
-        query = self.query.expand(x_embed.shape[0], -1, -1)
-        x_state, _ = self.attn(
-            query=query,
-            key=x_embed,
-            value=x_embed,
-            key_padding_mask=key_padding_mask,
-        )
-
-        return x_state.squeeze(1)
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -799,17 +725,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # AdaLN components for ego_status modulation
         self.time_emb = SinusoidalPosEmb(n_emb)  # 时间步编码
         
-        # StateAttentionEncoder for ego_status history encoding
-        self.ego_status_seq_len = ego_status_seq_len
+        # Linear projection for ego_status
         self.status_dim = status_dim
-        # For flattened input: (B, ego_status_seq_len * status_dim)
-        self.state_attention_encoder = StateAttentionEncoder(
-            state_dim=ego_status_seq_len * status_dim,
-            embed_dim=n_emb,
-            num_kinematic_states=min(ego_status_seq_len * status_dim, ego_status_seq_len * 10),  # Approximate kinematic states
-            state_dropout=0.0,  # No dropout during training by default
-            num_heads=4
-        )
+        self.ego_status_proj = nn.Linear(status_dim, n_emb)
 
         # Custom encoder block that handles all condition processing
         self.encoder_block = CustomEncoderBlock(
@@ -895,7 +813,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             CustomTransformerDecoder,
             TrajectoryHead,
             TrajectoryRefinementHead,
-            StateAttentionEncoder,
             nn.ModuleList
         )  #
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -936,9 +853,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 torch.nn.init.normal_(module.vl_pool_query, mean=0.0, std=0.02)
             if hasattr(module, 'cond_pos_emb') and module.cond_pos_emb is not None:
                 torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
-        elif isinstance(module, StateAttentionEncoder):
-            # StateAttentionEncoder has its own initialization in _initialize_weights
-            pass
         elif isinstance(module, ignore_types):
             pass
         else:
@@ -981,9 +895,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 no_decay.add(name)
             elif 'vl_pool_query' in name or 'cond_pos_emb' in name:
                 no_decay.add(name)
-            elif 'state_attention_encoder.query' in name or 'state_attention_encoder.pos_embed' in name:
-                # StateAttentionEncoder's learnable parameters should not be decayed
-                no_decay.add(name)
 
         # validate that we considered every parameter
         inter_params = decay & no_decay
@@ -1025,14 +936,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         timestep: Union[torch.Tensor, float, int], 
         vl_embeds: torch.Tensor,
         cond: torch.Tensor,
-        ego_status_history: Optional[torch.Tensor] = None,  # Changed: (B, T_ego, status_dim) - full history
+        ego_status: Optional[torch.Tensor] = None,
         **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
         vl_embeds: (B, T_vl, D_vl)
-        ego_status_history: (B, T_ego, status_dim) full ego status history for encoding
+        ego_status: (B, status_dim) current ego status
         output: (B,T,input_dim)
         """
         sample = sample.contiguous()
@@ -1047,16 +958,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
             timesteps = timesteps[None].to(sample.device)
         timesteps = timesteps.expand(sample.shape[0])
         
-        # 2. Generate conditioning from timestep and ego_status_history (AdaLN)
+        # 2. Generate conditioning from timestep and ego_status (AdaLN)
         time_embedding = self.time_emb(timesteps)  # (B, n_emb)
         conditioning = None
-        if ego_status_history is not None:
-            # Flatten ego_status_history: (B, T_ego, status_dim) -> (B, T_ego * status_dim)
-            B = ego_status_history.shape[0]
-            flattened_status = ego_status_history.reshape(B, -1)  # (B, T_ego * status_dim)
-            # Encode using StateAttentionEncoder
-            status_embedding = self.state_attention_encoder(flattened_status)  # (B, n_emb)
-            # Concatenate with timestep embedding
+        if ego_status is not None:
+            # Project ego_status
+            status_embedding = self.ego_status_proj(ego_status)  # (B, n_emb)
+            # Add to timestep embedding
             conditioning = time_embedding + status_embedding  # (B, n_emb)
 
         

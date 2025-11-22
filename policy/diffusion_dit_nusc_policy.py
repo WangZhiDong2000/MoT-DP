@@ -368,10 +368,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=device)
         vl_embeds = self.feature_encoder(vl_features)
         
-        # Use full ego_status history instead of just the last timestep
-        ego_status_history = nobs['ego_status']  # (B, T_ego, 13)
+        # Use current ego_status instead of full history
+        ego_status = nobs['ego_status'][:, -1]  # (B, 13)
         
-        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask, ego_status_history=ego_status_history)
+        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask, ego_status=ego_status)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -395,7 +395,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None, vl_features=None,
-            ego_status_history=None,  # Changed parameter name
+            ego_status=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -447,7 +447,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask, ego_status_history=ego_status_history)
+            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask, ego_status=ego_status)
 
 
             # 3. compute previous image: x_t -> x_t-1
@@ -509,15 +509,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         else:
             vl_feat = nobs['vqa'].to(dtype=torch.float32)
         
-        # Use full ego_status history instead of just the last timestep
-        ego_status_history = nobs['ego_status']  # (B, T_ego, 13)
+        # Use current ego_status instead of full history
+        ego_status = nobs['ego_status'][:, -1]  # (B, 13)
         
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             cond=cond,
             vl_features=vl_feat,
-            ego_status_history=ego_status_history
+            ego_status=ego_status
             )
         
         naction_pred = nsample[...,:Da]
