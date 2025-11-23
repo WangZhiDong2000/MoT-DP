@@ -369,7 +369,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         vl_embeds = self.feature_encoder(vl_features)
         
         # Use current ego_status instead of full history
-        ego_status = nobs['ego_status'][:, -1]  # (B, 13)
+        ego_status = nobs['ego_status']  # (B, 13)
         
         pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask, ego_status=ego_status)
 
@@ -510,7 +510,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             vl_feat = nobs['vqa'].to(dtype=torch.float32)
         
         # Use current ego_status instead of full history
-        ego_status = nobs['ego_status'][:, -1]  # (B, 13)
+        ego_status = nobs['ego_status']  # (B, 13)
         
         nsample = self.conditional_sample(
             cond_data, 

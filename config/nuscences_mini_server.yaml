@@ -13,7 +13,7 @@ dataloader:
   prefetch_factor: 2
   shuffle: true
 obs_horizon: 4
-pred_horizon: 6
+pred_horizon: 10
 action_horizon: 6
 n_obs_steps: 4
 ema:

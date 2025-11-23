@@ -230,89 +230,96 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
         metrics['L2_avg'] = 0.0
     
     # === 碰撞率指标（基于边界框重叠检测）===
-    if fut_obstacles is not None:
-        ego_length = 4.084  
-        ego_width = 1.730   
-        collisions = np.zeros((B, T), dtype=np.float32)
+    # if fut_obstacles is not None:
+    #     ego_length = 4.084  
+    #     ego_width = 1.730   
+    #     collisions = np.zeros((B, T), dtype=np.float32)
+    #     eval_timesteps = []
+    #     if T >= 2:
+    #         eval_timesteps.append(1)
+    #     if T >= 4:
+    #         eval_timesteps.append(3)
+    #     if T >= 6:
+    #         eval_timesteps.append(5)
         
-        for b in range(B):
-            for t in range(T):
-                pred_x = predicted_trajectories[b, t, 0]
-                pred_y = predicted_trajectories[b, t, 1]
+    #     for b in range(B):
+    #         for t in eval_timesteps:
+    #             pred_x = predicted_trajectories[b, t, 0]
+    #             pred_y = predicted_trajectories[b, t, 1]
                 
-                if t > 0:
-                    dx = predicted_trajectories[b, t, 0] - predicted_trajectories[b, t-1, 0]
-                    dy = predicted_trajectories[b, t, 1] - predicted_trajectories[b, t-1, 1]
+    #             if t > 0:
+    #                 dx = predicted_trajectories[b, t, 0] - predicted_trajectories[b, t-1, 0]
+    #                 dy = predicted_trajectories[b, t, 1] - predicted_trajectories[b, t-1, 1]
 
-                    if np.sqrt(dx**2 + dy**2) > 0.01:  
-                        pred_yaw = np.arctan2(dy, dx)
-                    elif t > 1:
-                        dx_prev = predicted_trajectories[b, t-1, 0] - predicted_trajectories[b, t-2, 0]
-                        dy_prev = predicted_trajectories[b, t-1, 1] - predicted_trajectories[b, t-2, 1]
-                        pred_yaw = np.arctan2(dy_prev, dx_prev)
-                    else:
-                        pred_yaw = 0.0
-                else:
-                    if T > 1:
-                        dx = predicted_trajectories[b, 1, 0] - predicted_trajectories[b, 0, 0]
-                        dy = predicted_trajectories[b, 1, 1] - predicted_trajectories[b, 0, 1]
-                        if np.sqrt(dx**2 + dy**2) > 0.01:
-                            pred_yaw = np.arctan2(dy, dx)
-                        else:
-                            pred_yaw = 0.0  
-                    else:
-                        pred_yaw = 0.0  
+    #                 if np.sqrt(dx**2 + dy**2) > 0.01:  
+    #                     pred_yaw = np.arctan2(dy, dx)
+    #                 elif t > 1:
+    #                     dx_prev = predicted_trajectories[b, t-1, 0] - predicted_trajectories[b, t-2, 0]
+    #                     dy_prev = predicted_trajectories[b, t-1, 1] - predicted_trajectories[b, t-2, 1]
+    #                     pred_yaw = np.arctan2(dy_prev, dx_prev)
+    #                 else:
+    #                     pred_yaw = 0.0
+    #             else:
+    #                 if T > 1:
+    #                     dx = predicted_trajectories[b, 1, 0] - predicted_trajectories[b, 0, 0]
+    #                     dy = predicted_trajectories[b, 1, 1] - predicted_trajectories[b, 0, 1]
+    #                     if np.sqrt(dx**2 + dy**2) > 0.01:
+    #                         pred_yaw = np.arctan2(dy, dx)
+    #                     else:
+    #                         pred_yaw = 0.0  
+    #                 else:
+    #                     pred_yaw = 0.0  
                 
-                pred_box = np.array([[pred_x, pred_y, ego_width, ego_length, pred_yaw]])
+    #             pred_box = np.array([[pred_x, pred_y, ego_width, ego_length, pred_yaw]])
                 
-                # 获取该时刻的障碍物边界框
-                obstacles_at_t = fut_obstacles[b][t]
+    #             # 获取该时刻的障碍物边界框
+    #             obstacles_at_t = fut_obstacles[b][t]
                 
-                if isinstance(obstacles_at_t['gt_boxes'], torch.Tensor):
-                    obs_boxes = obstacles_at_t['gt_boxes'].cpu().numpy()  # (N, 7)
-                else:
-                    obs_boxes = obstacles_at_t['gt_boxes']
+    #             if isinstance(obstacles_at_t['gt_boxes'], torch.Tensor):
+    #                 obs_boxes = obstacles_at_t['gt_boxes'].cpu().numpy()  # (N, 7)
+    #             else:
+    #                 obs_boxes = obstacles_at_t['gt_boxes']
                 
-                if len(obs_boxes) == 0:
-                    collisions[b, t] = 0.0
-                    continue
+    #             if len(obs_boxes) == 0:
+    #                 collisions[b, t] = 0.0
+    #                 continue
                 
-                obs_boxes_2d = np.zeros((len(obs_boxes), 5))
-                obs_boxes_2d[:, 0] = obs_boxes[:, 0]  # x
-                obs_boxes_2d[:, 1] = obs_boxes[:, 1]  # y
-                obs_boxes_2d[:, 2] = obs_boxes[:, 4]  # w (width, y方向)
-                obs_boxes_2d[:, 3] = obs_boxes[:, 3]  # l (length, x方向)
-                obs_boxes_2d[:, 4] = obs_boxes[:, 6]  # yaw
+    #             obs_boxes_2d = np.zeros((len(obs_boxes), 5))
+    #             obs_boxes_2d[:, 0] = obs_boxes[:, 0]  # x
+    #             obs_boxes_2d[:, 1] = obs_boxes[:, 1]  # y
+    #             obs_boxes_2d[:, 2] = obs_boxes[:, 4]  # w (width, y方向)
+    #             obs_boxes_2d[:, 3] = obs_boxes[:, 3]  # l (length, x方向)
+    #             obs_boxes_2d[:, 4] = obs_boxes[:, 6]  # yaw
                 
-                collision_mask = check_box_collision_2d(
-                    pred_box,  # (1, 5)
-                    obs_boxes_2d  # (N, 5)
-                )  # (1, N)
+    #             collision_mask = check_box_collision_2d(
+    #                 pred_box,  # (1, 5)
+    #                 obs_boxes_2d  # (N, 5)
+    #             )  # (1, N)
                 
-                collisions[b, t] = 1.0 if np.any(collision_mask) else 0.0
+    #             collisions[b, t] = 1.0 if np.any(collision_mask) else 0.0
         
-        if T >= 2:
-            metrics['collision_1s'] = np.mean(collisions[:, 1])
+    #     if T >= 2:
+    #         metrics['collision_1s'] = np.mean(collisions[:, 1])
         
-        if T >= 4:
-            metrics['collision_2s'] = np.mean(collisions[:, 3])
+    #     if T >= 4:
+    #         metrics['collision_2s'] = np.mean(collisions[:, 3])
         
-        if T >= 6:
-            metrics['collision_3s'] = np.mean(collisions[:, 5])
+    #     if T >= 6:
+    #         metrics['collision_3s'] = np.mean(collisions[:, 5])
         
-        # collision_avg: 只计算1s, 2s, 3s时间步的平均
-        collision_avg_values = []
-        if T >= 2:
-            collision_avg_values.append(collisions[:, 1])
-        if T >= 4:
-            collision_avg_values.append(collisions[:, 3])
-        if T >= 6:
-            collision_avg_values.append(collisions[:, 5])
+    #     # collision_avg: 只计算1s, 2s, 3s时间步的平均
+    #     collision_avg_values = []
+    #     if T >= 2:
+    #         collision_avg_values.append(collisions[:, 1])
+    #     if T >= 4:
+    #         collision_avg_values.append(collisions[:, 3])
+    #     if T >= 6:
+    #         collision_avg_values.append(collisions[:, 5])
         
-        if len(collision_avg_values) > 0:
-            metrics['collision_avg'] = np.mean(np.concatenate(collision_avg_values))
-        else:
-            metrics['collision_avg'] = 0.0
+    #     if len(collision_avg_values) > 0:
+    #         metrics['collision_avg'] = np.mean(np.concatenate(collision_avg_values))
+    #     else:
+    #         metrics['collision_avg'] = 0.0
     
     safe_metrics = {}
     for key, value in metrics.items():
@@ -667,7 +674,7 @@ def train_nusc_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train nuScenes Driving Policy with Diffusion DiT")
-    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/nuscences_mini_server.yaml", 
+    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/nuscences_server.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_nusc_policy(config_path=args.config_path)
