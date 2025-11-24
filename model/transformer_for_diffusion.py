@@ -665,9 +665,6 @@ class TrajectoryRefinementHead(nn.Module):
         self.ln_f = nn.LayerNorm(n_emb)
         self.drop = nn.Dropout(p_drop_emb)
         
-        # Temporal Processing with Bidirectional GRU
-        # hidden_size=n_emb//2 with bidirectional=True -> output=(B, T, n_emb)
-        # This captures both forward and backward temporal dependencies
         self.refine_gru = nn.GRU(
             input_size=n_emb,
             hidden_size=n_emb,
@@ -725,8 +722,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             obs_as_cond: bool=False,
             n_cond_layers: int = 4,
             vl_emb_dim: int = 1536,
-            status_dim: int = 15,  # ego_status 的维度 (默认15以匹配nuScenes配置)
-            ego_status_seq_len: int = 1  # ego_status 序列长度 (历史帧数)
+            status_dim: int = 15,  
+            ego_status_seq_len: int = 1  
         ) -> None:
         super().__init__()
 
@@ -760,7 +757,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
         
         # AdaLN components for ego_status modulation
-        self.time_emb = SinusoidalPosEmb(n_emb)  # 时间步编码
+        self.time_emb = SinusoidalPosEmb(n_emb)  
         
         # Linear projection for ego_status
         self.status_dim = status_dim
@@ -846,7 +843,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.TransformerEncoder,
             nn.TransformerDecoder,
             nn.GELU,
-            nn.SiLU,  # 添加 SiLU
+            nn.SiLU,  
             nn.Sequential,
             CustomEncoderBlock,
             CustomDecoderLayer,
@@ -1019,7 +1016,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         """
         sample = sample.contiguous()
         cond = cond.contiguous() 
+        # vl_embeds=torch.ones_like(vl_embeds)
         vl_embeds = vl_embeds.contiguous()
+        
         
         # 1. Prepare timesteps
         timesteps = timestep
