@@ -459,38 +459,41 @@ class CustomEncoderBlock(nn.Module):
 
 class CustomDecoderLayer(nn.Module):
     """
-    DP decoder. Memory first enhanced by VL feature, than guide trajectory generation
+    Condition-Centric Decoder Layer for Path Planning.
+    Removes self-attention on noisy trajectory, focuses on condition utilization.
+    Architecture: Memory-VL Fusion -> Trajectory-Condition Cross-Attention -> FFN
     """
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, batch_first=False):
         super().__init__()
-        self.self_attn = MultiheadAttentionWithQKNorm(
-            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
-        )
+        
+        # Step 1: Enhance Memory with VL features
         self.memory_vl_cross_attn = MultiheadAttentionWithQKNorm(
             d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
         )
+        
+        # Step 2: Trajectory attends to enhanced memory (condition)
         self.traj_memory_cross_attn = MultiheadAttentionWithQKNorm(
             d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
         )
         
+        # Feed-forward network
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
         self.dropout = nn.Dropout(dropout)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
         
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
-        self.norm4 = nn.LayerNorm(d_model)
         
         self.activation = torch.nn.functional.gelu
         
-        # AdaLN modulation - 生成 12 个参数：4组 (shift, scale, gate) 分别用于4个norm
+        # AdaLN modulation - 生成 9 个参数：3组 (shift, scale, gate)
+        # For: memory_vl, traj_memory, ffn
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(d_model, 12 * d_model, bias=True)
+            nn.Linear(d_model, 9 * d_model, bias=True)
         )
     
     def modulate(self, x, shift, scale):
@@ -505,29 +508,17 @@ class CustomDecoderLayer(nn.Module):
         # 如果提供了 conditioning，生成调制参数
         if conditioning is not None:
             mod_params = self.adaLN_modulation(conditioning)
-            shift_self, scale_self, gate_self, \
             shift_mem_vl, scale_mem_vl, gate_mem_vl, \
             shift_traj_mem, scale_traj_mem, gate_traj_mem, \
-            shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(12, dim=1)
+            shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(9, dim=1)
         else:
             # 如果没有 conditioning，使用默认值（不进行modulation）
-            shift_self = scale_self = gate_self = None
             shift_mem_vl = scale_mem_vl = gate_mem_vl = None
             shift_traj_mem = scale_traj_mem = gate_traj_mem = None
             shift_ffn = scale_ffn = gate_ffn = None
         
-        # 1. Self-attention on trajectory with modulation
-        tgt2 = self.norm1(tgt)
-        if conditioning is not None:
-            tgt2 = self.modulate(tgt2, shift_self, scale_self)
-        tgt2, _ = self.self_attn(tgt2, tgt2, tgt2, attn_mask=tgt_mask, key_padding_mask=None)
-        if conditioning is not None:
-            tgt = tgt + gate_self.unsqueeze(1) * tgt2
-        else:
-            tgt = tgt + self.dropout1(tgt2)
-        
-        # 2. Memory-VL cross attention with modulation
-        memory2 = self.norm2(memory)
+        # 1. Enhance Memory with VL features (Condition Fusion)
+        memory2 = self.norm1(memory)
         if conditioning is not None:
             memory2 = self.modulate(memory2, shift_mem_vl, scale_mem_vl)
         enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, vl_features, vl_features, 
@@ -535,10 +526,10 @@ class CustomDecoderLayer(nn.Module):
         if conditioning is not None:
             enhanced_memory = memory + gate_mem_vl.unsqueeze(1) * enhanced_memory_output
         else:
-            enhanced_memory = memory + self.dropout2(enhanced_memory_output)
+            enhanced_memory = memory + self.dropout1(enhanced_memory_output)
         
-        # 3. Trajectory-Memory cross attention with modulation
-        tgt2 = self.norm3(tgt)
+        # 2. Trajectory attends to Enhanced Condition (Direct Condition Utilization)
+        tgt2 = self.norm2(tgt)
         if conditioning is not None:
             tgt2 = self.modulate(tgt2, shift_traj_mem, scale_traj_mem)
         tgt2, _ = self.traj_memory_cross_attn(tgt2, enhanced_memory, enhanced_memory, 
@@ -546,10 +537,10 @@ class CustomDecoderLayer(nn.Module):
         if conditioning is not None:
             tgt = tgt + gate_traj_mem.unsqueeze(1) * tgt2
         else:
-            tgt = tgt + self.dropout3(tgt2)
+            tgt = tgt + self.dropout2(tgt2)
         
-        # 4. Feed forward with modulation
-        tgt2 = self.norm4(tgt)
+        # 3. Feed forward with modulation
+        tgt2 = self.norm3(tgt)
         if conditioning is not None:
             tgt2 = self.modulate(tgt2, shift_ffn, scale_ffn)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))

@@ -125,11 +125,11 @@ class NUSCDataset(torch.utils.data.Dataset):
         # Normalize hist_waypoints using min-max normalization
         # action_stats: min=[-2.024064064025879, -11.107964515686035], max=[55.828826904296875, 13.316089630126953]
         # action_stats: min=[-0.019322488456964493, -1.1484386920928955], max=[45.14558029174805, 7.632166385650635]
-        waypoint_min = torch.tensor([-2.024, -11.107], dtype=torch.float32)
-        waypoint_max = torch.tensor([55.8288, 13.316], dtype=torch.float32)
-        hist_waypoints_normalized = (hist_waypoints - waypoint_min) / (waypoint_max - waypoint_min)
+        # waypoint_min = torch.tensor([-2.024, -11.107], dtype=torch.float32)
+        # waypoint_max = torch.tensor([55.8288, 13.316], dtype=torch.float32)
+        # hist_waypoints_normalized = (hist_waypoints - waypoint_min) / (waypoint_max - waypoint_min)
         
-        ego_status_with_waypoints=torch.cat([ego_status_with_command, hist_waypoints_normalized], dim=-1)  # (obs_horizon, 15)
+        ego_status_with_waypoints=torch.cat([ego_status_with_command, hist_waypoints], dim=-1)  # (obs_horizon, 15)
         
         # Load obstacle information for future frames
         fut_obstacles = []
