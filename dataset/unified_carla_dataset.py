@@ -127,10 +127,21 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         
         # Load VQA feature from pt file
         vqa_path = sample.get('vqa', None)
-        vqa_feature_tensor = None
-        full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-        vqa_feature_tensor = torch.load(full_vqa_path, weights_only=True)
-        vqa_feature = vqa_feature_tensor
+        vqa_feature = {}
+        if vqa_path is not None:
+            full_vqa_path = os.path.join(self.image_data_root, vqa_path)
+            try:
+                vqa_feature_data = torch.load(full_vqa_path, weights_only=True)
+                # Check if loaded data is a dict or tensor
+                if isinstance(vqa_feature_data, dict):
+                    vqa_feature = vqa_feature_data
+                else:
+                    # If it's a tensor, assume it's gen_vit_tokens
+                    vqa_feature = {'gen_vit_tokens': vqa_feature_data}
+                    print(f"Warning: VQA feature at {full_vqa_path} is a tensor, expected dict. Stored as 'gen_vit_tokens'.")
+            except FileNotFoundError:
+                print(f"Warning: VQA feature file not found at {full_vqa_path}")
+                vqa_feature = {}
   
         
         # Convert sample data
@@ -153,21 +164,24 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
             elif key == 'vqa':
                 # Add the VQA features if available
-                final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
-                final_sample['reasoning_query_tokens'] = vqa_feature['reasoning_query_tokens']
-                # Handle variable-length answer_token_indexes by padding to fixed size
-                if isinstance(vqa_feature, dict) and 'answer_token_indexes' in vqa_feature:
-                    answer_tokens = vqa_feature['answer_token_indexes']
-                    max_answer_tokens = 8  # Fixed maximum length for padding
-                    if answer_tokens.shape[0] < max_answer_tokens:
-                        # Pad with -1 (or any invalid token index)
-                        padding = torch.full((max_answer_tokens - answer_tokens.shape[0],), -1, dtype=answer_tokens.dtype)
-                        final_sample['answer_token_indexes'] = torch.cat([answer_tokens, padding])
-                    elif answer_tokens.shape[0] > max_answer_tokens:
-                        # Truncate if longer than max
-                        final_sample['answer_token_indexes'] = answer_tokens[:max_answer_tokens]
-                    else:
-                        final_sample['answer_token_indexes'] = answer_tokens
+                if isinstance(vqa_feature, dict):
+                    if 'gen_vit_tokens' in vqa_feature:
+                        final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
+                    if 'reasoning_query_tokens' in vqa_feature:
+                        final_sample['reasoning_query_tokens'] = vqa_feature['reasoning_query_tokens']
+                    # Handle variable-length answer_token_indexes by padding to fixed size
+                    if 'answer_token_indexes' in vqa_feature:
+                        answer_tokens = vqa_feature['answer_token_indexes']
+                        max_answer_tokens = 8  # Fixed maximum length for padding
+                        if answer_tokens.shape[0] < max_answer_tokens:
+                            # Pad with -1 (or any invalid token index)
+                            padding = torch.full((max_answer_tokens - answer_tokens.shape[0],), -1, dtype=answer_tokens.dtype)
+                            final_sample['answer_token_indexes'] = torch.cat([answer_tokens, padding])
+                        elif answer_tokens.shape[0] > max_answer_tokens:
+                            # Truncate if longer than max
+                            final_sample['answer_token_indexes'] = answer_tokens[:max_answer_tokens]
+                        else:
+                            final_sample['answer_token_indexes'] = answer_tokens
 
 
             elif isinstance(value, np.ndarray):

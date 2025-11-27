@@ -996,6 +996,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         cond: torch.Tensor,
         gen_vit_tokens: Optional[torch.Tensor] = None,
         answer_token_indexes: Optional[torch.Tensor] = None,
+        reasoning_query_tokens: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
         **kwargs):
         """

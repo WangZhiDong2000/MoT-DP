@@ -381,11 +381,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Predict the noise residual
         gen_vit_tokens = batch.get('gen_vit_tokens', None)
         answer_token_indexes = batch.get('answer_token_indexes', None)
+        reasoning_query_tokens = batch.get('reasoning_query_tokens', None)
         
         # Process gen_vit_tokens through feature_encoder
         if gen_vit_tokens is not None:
             gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)
             gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
+        
+        # Process reasoning_query_tokens through feature_encoder
+        if reasoning_query_tokens is not None:
+            reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=torch.float32)
+            reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
         
         # answer_token_indexes is passed as independent variable (no processing needed)
         if answer_token_indexes is not None:
@@ -394,7 +400,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Use current ego_status instead of full history
         ego_status = nobs['ego_status']  # (B, 13)
         
-        pred = self.model(noisy_trajectory, timesteps, cond, gen_vit_tokens=gen_vit_tokens, answer_token_indexes=answer_token_indexes, ego_status=ego_status)
+        pred = self.model(noisy_trajectory, timesteps, cond, gen_vit_tokens=gen_vit_tokens, answer_token_indexes=answer_token_indexes, reasoning_query_tokens=reasoning_query_tokens, ego_status=ego_status)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -418,7 +424,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None, gen_vit_tokens=None, answer_token_indexes=None,
-            ego_status=None,
+            reasoning_query_tokens=None, ego_status=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -461,7 +467,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, cond, gen_vit_tokens=gen_vit_tokens, answer_token_indexes=answer_token_indexes, ego_status=ego_status)
+            model_output = model(trajectory, t, cond, gen_vit_tokens=gen_vit_tokens, answer_token_indexes=answer_token_indexes, reasoning_query_tokens=reasoning_query_tokens, ego_status=ego_status)
 
 
             # 3. compute previous image: x_t -> x_t-1
@@ -515,18 +521,24 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # run sampling
         gen_vit_tokens = nobs.get('gen_vit_tokens', None)
         answer_token_indexes = nobs.get('answer_token_indexes', None)
+        reasoning_query_tokens = nobs.get('reasoning_query_tokens', None)
         
         # Process gen_vit_tokens through feature_encoder
         if gen_vit_tokens is not None:
             gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)
             gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
         
+        # Process reasoning_query_tokens through feature_encoder
+        if reasoning_query_tokens is not None:
+            reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=torch.float32)
+            reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
+        
         # answer_token_indexes is passed as independent variable (no processing needed)
         if answer_token_indexes is not None:
             answer_token_indexes = answer_token_indexes.to(device=device)
         
         # Use current ego_status instead of full history
-        ego_status = nobs['ego_status']  # (B, 13)
+        ego_status = nobs['ego_status']  # (B, 14)
         
         nsample = self.conditional_sample(
             cond_data, 
@@ -534,6 +546,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond=cond,
             gen_vit_tokens=gen_vit_tokens,
             answer_token_indexes=answer_token_indexes,
+            reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status
             )
         
