@@ -1,0 +1,165 @@
+
+device:
+  gpu_ids:
+  - 6
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  shuffle: true
+obs_horizon: 4
+pred_horizon: 10
+action_horizon: 6
+n_obs_steps: 4
+ema:
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+optimizer:
+  _target_: torch.optim.AdamW
+  betas:
+  - 0.9
+  - 0.999
+  eps: 1.0e-08
+  lr: 0.0001
+  weight_decay: 1.0e-05
+shape_meta:
+  action:
+    shape:
+    - 2
+  obs:
+    agent_pos:
+      shape:
+      - 2
+      type: low_dim
+    image:
+      shape:
+      - 3
+      - 96
+      - 96
+      type: rgb
+    speed:
+      shape:
+      - 1
+      type: low_dim
+    theta:
+      shape:
+      - 1
+      type: low_dim
+    target_point:
+      shape:
+      - 2
+      type: low_dim
+enable_action_normalization: true
+bev_encoder:
+  pretrained_path: /root/z_projects/code/MoT-DP-1/checkpoints/interfuser/lidar_bev_encoder_only.pth
+  state_dim: 12
+  feature_dim: 256
+  use_group_norm: true
+  freeze_backbone: false
+  bev_input_size:
+  - 448
+  - 448
+policy:
+  input_dim: 2
+  output_dim: 2
+  horizon: 6
+  n_obs_steps: 4
+  cond_dim: 256
+  obs_as_global_cond: true
+  n_layer: 12
+  n_head: 16
+  n_emb: 1024
+  p_drop_emb: 0.1
+  p_drop_attn: 0.1
+  causal_attn: true
+  time_as_cond: true
+  obs_as_cond: true
+  n_cond_layers: 6
+  action_horizon: 6
+  num_inference_steps: 100
+  use_anchor: false
+noise_scheduler:
+  num_diffusion_steps: 100
+  beta_start: 0.0001
+  beta_end: 0.02
+  beta_schedule: squaredcos_cap_v2
+  clip_sample: false
+  prediction_type: epsilon
+training:
+  num_epochs: 1000
+  max_grad_norm: 1.0
+  dataset_path: /share-data/pdm_lite/tmp_data
+  image_data_root: /share-data/pdm_lite
+  sample_interval: 1
+  lr_final: 1e-7
+  validation_freq: 5
+  save_freq: 5
+  early_stopping_patience: 10
+  checkpoint_dir: /root/z_projects/code/MoT-DP-1/checkpoints/carla_dit_best
+logging:
+  use_wandb: true
+  wandb_project: carla-diffusion-policy
+  run_name: carla_dit_optimized
+  checkpoint_dir: /root/z_projects/code/MoT-DP-1/checkpoints/carla_dit_best
+  save_every: 5
+  log_freq: 10
+  wandb_entity: wangzhidong2000-nanyang-technological-university-singapore
+  wandb_api_key: a0d403cb4dc1be3c5c7df4677a1b42d1c3e71b4f
+eval:
+  num_episodes: 10
+  max_steps: 500
+  success_threshold: 0.1
+  eval_freq: 10
+data_augmentation:
+  enable: true
+  image_noise_std: 0.02
+  action_noise_std: 0.01
+  random_crop: false
+model_optimization:
+  use_mixed_precision: true
+  gradient_accumulation_steps: 2
+  warmup_steps: 500
+  lr_scheduler: cosine
+action_stats:
+  min:
+  - -14.108696937561035
+  - -43.720863342285156
+  max:
+  - 74.04539489746094
+  - 41.13515090942383
+  mean:
+  - 6.94471549987793
+  - -0.008842588402330875
+  std:
+  - 10.923248291015625
+  - 2.327697992324829
+
+# Controller configuration - PID 控制器参数
+controller:
+  # Turn controller (转向控制器)
+  turn_KP: 0.75         # 转向 Proportional 增益
+  turn_KI: 0.75         # 转向 Integral 增益
+  turn_KD: 0.3          # 转向 Derivative 增益
+  turn_n: 40            # 转向控制器窗口大小
+  
+  # Speed controller (速度控制器)
+  speed_KP: 5.0         # 速度 Proportional 增益
+  speed_KI: 0.5         # 速度 Integral 增益
+  speed_KD: 1.0         # 速度 Derivative 增益
+  speed_n: 40           # 速度控制器窗口大小
+  
+  # Trajectory planning parameters (轨迹规划参数)
+  aim_dist: 4.0         # 目标距离 - 搜索aim point的距离范围
+  angle_thresh: 0.3     # 角度阈值 - 异常控制检测的角度阈值
+  dist_thresh: 10.0     # 距离阈值 - 用于异常过滤的目标点y距离
+  
+  # Brake and throttle parameters (制动和油门参数)
+  brake_speed: 0.4      # 制动速度阈值 - 低于此速度时触发制动
+  brake_ratio: 1.1      # 制动比率 - 速度/期望速度的比率，超过此值触发制动
+  clip_delta: 0.25      # 速度差值剪切范围 - 纵向控制器的最大速度变化
+  max_throttle: 0.75    # 最大油门 - 数据集中油门信号的上限

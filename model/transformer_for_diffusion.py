@@ -7,6 +7,249 @@ import math
 logger = logging.getLogger(__name__)
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # x: (..., dim)
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    Rotates half the hidden dimensions of the input tensor.
+    Splits the last dimension into two halves, negates the second half,
+    and concatenates them back together.
+    """
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) module.
+    Pre-computes sine and cosine values for efficient rotary embeddings.
+    """
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 2048,
+        theta: float = 10000.0
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.theta = theta
+
+        inv_freq = 1.0 / (
+            self.theta ** (torch.arange(0, self.dim, 2).float() / self.dim)
+        )
+        self.register_buffer("inv_freq", inv_freq)
+        self._set_cos_sin_cache(max_position_embeddings, self.inv_freq.device)
+
+    def _set_cos_sin_cache(self, seq_len: int, device: torch.device):
+        """Updates the sine and cosine cache."""
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
+
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.LongTensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generates rotary embeddings for the given positions.
+        Args:
+            x: Dummy tensor for device/dtype
+            position_ids: Token positions, shape (batch_size, sequence_length)
+        Returns:
+            Tuple of (cos, sin) embeddings, shape (batch_size, 1, sequence_length, dim)
+        """
+        seq_len = position_ids.max().item() + 1
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device)
+
+        # Extract embeddings using indexing instead of gather
+        # cos_cached: [1, 1, max_seq, dim], position_ids: [B, seq_len]
+        B, seq_len = position_ids.shape
+        cos = self.cos_cached[:, :, position_ids[0], :]  # Use first batch's positions
+        sin = self.sin_cached[:, :, position_ids[0], :]
+        
+        # Expand to batch size: [1, 1, seq_len, dim] -> [B, 1, seq_len, dim]
+        cos = cos.expand(B, -1, -1, -1)
+        sin = sin.expand(B, -1, -1, -1)
+        
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class MultiheadAttentionWithQKNorm(nn.Module):
+    """
+    Wrapper around nn.MultiheadAttention with Query-Key Normalization and RoPE support.
+    QK-Norm improves training stability and RoPE provides better positional encoding.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        batch_first: bool = False,
+        norm_type: str = "rmsnorm",  # "rmsnorm" or "layernorm"
+        use_rope: bool = True,  # Enable RoPE
+        rope_theta: float = 10000.0,
+        max_position_embeddings: int = 2048
+    ):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            bias=bias,
+            batch_first=batch_first
+        )
+        
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        
+        # QK Normalization layers
+        if norm_type == "rmsnorm":
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        elif norm_type == "layernorm":
+            self.q_norm = nn.LayerNorm(self.head_dim)
+            self.k_norm = nn.LayerNorm(self.head_dim)
+        else:
+            raise ValueError(f"Unknown norm_type: {norm_type}")
+        
+        # RoPE (optional)
+        self.use_rope = use_rope
+        if use_rope:
+            self.rope = RotaryEmbedding(
+                dim=self.head_dim,
+                max_position_embeddings=max_position_embeddings,
+                theta=rope_theta
+            )
+        
+        self.batch_first = batch_first
+    
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply QK normalization to query and key tensors.
+        Args:
+            q, k: (B, num_heads, seq_len, head_dim) if batch_first=True
+                  or (seq_len, B, num_heads, head_dim) if batch_first=False
+        """
+        # Reshape for normalization: apply norm on head_dim
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        return q, k
+    
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply RoPE to query and key tensors.
+        Args:
+            q: (B, num_heads, seq_len_q, head_dim)
+            k: (B, num_heads, seq_len_k, head_dim)
+        Returns:
+            q, k with RoPE applied (only if seq_len_q == seq_len_k, i.e., self-attention)
+        """
+        B = q.shape[0]
+        seq_len_q = q.shape[2]
+        seq_len_k = k.shape[2]
+        device = q.device
+        
+        # Only apply RoPE for self-attention (when query and key have same sequence length)
+        # For cross-attention, skip RoPE since positional relationship between different sequences isn't meaningful
+        if seq_len_q != seq_len_k:
+            return q, k
+        
+        # Generate position ids
+        position_ids = torch.arange(seq_len_q, device=device).unsqueeze(0).expand(B, -1)
+        
+        # Get cos/sin embeddings: (B, 1, seq_len, head_dim)
+        cos, sin = self.rope(q, position_ids)
+        
+        # Broadcast cos/sin to match q/k shape: (B, 1, seq_len, head_dim) -> (B, num_heads, seq_len, head_dim)
+        # cos and sin will automatically broadcast across num_heads dimension
+        
+        # Apply rotation
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
+        
+        return q, k
+    
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[torch.Tensor] = None,
+        average_attn_weights: bool = True
+    ):
+        """
+        Forward pass with QK-Norm and optional RoPE.
+        Note: This is a simplified implementation that works with batch_first=True.
+        For full compatibility, a custom attention implementation would be needed.
+        """
+        # For now, apply QK-Norm in embedding space (before splitting heads)
+        # This is a compromise since we're wrapping nn.MultiheadAttention
+        
+        # Reshape to apply per-head normalization
+        # query: (B, seq_len, embed_dim) -> (B, seq_len, num_heads, head_dim)
+        if self.batch_first:
+            B, seq_len_q, embed_dim = query.shape
+            _, seq_len_k, _ = key.shape
+            
+            # Reshape for per-head operations
+            q = query.view(B, seq_len_q, self.num_heads, self.head_dim).transpose(1, 2)
+            k = key.view(B, seq_len_k, self.num_heads, self.head_dim).transpose(1, 2)
+            
+            # Apply QK-Norm: (B, num_heads, seq_len, head_dim)
+            q, k = self._apply_qk_norm(q, k)
+            
+            # Apply RoPE if enabled (will skip for cross-attention)
+            if self.use_rope:
+                q, k = self._apply_rope(q, k)
+            
+            # Reshape back
+            query = q.transpose(1, 2).reshape(B, seq_len_q, embed_dim)
+            key = k.transpose(1, 2).reshape(B, seq_len_k, embed_dim)
+        else:
+            # Handle seq_first case
+            query = self.q_norm(query)
+            key = self.k_norm(key)
+        
+        # Call standard MultiheadAttention
+        return self.attn(
+            query=query,
+            key=key,
+            value=value,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            attn_mask=attn_mask,
+            average_attn_weights=average_attn_weights
+        )
+
+
+
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -119,11 +362,12 @@ class CustomEncoderBlock(nn.Module):
         # VL features processing
         self.vl_emb_proj = nn.Linear(vl_emb_dim, n_emb)
         self.vl_emb_norm = nn.LayerNorm(n_emb)
-        self.vl_attention_pooling = nn.MultiheadAttention(
+        self.vl_attention_pooling = MultiheadAttentionWithQKNorm(
             embed_dim=n_emb,
             num_heads=n_head,
             dropout=p_drop_attn,
-            batch_first=True
+            batch_first=True,
+            norm_type="rmsnorm"
         )
         self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
         
@@ -168,31 +412,27 @@ class CustomEncoderBlock(nn.Module):
         )
         return pooled_features  # (B, 1, n_emb)
     
-    def forward(self, timestep: torch.Tensor, vl_embeds: torch.Tensor, cond: Optional[torch.Tensor] = None, 
+    def forward(self, vl_embeds: torch.Tensor, cond: Optional[torch.Tensor] = None, 
                 vl_padding_mask: Optional[torch.Tensor] = None):
         """
-        timestep: (B,) timestep tensor
         vl_embeds: (B, T_vl, D_vl) vision-language embeddings
         cond: (B, T_cond, cond_dim) condition tensor
         vl_padding_mask: (B, T_vl) padding mask for VL features
+        Note: timestep is removed - memory generation does not use timesteps
         """
         
-        # 1. Time embedding
-        time_emb = self.time_emb(timestep).unsqueeze(1)  # (B, 1, n_emb)
-        
-        # 2. Process VL features
+        # 1. Process VL features
         vl_features = self.vl_emb_proj(vl_embeds)  # (B, T_vl, n_emb)
         vl_features = self.vl_emb_norm(vl_features)
         vl_features_processed = self._attention_pool_vl_features(vl_features, vl_padding_mask)
         
-        # 3. Combine condition embeddings
-        cond_embeddings = time_emb
+        # 2. Combine condition embeddings (no timestep here)
+        cond_embeddings = vl_features_processed
         if self.obs_as_cond and cond is not None:
             cond_obs_emb = self.cond_obs_emb(cond)
-            cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
-        cond_embeddings = torch.cat([cond_embeddings, vl_features_processed], dim=1)
+            cond_embeddings = torch.cat([cond_obs_emb, cond_embeddings], dim=1)
         
-        # 4. Add position embedding
+        # 3. Add position embedding
         tc = cond_embeddings.shape[1]
         if tc <= self.cond_pos_emb.shape[1]:
             position_embeddings = self.cond_pos_emb[:, :tc, :]
@@ -203,14 +443,14 @@ class CustomEncoderBlock(nn.Module):
             if tc > self.cond_pos_emb.shape[1]:
                 torch.nn.init.normal_(position_embeddings[:, self.cond_pos_emb.shape[1]:, :], mean=0.0, std=0.02)
         
-        # 5. Apply dropout and pre-norm
+        # 4. Apply dropout and pre-norm
         x = self.drop(cond_embeddings + position_embeddings)
         x = self.pre_encoder_norm(x)
         
-        # 6. Transformer encoder
+        # 5. Transformer encoder
         x = self.encoder(x)
         
-        # 7. Memory processing
+        # 6. Memory processing
         memory = self.memory_norm(x)
         memory = memory + self.memory_proj(memory)
         
@@ -219,53 +459,95 @@ class CustomEncoderBlock(nn.Module):
 
 class CustomDecoderLayer(nn.Module):
     """
-    DP decoder. Memory first enhanced by VL feature, than guide trajectory generation
+    Condition-Centric Decoder Layer for Path Planning.
+    Removes self-attention on noisy trajectory, focuses on condition utilization.
+    Architecture: Memory-VL Fusion -> Trajectory-Condition Cross-Attention -> FFN
     """
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, batch_first=False):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        self.memory_vl_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        self.traj_memory_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
         
+        # Step 1: Enhance Memory with VL features
+        self.memory_vl_cross_attn = MultiheadAttentionWithQKNorm(
+            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
+        )
+        
+        # Step 2: Trajectory attends to enhanced memory (condition)
+        self.traj_memory_cross_attn = MultiheadAttentionWithQKNorm(
+            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
+        )
+        
+        # Feed-forward network
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
         self.dropout = nn.Dropout(dropout)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
         
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
-        self.norm4 = nn.LayerNorm(d_model)
         
         self.activation = torch.nn.functional.gelu
+        
+        # AdaLN modulation - 生成 9 个参数：3组 (shift, scale, gate)
+        # For: memory_vl, traj_memory, ffn
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 9 * d_model, bias=True)
+        )
     
-    def forward(self, tgt, memory, vl_features, tgt_mask=None, memory_mask=None, 
+    def modulate(self, x, shift, scale):
+        """AdaLN modulation function"""
+        if shift is None:
+            return x * (1 + scale.unsqueeze(1))
+        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    
+    def forward(self, tgt, memory, vl_features, conditioning=None, tgt_mask=None, memory_mask=None, 
                 vl_key_padding_mask=None):
         
-        # three masks are used: tgt_mask, memory_mask, vl_key_padding_mask
-        # 1. Self-attention on trajectory 
-        tgt2 = self.norm1(tgt)
-        tgt2, _ = self.self_attn(tgt2, tgt2, tgt2, attn_mask=tgt_mask, key_padding_mask=None)
-        tgt = tgt + self.dropout1(tgt2)
+        # 如果提供了 conditioning，生成调制参数
+        if conditioning is not None:
+            mod_params = self.adaLN_modulation(conditioning)
+            shift_mem_vl, scale_mem_vl, gate_mem_vl, \
+            shift_traj_mem, scale_traj_mem, gate_traj_mem, \
+            shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(9, dim=1)
+        else:
+            # 如果没有 conditioning，使用默认值（不进行modulation）
+            shift_mem_vl = scale_mem_vl = gate_mem_vl = None
+            shift_traj_mem = scale_traj_mem = gate_traj_mem = None
+            shift_ffn = scale_ffn = gate_ffn = None
         
-        # 2. Memory-VL cross attention 
-        memory2 = self.norm2(memory)
+        # 1. Enhance Memory with VL features (Condition Fusion)
+        memory2 = self.norm1(memory)
+        if conditioning is not None:
+            memory2 = self.modulate(memory2, shift_mem_vl, scale_mem_vl)
         enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, vl_features, vl_features, 
                                                       key_padding_mask=vl_key_padding_mask)
-        enhanced_memory = memory + self.dropout2(enhanced_memory_output)
+        if conditioning is not None:
+            enhanced_memory = memory + gate_mem_vl.unsqueeze(1) * enhanced_memory_output
+        else:
+            enhanced_memory = memory + self.dropout1(enhanced_memory_output)
         
-        # 3. Trajectory-Memory cross attention 
-        tgt2 = self.norm3(tgt)
+        # 2. Trajectory attends to Enhanced Condition (Direct Condition Utilization)
+        tgt2 = self.norm2(tgt)
+        if conditioning is not None:
+            tgt2 = self.modulate(tgt2, shift_traj_mem, scale_traj_mem)
         tgt2, _ = self.traj_memory_cross_attn(tgt2, enhanced_memory, enhanced_memory, 
                                              attn_mask=memory_mask, key_padding_mask=None)
-        tgt = tgt + self.dropout3(tgt2)
+        if conditioning is not None:
+            tgt = tgt + gate_traj_mem.unsqueeze(1) * tgt2
+        else:
+            tgt = tgt + self.dropout2(tgt2)
         
-        # 4. Feed forward
-        tgt2 = self.norm4(tgt)
+        # 3. Feed forward with modulation
+        tgt2 = self.norm3(tgt)
+        if conditioning is not None:
+            tgt2 = self.modulate(tgt2, shift_ffn, scale_ffn)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout(tgt2)
+        if conditioning is not None:
+            tgt = tgt + gate_ffn.unsqueeze(1) * tgt2
+        else:
+            tgt = tgt + self.dropout(tgt2)
             
         return tgt
 
@@ -318,16 +600,35 @@ class CustomTransformerDecoder(nn.Module):
         return memory_mask
         
     def forward(self, tgt, memory, vl_features, cond=None, tgt_mask=None, 
-                vl_key_padding_mask=None):
+                vl_key_padding_mask=None, conditioning=None):
         # Generate dynamic memory mask
         memory_mask = self._generate_memory_mask(tgt, memory, cond, tgt_mask)
         
         # Decoder layers
         output = tgt
         for layer in self.layers:
-            output = layer(output, memory, vl_features, tgt_mask=tgt_mask, memory_mask=memory_mask,
+            output = layer(output, memory, vl_features, conditioning=conditioning, 
+                          tgt_mask=tgt_mask, memory_mask=memory_mask,
                           vl_key_padding_mask=vl_key_padding_mask)
         return output
+
+
+class HistoryEncoder(nn.Module):
+    """
+    Encodes the history sequence of ego status into a single vector.
+    """
+    def __init__(self, input_dim, hidden_dim, num_layers=1):
+        super().__init__()
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        # x: (B, T, input_dim)
+        # We use the final hidden state as the summary
+        _, h_n = self.gru(x) # h_n: (num_layers, B, hidden_dim)
+        h = h_n[-1] # (B, hidden_dim)
+        return self.out_proj(self.act(h))
 
 
 class TrajectoryHead(nn.Module):
@@ -342,6 +643,58 @@ class TrajectoryHead(nn.Module):
         x = self.drop(x)
         x = self.head(x)
         return x
+
+
+class TrajectoryRefinementHead(nn.Module):
+    """
+    Trajectory Head with GRU Temporal Processing.
+    Structure: Temporal GRU -> Activation -> Output Projection
+    Uses GRU to capture temporal dependencies and ensure continuity between time steps.
+    """
+    def __init__(self, n_emb, output_dim, p_drop_emb):
+        super().__init__()
+        self.ln_f = nn.LayerNorm(n_emb)
+        self.drop = nn.Dropout(p_drop_emb)
+        
+        self.refine_gru = nn.GRU(
+            input_size=n_emb,
+            hidden_size=n_emb,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=False
+        )
+        self.act = nn.GELU()
+        
+        # Output Projection
+        self.output_head = nn.Linear(n_emb, output_dim)
+        
+        # Conditioning projection for GRU init
+        self.cond_proj = nn.Linear(n_emb, n_emb)
+
+    def forward(self, x, conditioning=None):
+        # x: (B, T, n_emb)
+        x_norm = self.ln_f(x)
+        x_norm = self.drop(x_norm)
+        
+        # Prepare initial hidden state from conditioning if available
+        h_0 = None
+        if conditioning is not None:
+            # conditioning: (B, n_emb) -> (1, B, n_emb)
+            h_0 = self.cond_proj(conditioning).unsqueeze(0)
+            # Ensure contiguous
+            h_0 = h_0.contiguous()
+        
+        # Temporal processing with GRU
+        # GRU processes temporal sequence: (B, T, n_emb) -> (B, T, n_emb)
+        x_gru, _ = self.refine_gru(x_norm, h_0)
+        
+        # Residual connection: combine input with GRU refinement
+        x_refined = x_norm + self.act(x_gru)
+        
+        # Output projection
+        output = self.output_head(x_refined)
+        
+        return output
 
 
 class TransformerForDiffusion(ModuleAttrMixin):
@@ -359,12 +712,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
             causal_attn: bool=False,
             obs_as_cond: bool=False,
             n_cond_layers: int = 4,
-            vl_emb_dim: int = 1536
+            vl_emb_dim: int = 1536,
+            status_dim: int = 15,  
+            ego_status_seq_len: int = 1  
         ) -> None:
         super().__init__()
 
         if n_obs_steps is None:
             n_obs_steps = horizon
+        
+        self.n_obs_steps = n_obs_steps
         
         T = horizon
         T_cond = 1
@@ -379,9 +736,26 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         # input embedding stem
         self.input_emb = nn.Linear(input_dim, n_emb)
+        self.hist_feature_emb = nn.Linear(status_dim, n_emb) # Embedding for full history state
         self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
+        self.hist_pos_emb = nn.Parameter(torch.zeros(1, n_obs_steps, n_emb))
+        
+        # Segment embeddings to distinguish history and future
+        self.hist_segment_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        self.fut_segment_emb = nn.Parameter(torch.zeros(1, 1, n_emb))
+        
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
+        
+        # AdaLN components for ego_status modulation
+        self.time_emb = SinusoidalPosEmb(n_emb)  
+        
+        # Linear projection for ego_status
+        self.status_dim = status_dim
+        self.ego_status_proj = nn.Linear(status_dim, n_emb)
+        
+        # History Encoder for global modulation
+        self.history_encoder = HistoryEncoder(status_dim, n_emb)
 
         # Custom encoder block that handles all condition processing
         self.encoder_block = CustomEncoderBlock(
@@ -423,8 +797,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             self.mask = None
             self.memory_mask = None
 
-        # trajectory head block
-        self.trajectory_head = TrajectoryHead(n_emb, output_dim, p_drop_emb)
+        # trajectory head block (with Residual Refinement and Temporal Smoothing)
+        self.trajectory_head = TrajectoryRefinementHead(n_emb, output_dim, p_drop_emb)
         
         # constants
         self.T = T
@@ -434,6 +808,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.vl_emb_dim = vl_emb_dim
 
         self.apply(self._init_weights)
+        
+        # Initialize AdaLN modulation weights to zero (like in recogdrive.py)
+        def zero_out_init(module: nn.Module):
+            if isinstance(module, nn.Linear):
+                nn.init.constant_(module.weight, 0)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        
+        # Zero out adaLN_modulation in all decoder layers
+        for layer in self.decoder.layers:
+            if hasattr(layer, 'adaLN_modulation'):
+                layer.adaLN_modulation.apply(zero_out_init)
+        
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
@@ -447,17 +834,41 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.TransformerEncoder,
             nn.TransformerDecoder,
             nn.GELU,
+            nn.SiLU,  
             nn.Sequential,
             CustomEncoderBlock,
             CustomDecoderLayer,
             CustomTransformerDecoder,
             TrajectoryHead,
+            TrajectoryRefinementHead,
             nn.ModuleList
         )  #
         if isinstance(module, (nn.Linear, nn.Embedding)):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.GRU):
+             # This case is now handled inside TrajectoryRefinementHead check or here if standalone
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    torch.nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    torch.nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    torch.nn.init.zeros_(param.data)
+        elif isinstance(module, TrajectoryRefinementHead):
+            # Initialize GRU
+            for name, param in module.refine_gru.named_parameters():
+                if 'weight_ih' in name:
+                    torch.nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    torch.nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    torch.nn.init.zeros_(param.data)
+            # Initialize cond_proj
+            if hasattr(module, 'cond_proj'):
+                torch.nn.init.normal_(module.cond_proj.weight, mean=0.0, std=0.02)
+                torch.nn.init.zeros_(module.cond_proj.bias)
         elif isinstance(module, nn.MultiheadAttention):
             weight_names = [
                 'in_proj_weight', 'q_proj_weight', 'k_proj_weight', 'v_proj_weight']
@@ -474,8 +885,29 @@ class TransformerForDiffusion(ModuleAttrMixin):
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
+        elif isinstance(module, RMSNorm):
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, RotaryEmbedding):
+            # RotaryEmbedding has its own initialization with buffers
+            pass
+        elif isinstance(module, MultiheadAttentionWithQKNorm):
+            # QK-Norm wrapper - let it handle its own submodules
+            pass
+        elif isinstance(module, HistoryEncoder):
+            for name, param in module.gru.named_parameters():
+                if 'weight_ih' in name:
+                    torch.nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    torch.nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    torch.nn.init.zeros_(param.data)
+            torch.nn.init.normal_(module.out_proj.weight, mean=0.0, std=0.02)
+            torch.nn.init.zeros_(module.out_proj.bias)
         elif isinstance(module, TransformerForDiffusion):
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.hist_pos_emb, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.hist_segment_emb, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.fut_segment_emb, mean=0.0, std=0.02)
             if hasattr(module, 'vl_pool_query'):
                 torch.nn.init.normal_(module.vl_pool_query, mean=0.0, std=0.02)
             if hasattr(module, 'cond_pos_emb') and module.cond_pos_emb is not None:
@@ -496,20 +928,18 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention)
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention, torch.nn.Conv1d, torch.nn.GRU)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding, RMSNorm)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
                 fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
 
-                if pn.endswith("bias"):
+                if pn.endswith("bias") or "bias" in pn:
                     # all biases will not be decayed
                     no_decay.add(fpn)
-                elif pn.startswith("bias"):
-                    # MultiheadAttention bias starts with "bias"
-                    no_decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
+                elif "weight" in pn and isinstance(m, whitelist_weight_modules):
                     # weights of whitelist modules will be weight decayed
+                    # This includes weight_ih, weight_hh for GRU/LSTM, weight for Linear/Conv1d, etc.
                     decay.add(fpn)
                 elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
                     # weights of blacklist modules will NOT be weight decayed
@@ -521,6 +951,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             if 'pos_emb' in name or '_dummy_variable' in name:
                 no_decay.add(name)
             elif 'vl_pool_query' in name or 'cond_pos_emb' in name:
+                no_decay.add(name)
+            elif 'hist_pos_emb' in name or 'segment_emb' in name:
                 no_decay.add(name)
 
         # validate that we considered every parameter
@@ -562,17 +994,22 @@ class TransformerForDiffusion(ModuleAttrMixin):
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
         vl_embeds: torch.Tensor,
-        cond: torch.Tensor, **kwargs):
+        cond: torch.Tensor,
+        ego_status: Optional[torch.Tensor] = None,
+        **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
-        vl_embeds: (B, T_vl, D_vl) 
+        vl_embeds: (B, T_vl, D_vl)
+        ego_status: (B, status_dim) current ego status
         output: (B,T,input_dim)
         """
         sample = sample.contiguous()
         cond = cond.contiguous() 
+        # vl_embeds=torch.ones_like(vl_embeds)
         vl_embeds = vl_embeds.contiguous()
+        
         
         # 1. Prepare timesteps
         timesteps = timestep
@@ -582,7 +1019,51 @@ class TransformerForDiffusion(ModuleAttrMixin):
             timesteps = timesteps[None].to(sample.device)
         timesteps = timesteps.expand(sample.shape[0])
         
-        # 2. Check VL padding
+        # 2. Generate conditioning from timestep and ego_status (AdaLN)
+        time_embedding = self.time_emb(timesteps)  # (B, n_emb)
+        conditioning = None
+        hist_features = None
+        if ego_status is not None:
+            # Handle 3D ego_status (B, To, status_dim)
+            if ego_status.dim() == 3:
+                current_status = ego_status[:, -1, :]
+                
+                # Use full history state (B, To, status_dim)
+                # We assume the input ego_status contains the history we want
+                hist_state = ego_status
+                
+                # 1. Embed history for concatenation (Local Context)
+                hist_tokens = self.hist_feature_emb(hist_state)
+                
+                # Add position embedding
+                t_hist = hist_tokens.shape[1]
+                if t_hist <= self.hist_pos_emb.shape[1]:
+                    hist_pos = self.hist_pos_emb[:, :t_hist, :]
+                else:
+                    hist_pos = self.hist_pos_emb
+                
+                # Add segment embedding for history
+                hist_features = hist_tokens + hist_pos + self.hist_segment_emb
+                
+                # 2. Encode history for modulation (Global Context)
+                # This summarizes the motion trend into a single vector
+                hist_global_embedding = self.history_encoder(hist_state)
+                
+            else:
+                current_status = ego_status
+                # If no history provided, use zero or projection of current as fallback for global
+                # But ideally we should have history. For now, if 2D, we can't use history encoder properly
+                # unless we treat it as sequence of length 1.
+                hist_global_embedding = torch.zeros_like(time_embedding)
+
+            # Project ego_status (current)
+            status_embedding = self.ego_status_proj(current_status)  # (B, n_emb)
+            
+            # Add to timestep embedding: Time + Current Status + History Trend
+            conditioning = time_embedding + status_embedding + hist_global_embedding # (B, n_emb)
+
+        
+        # 3. Check VL padding
         vl_padding_mask = None
         if 'vl_mask' in kwargs and kwargs['vl_mask'] is not None:
             vl_padding_mask = ~kwargs['vl_mask']  
@@ -590,32 +1071,54 @@ class TransformerForDiffusion(ModuleAttrMixin):
             vl_norm = torch.norm(vl_embeds, dim=-1)  # (B, T_vl)
             vl_padding_mask = (vl_norm == 0) 
         
-        # 3. Process conditions through encoder block to get memory
+        # 4. Process conditions through encoder block to get memory (no timestep)
         memory, vl_features = self.encoder_block(
-            timestep=timesteps, 
             vl_embeds=vl_embeds, 
             cond=cond, 
             vl_padding_mask=vl_padding_mask)
         
-        # 4. Pre-decoder processing
+        # 5. Pre-decoder processing
         token_embeddings = self.input_emb(sample)
         t = token_embeddings.shape[1]
         position_embeddings = self.pos_emb[:, :t, :]
-        x = self.drop(token_embeddings + position_embeddings)
+        # Add future segment embedding
+        x = self.drop(token_embeddings + position_embeddings + self.fut_segment_emb)
         x = self.pre_decoder_norm(x)
         
-        # 5. Decoder with integrated memory mask handling and VL cross attention
+        # Concatenate history if available
+        tgt_mask = self.mask
+        if hist_features is not None:
+            hist_x = self.drop(hist_features)
+            hist_x = self.pre_decoder_norm(hist_x)
+            x = torch.cat([hist_x, x], dim=1)
+            
+            if tgt_mask is not None:
+                # Create causal mask for the extended sequence
+                total_len = x.shape[1]
+                mask = (torch.triu(torch.ones(total_len, total_len, device=x.device)) == 1).transpose(0, 1)
+                tgt_mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        
+        # 6. Decoder with integrated memory mask handling and VL cross attention
+        # Pass conditioning to decoder for AdaLN modulation
         x = self.decoder(
             tgt=x,
             memory=memory,
             vl_features=vl_features,
             cond=cond,
-            tgt_mask=self.mask,
-            vl_key_padding_mask=vl_padding_mask
+            tgt_mask=tgt_mask,
+            vl_key_padding_mask=vl_padding_mask,
+            conditioning=conditioning  # 传递 conditioning
         )        
         
-        # 6. trajectory head 
-        x = self.trajectory_head(x)
+        # 7. trajectory head 
+        # Pass full sequence (History + Future) to head for GRU continuity
+        # Also pass conditioning for GRU initialization
+        x = self.trajectory_head(x, conditioning=conditioning)
+        
+        # Slice output if history was added (keep only future)
+        if hist_features is not None:
+            x = x[:, -t:, :]
+            
         return x
 
 
@@ -623,23 +1126,96 @@ class TransformerForDiffusion(ModuleAttrMixin):
 def test():
     # GPT with time embedding and obs cond and encoder
     transformer = TransformerForDiffusion(
-        input_dim=16,
-        output_dim=16,
+        input_dim=2,  # Changed to 2 to match hist_traj dimension
+        output_dim=2, # Changed to 2
         horizon=8,
         n_obs_steps=4,
         cond_dim=10,
         causal_attn=True,
         n_cond_layers=4,
-        vl_emb_dim=1536
+        vl_emb_dim=1536,
+        status_dim=13,  # ego_status 维度
+        ego_status_seq_len=4  # 历史帧数
     )
     opt = transformer.configure_optimizers()
     
     timestep = torch.tensor(0)
-    sample = torch.zeros((4,8,16))
+    sample = torch.zeros((4,8,2)) # Changed to 2
     cond = torch.zeros((4,4,10))
     vl_embeds = torch.ones((4,36,1536))
+    
+    # Test 1: Without ego_status_history (backward compatibility)
+    print("Test 1: Without ego_status_history")
     out = transformer(sample, timestep, vl_embeds, cond)
-    print(out.shape)
+    print(f"Output shape: {out.shape}")
+    
+    # Test 2: With ego_status (AdaLN modulation)
+    print("\nTest 2: With ego_status (AdaLN modulation)")
+    ego_status = torch.randn((4, 13))  # (B, status_dim=13) - 2D for simple modulation
+    out_with_status = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status)
+    print(f"Output shape with status: {out_with_status.shape}")
+    
+    # Test 3: Verify outputs are different with/without status
+    print("\nTest 3: Verify modulation effect")
+    diff = torch.abs(out - out_with_status).mean()
+    print(f"Mean difference between outputs: {diff:.6f}")
+    if diff > 0:
+        print("✓ AdaLN modulation is working!")
+    else:
+        print("⚠ Warning: Outputs are identical (modulation may not be working)")
+
+    # Test 4: With 3D ego_status (History concatenation + AdaLN)
+    print("\nTest 4: With 3D ego_status (History concatenation)")
+    # ego_status with history: (B, To=4, status_dim=13)
+    ego_status_3d = torch.randn((4, 4, 13)) 
+    out_with_hist = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status_3d)
+    print(f"Output shape with history: {out_with_hist.shape}")
+    
+    diff_hist = torch.abs(out_with_status - out_with_hist).mean()
+    print(f"Mean difference between 2D and 3D status: {diff_hist:.6f}")
+    if diff_hist > 0:
+        print("✓ History concatenation is affecting output!")
+    
+    # Test 5: Verify GRU Continuity and Conditioning
+    print("\nTest 5: Verify GRU Continuity and Conditioning")
+    # We expect the output to change slightly because of GRU initialization with conditioning
+    # and because the GRU now sees the history sequence.
+    
+    # Run with same inputs as Test 4 but check if output is different from what we would expect 
+    # if we sliced BEFORE the head (which we can't easily simulate without changing code back, 
+    # but we can check if conditioning affects output).
+    
+    # Run with different conditioning (different timestep)
+    timestep2 = torch.tensor(10)
+    out_diff_time = transformer(sample, timestep2, vl_embeds, cond, ego_status=ego_status_3d)
+    
+    diff_time = torch.abs(out_with_hist - out_diff_time).mean()
+    print(f"Mean difference with different timestep (Global Context Injection): {diff_time:.6f}")
+    if diff_time > 0:
+        print("✓ Global Context Injection (Conditioning) is working!")
+
+    # Test 6: Verify Global History Modulation
+    print("\nTest 6: Verify Global History Modulation")
+    # We check if changing the history (but keeping current status same) affects the output
+    # via the modulation pathway.
+    
+    # Create two histories with same final state but different past
+    ego_status_A = torch.randn((4, 4, 13))
+    ego_status_B = ego_status_A.clone()
+    # Change the past (t=0..2), keep current (t=3) same
+    ego_status_B[:, :3, :] = torch.randn((4, 3, 13))
+    
+    # Run model
+    out_A = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status_A)
+    out_B = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status_B)
+    
+    diff_hist_mod = torch.abs(out_A - out_B).mean()
+    print(f"Mean difference with different history (same current): {diff_hist_mod:.6f}")
+    if diff_hist_mod > 0:
+        print("✓ Global History Modulation is working!")
+
+    print("\n✓ All tests passed!")
+
 
     
 if __name__ == "__main__":

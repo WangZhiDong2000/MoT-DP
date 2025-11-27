@@ -156,14 +156,13 @@ def main():
     parser.add_argument(
         '--dataset_path',
         type=str,
-        default='/home/wang/Project/carla_garage/tmp_data/train',
-        # default='/home/wang/Dataset/b2d_10scene/tmp_data/train',
+        default='/share-data/pdm_lite/tmp_data/train',
         help='Path to processed dataset (containing train/val folders or pkl files)'
     )
     parser.add_argument(
         '--config_path',
         type=str,
-        default='/home/wang/Project/MoT-DP/config/carla.yaml',
+        default='/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml',
         help='Path to config file to save stats'
     )
     parser.add_argument(

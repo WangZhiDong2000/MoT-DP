@@ -53,16 +53,12 @@ def dict_apply(
     return result
 
 def normalize_data(data, stats):
-    # nomalize to [0,1]
     ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-    # normalize to [-1, 1]
     ndata = ndata * 2 - 1
     return ndata
 
 def unnormalize_data(ndata, stats):
-    # unnormalize from [-1, 1] to [0, 1]
     ndata = (ndata + 1) / 2
-    # unnormalize to original range
     data = ndata * (stats['max'] - stats['min']) + stats['min']
     return data
 
@@ -99,7 +95,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         bev_encoder_cfg = config.get('bev_encoder', {})
         obs_encoder = InterfuserBEVEncoder(
             perception_backbone=None,
-            state_dim=bev_encoder_cfg.get('state_dim', 9),
+            state_dim=bev_encoder_cfg.get('state_dim', 13),  # 修改为13维以支持拼接后的ego_status
             feature_dim=bev_encoder_cfg.get('feature_dim', 256),
             use_group_norm=bev_encoder_cfg.get('use_group_norm', True),
             freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
@@ -116,7 +112,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             print("  Continuing with random initialization...")
         
         self.obs_encoder = obs_encoder
-        self.obs_encoder.cuda()
 
         # TODO load vlm and vlm encoder model）
         self.vlm_backbone = None
@@ -137,20 +132,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         else:
             print("⚠ VLM backbone not available, using simulated features")
         self._init_fixed_vlm_features()
-        # self.feature_encoder = nn.Linear(2560, 1536)
-        # self.feature_encoder.eval()
-        # self._init_loaded_vlm_features()
 
-
-        # create diffusion model
-        # TCP模型输出特征维度（j_ctrl）为256，修改相应维度
         obs_feature_dim = 256  
+
+        # Get status_dim from bev_encoder config
+        status_dim = bev_encoder_cfg.get('state_dim', 15)
         
-        # Optional GroupNorm for j_ctrl features (recommended for training stability)
-        # self.use_j_ctrl_norm = policy_cfg.get('use_j_ctrl_norm', False)
-        # if self.use_j_ctrl_norm:
-        #     self.j_ctrl_norm = nn.GroupNorm(num_groups=8, num_channels=256)
-        #     print("✓ GroupNorm enabled for j_ctrl features")  
+        # Get ego_status_seq_len from policy config (defaults to n_obs_steps)
+        ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
@@ -165,7 +154,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             p_drop_attn=policy_cfg.get('p_drop_attn', 0.1),
             causal_attn=policy_cfg.get('causal_attn', True),
             obs_as_cond=obs_as_global_cond,
-            n_cond_layers=policy_cfg.get('n_cond_layers', 4)
+            n_cond_layers=policy_cfg.get('n_cond_layers', 4),
+            status_dim=status_dim,  # 传入 ego_status 维度
+            ego_status_seq_len=ego_status_seq_len  # 传入 ego_status 序列长度
         )
 
         self.model = model
@@ -267,7 +258,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
                 - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
                 - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                - 'speed', 'target_point', 'next_command': 状态信息
+                - 'ego_status' (B, 13): [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
+                  已经拼接好的13维状态向量，直接作为state输入
             return_attention: 是否返回attention map
             
         Returns:
@@ -275,18 +267,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             如果return_attention=True: (j_ctrl特征, attention_map) 
         """
         try:
-            # 准备状态信息
-            speed = obs_dict['speed'].to(dtype=torch.float32).view(-1,1) / 12.
-            target_point = obs_dict['target_point'].to(dtype=torch.float32)
-            command = obs_dict['next_command'].to(dtype=torch.float32)
-            state = torch.cat([speed, target_point, command], 1).to('cuda')
-            
+            device = next(self.parameters()).device
+            state = obs_dict['ego_status'].to(device=device, dtype=torch.float32)  # (B, 13)
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
-            
             if use_precomputed:
-                # 模式1: 使用预处理好的BEV特征（快速）
-                lidar_token = obs_dict['lidar_token'].to(device='cuda', dtype=torch.float32)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device='cuda', dtype=torch.float32)
+                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=torch.float32)
+                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=torch.float32)
                 
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
@@ -306,12 +292,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                     )
                     attention_map = None
             else:
-                # 模式2: 使用原始lidar_bev图像（兼容模式，慢）
                 if 'lidar_bev' not in obs_dict:
                     raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
                 
-                lidar_bev_img = obs_dict['lidar_bev'].to(device='cuda', dtype=torch.float32)
-                
+                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=torch.float32)
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
                         image=lidar_bev_img,
@@ -341,26 +325,21 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
-            # 选项1: 预处理好的特征（推荐）
-            'lidar_token': (B, obs_horizon, seq_len, 512) - 预处理的空间特征
-            'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征
+            # BEV特征（二选一）
+            'lidar_token': (B, obs_horizon, seq_len, 512) - 预处理的空间特征（推荐）
+            'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征（推荐）
+            'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
             
-            # 选项2: 原始图像（兼容模式）
-            'lidar_bev': (B, obs_horizon, 3, 448, 448) - LiDAR BEV图像
-            
-            # 其他必需字段
-            'agent_pos': (B, obs_horizon, 2)
-            'next_command': (B, obs_horizon, 6)
-            'speed': (B, obs_horizon)
-            'target_point': (B, obs_horizon, 2)
+            # nuScenes必需字段
+            'agent_pos': (B, horizon, 2) - 未来轨迹点
+            'ego_status': (B, obs_horizon, 13) - 车辆状态 [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
         }
         """
         device = next(self.parameters()).device
         nobs = {}
+        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos']
         
-        # 支持预处理特征和原始图像两种模式
-        carla_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'next_command', 'speed', 'target_point', 'agent_pos']
-        for field in carla_fields:
+        for field in required_fields:
             if field in batch:
                 if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
                     nobs[field] = batch[field].to(device=device, dtype=torch.float32)
@@ -385,7 +364,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
 
         if self.obs_as_global_cond:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -395,8 +373,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             nobs_features = self.extract_tcp_features(this_nobs)
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
 
-        # generate impainting mask
-        # condition_mask = self.mask_generator(trajectory.shape)
         condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
 
         # Sample noise that we'll add to the images
@@ -427,11 +403,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 device=device,
                 max_seq_len=None
             )
+            print("Using simulated VLM features for loss computation! ! !")
         else:
             vl_features = vqa.to(device=device, dtype=torch.float32)  # (B, seq_len, feat_dim)
             vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=device)
         vl_embeds = self.feature_encoder(vl_features)
-        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask)
+        
+        # Use current ego_status instead of full history
+        ego_status = nobs['ego_status']  # (B, 13)
+        
+        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask, ego_status=ego_status)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -455,17 +436,40 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None, vl_features=None,
+            ego_status=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
         model = self.model
         scheduler = self.noise_scheduler
+        device = condition_data.device
+        bs = condition_data.shape[0]
 
-        trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
-            generator=generator)
+        # Initialize trajectory based on anchor configuration
+        if self.use_anchor and self.plan_anchor is not None:
+            # 1. 准备 plan_anchor：使用anchor轨迹，加噪声到归一化后的anchor
+            plan_anchor = self.plan_anchor.to(device).repeat(bs, 1, 1)  # (bs, 8, 2)
+            odo_info_fut = self.normalize_action(plan_anchor)  # 归一化到[-1, 1]
+            
+            # 添加噪声到归一化后的 plan_anchor
+            noise = torch.randn(odo_info_fut.shape, device=device)
+            timesteps = torch.randint(
+                0, self.noise_scheduler.config.get('num_train_timesteps', 100),
+                (bs,), device=device
+            ).long()
+            noisy_trajectory = scheduler.add_noise(
+                original_samples=odo_info_fut,
+                noise=noise,
+                timesteps=timesteps
+            ).float()
+            trajectory = torch.clamp(noisy_trajectory, min=-1, max=1)
+        else:
+            # 直接从高斯分布采样
+            trajectory = torch.randn(
+                size=condition_data.shape, 
+                dtype=condition_data.dtype,
+                device=device,
+                generator=generator)
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
@@ -484,7 +488,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask)
+            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask, ego_status=ego_status)
 
 
             # 3. compute previous image: x_t -> x_t-1
@@ -515,7 +519,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond_data = None
         cond_mask = None
         if self.obs_as_global_cond:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -526,7 +529,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
             # condition through impainting
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
             batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
             batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
             feature_dim = batch_features.shape[-1]
@@ -540,7 +542,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # run sampling
         # Extract VQA features from obs_dict if available
         if 'vqa' not in nobs or nobs['vqa'] is None:
-            # 如果vqa为None或不存在，使用初始化中生成的模板
             vl_feat, _ = self.generate_simulated_vlm_outputs(
                 batch_size=B, 
                 device=device,
@@ -549,11 +550,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         else:
             vl_feat = nobs['vqa'].to(dtype=torch.float32)
         
+        # Use current ego_status instead of full history
+        ego_status = nobs['ego_status']  # (B, 13)
+        
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             cond=cond,
-            vl_features=vl_feat
+            vl_features=vl_feat,
+            ego_status=ego_status
             )
         
         naction_pred = nsample[...,:Da]
@@ -564,19 +569,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Unnormalize action predictions back to original range
         if self.enable_action_normalization and self.action_stats is not None:
             naction_pred = self.unnormalize_action(naction_pred)
-            
-            # Additional safety clamp after unnormalization to prevent extreme outliers
-            device = naction_pred.device
-            action_min = self.action_stats['min'].to(device)
-            action_max = self.action_stats['max'].to(device)
-            
-            # Expand to reasonable bounds (20% beyond training range)
-            safety_margin = 0.2
-            range_size = action_max - action_min
-            expanded_min = action_min - safety_margin * range_size
-            expanded_max = action_max + safety_margin * range_size
-            
-            naction_pred = torch.clamp(naction_pred, expanded_min, expanded_max)
         
         action_pred = naction_pred.detach().cpu().numpy()
         # 直接返回整个预测序列，因为horizon=action_horizon
@@ -587,188 +579,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         }
         return result
 
-    def extract_attention_map(self, obs_dict: Dict[str, torch.Tensor]) -> np.ndarray:
-        """
-        提取最后一帧观测的attention map
-        
-        Args:
-            obs_dict: 观测字典
-            
-        Returns:
-            attention_map: (H, W) numpy数组
-        """
-        device = next(self.parameters()).device
-        nobs = dict_apply(obs_dict, lambda x: x.to(device))
-        
-        # 获取最后一帧观测
-        last_obs = dict_apply(nobs, lambda x: x[:, -1, ...])
-        
-        # 提取特征和attention map
-        with torch.no_grad():
-            _, attention_map = self.extract_tcp_features(last_obs, return_attention=True)
-        
-        # 转换为numpy
-        attention_map_np = attention_map[0].cpu().numpy()  # (H, W)
-        
-        return attention_map_np
-
-    def predict_action_with_steps(self, obs_dict: Dict[str, torch.Tensor]):
-        """
-        预测动作并返回去噪过程的中间步骤
-        
-        Returns:
-            result: 预测结果字典
-            denoising_steps: 去噪过程中的轨迹列表
-        """
-        device = next(self.parameters()).device
-        nobs = dict_apply(obs_dict, lambda x: x.to(device))
-
-        value = next(iter(nobs.values()))
-        B, To = value.shape[:2]
-        T = self.horizon
-        Da = self.action_dim
-        Do = self.obs_feature_dim
-        To = self.n_obs_steps
-
-        # 准备条件
-        cond = None
-        cond_data = None
-        cond_mask = None
-        if self.obs_as_global_cond:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-            shape = (B, T, Da)
-            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-        else:
-            # 批量处理：将 (B, To, ...) reshape 为 (B*To, ...)，一次性提取特征，再 reshape 回来
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            nobs_features = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-            shape = (B, T, Da+Do)
-            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            cond_data[:,:To,Da:] = nobs_features
-            cond_mask[:,:To,Da:] = True
-
-        # 运行采样并捕获中间步骤
-        # Extract VQA features from obs_dict if available
-        if 'vqa' not in nobs or nobs['vqa'] is None:
-            # 如果vqa为None或不存在，使用初始化中生成的模板
-            vl_feat, _ = self.generate_simulated_vlm_outputs(
-                batch_size=B, 
-                device=device,
-                max_seq_len=None
-            )
-        else:
-            vl_feat = nobs['vqa'].to(dtype=torch.float32)
-        
-        nsample, denoising_steps = self.conditional_sample_with_steps(
-            cond_data, 
-            cond_mask,
-            cond=cond,
-            vl_features=vl_feat
-        )
-        
-        naction_pred = nsample[...,:Da]
-        naction_pred = torch.clamp(naction_pred, -1.0, 1.0)
-        
-        # 反归一化去噪步骤用于可视化
-        denoising_steps_unnormalized = []
-        if self.enable_action_normalization and self.action_stats is not None:
-            for step in denoising_steps:
-                step_actions = step[..., :Da]
-                step_actions_clamped = torch.clamp(step_actions, -1.0, 1.0)
-                step_actions_unnorm = self.unnormalize_action(step_actions_clamped)
-                denoising_steps_unnormalized.append(step_actions_unnorm)
-            
-            # 反归一化最终预测
-            naction_pred = self.unnormalize_action(naction_pred)
-            device = naction_pred.device
-            action_min = self.action_stats['min'].to(device)
-            action_max = self.action_stats['max'].to(device)
-            safety_margin = 0.2
-            range_size = action_max - action_min
-            expanded_min = action_min - safety_margin * range_size
-            expanded_max = action_max + safety_margin * range_size
-            naction_pred = torch.clamp(naction_pred, expanded_min, expanded_max)
-        else:
-            denoising_steps_unnormalized = [step[..., :Da] for step in denoising_steps]
-        
-        action_pred = naction_pred.detach().cpu().numpy()
-        action = action_pred
-        result = {
-            'action': action,
-            'action_pred': action_pred
-        }
-        
-        # 转换去噪步骤为numpy（已经反归一化）
-        denoising_steps_np = [step[0].detach().cpu().numpy() for step in denoising_steps_unnormalized]
-        
-        return result, denoising_steps_np
-
-    def conditional_sample_with_steps(self, 
-            condition_data, condition_mask,
-            cond=None, generator=None, vl_features=None,
-            **kwargs):
-        """
-        条件采样并返回中间去噪步骤
-        """
-        model = self.model
-        scheduler = self.noise_scheduler
-
-        trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
-            generator=generator)
-    
-        scheduler.set_timesteps(self.num_inference_steps)
-        
-        # Use provided vl_features or generate simulated ones
-        if vl_features is None:
-            print("No VLM features provided, generating simulated features...")
-            vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0], trajectory.device)
-        else:
-            # vl_features provided, create mask for valid positions
-            vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=vl_features.device)
-        
-        vl_embeds = self.feature_encoder(vl_features)
-
-        # 保存去噪步骤
-        denoising_steps = []
-        denoising_steps.append(trajectory.clone())  # 初始噪声
-        
-        total_steps = len(scheduler.timesteps)
-        for i, t in enumerate(scheduler.timesteps):
-            # 1. apply conditioning
-            trajectory[condition_mask] = condition_data[condition_mask]
-
-            # 2. predict model output
-            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask)
-
-            # 3. compute previous image: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, 
-                generator=generator,
-                **kwargs
-                ).prev_sample
-            
-            # 保存关键步骤（初始、33%、66%、最终）
-            if i == total_steps // 3 or i == 2 * total_steps // 3:
-                denoising_steps.append(trajectory.clone())
-        
-        # 最终结果
-        trajectory[condition_mask] = condition_data[condition_mask]
-        denoising_steps.append(trajectory.clone())
-
-        return trajectory, denoising_steps
-
-    # ========= VLM feature simulati, temporary! TODO   ============
+    # ========= VLM feature simulation, temporary! TODO   ============
 
     def _init_loaded_vlm_features(self):
         """
