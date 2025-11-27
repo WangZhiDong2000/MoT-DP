@@ -150,6 +150,7 @@ def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmenta
     Returns:
         waypoints_aug: List of waypoints in ego frame (BEV, 2D), length = action_horizon + 1
                       First waypoint is current position [0, 0], followed by future waypoints
+                      Returns None if there are not enough future frames
     """
     origin = measurements[0]
     origin_matrix = np.array(origin['ego_matrix'])[:3]
@@ -168,21 +169,12 @@ def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmenta
             # Drop the height dimension because we predict waypoints in BEV
             waypoints.append(waypoint_ego_frame[:2, 0])
         else:
-            # If we run out of measurements, pad with the last valid waypoint
-            if len(waypoints) > 1:
-                waypoints.append(waypoints[-1].copy())
-            else:
-                # This case should be rare if we have at least one future frame
-                waypoints.append(np.array([0.0, 0.0]))
+            # Not enough measurements - return None to indicate this sample should be skipped
+            return None
 
-    # Final check to ensure correct length
-    while len(waypoints) < action_horizon + 1:
-        print(f"Warning: Not enough future frames, padding with last waypoint. Have {len(waypoints)}, need {action_horizon+1}")
-        if len(waypoints) > 1:
-            waypoints.append(waypoints[-1].copy())
-        else:
-            print("Warning: No future frames available, using current position for all waypoints")
-            waypoints.append(np.array([0.0, 0.0]))
+    # Verify we have the correct number of waypoints
+    if len(waypoints) != action_horizon + 1:
+        return None
     
     # Data augmentation
     waypoints_aug = []
@@ -264,8 +256,9 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
         STORE_BYTES = False # Whether to store image bytes or image paths
         rgb_dir = join(folder_path, 'rgb')
         
-        # Start processing from a frame that allows for a full observation history
-        scen_start_frame_offset = (obs_horizon - 1) * hz_interval
+        # Start processing from a frame that allows for a full observation history and VQA features
+        # VQA features start from frame 0004, so we skip the first 3 frames
+        scen_start_frame_offset = max((obs_horizon - 1) * hz_interval, 4)
         
         for ii in range(scen_start_frame_offset, last_frame_idx, sample_interval):
             # --- Load all measurements needed for this sample ---
@@ -324,6 +317,11 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             # The list starts from the current frame
             future_measurements = loaded_measurements[current_idx_in_list:]       
             waypoints = get_waypoints(future_measurements, action_horizon=action_horizon)
+            
+            # Skip this sample if waypoints are incomplete (no padding allowed)
+            if waypoints is None:
+                continue
+            
             frame_data['ego_waypoints'] = np.array(waypoints)
             assert frame_data['ego_waypoints'].shape == (action_horizon + 1, 2)
             
@@ -448,35 +446,25 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             frame_data['lidar_bev_hist'] = lidar_bev_hist
 
             # --- VQA Features (dp_vl_feature) ---
-            # dp_vl_feature contains .pt files at frame indices that are multiples of 5
-            # For other frames, map to the previous multiple of 5
+            # Load only the current frame's corresponding .pt file (no history)
+            # VQA features start from frame 0004
             dp_vl_feature_dir = join(folder_path, 'dp_vl_feature')
-            vqa_hist = []
-            if os.path.exists(dp_vl_feature_dir):
-                for j in range(obs_start_idx, ii + 1, hz_interval):
-                    if j < 0: 
-                        continue
-                    # Find the corresponding frame index that is a multiple of 5
-                    vqa_frame_idx = (j // 5) * 5
-                    vqa_path = join(dp_vl_feature_dir, f"{vqa_frame_idx:04d}.pt")
-                    
-                    if os.path.exists(vqa_path):
-                        vqa_hist.append(join(folder_name, 'dp_vl_feature', f"{vqa_frame_idx:04d}.pt"))
-                    else:
-                        vqa_hist.append(None)
-                
-                # Pad if we don't have enough history frames
-                while len(vqa_hist) < obs_horizon:
-                    if vqa_hist:
-                        vqa_hist.insert(0, vqa_hist[0])
-                    else:
-                        vqa_hist.insert(0, None)
+            vqa_path = None
             
-            # If dp_vl_feature directory doesn't exist or no features were found, fill with None
-            if not vqa_hist:
-                vqa_hist = [None] * obs_horizon
+            if ii >= 4 and os.path.exists(dp_vl_feature_dir):
+                # Load the exact frame index for current frame
+                vqa_file = join(dp_vl_feature_dir, f"{ii:04d}.pt")
                 
-            frame_data['vqa'] = vqa_hist
+                if os.path.exists(vqa_file):
+                    vqa_path = join(folder_name, 'dp_vl_feature', f"{ii:04d}.pt")
+                else:
+                    # Skip this sample if VQA feature is missing (no padding allowed)
+                    continue
+            elif ii >= 4:
+                print(f"Warning: VQA feature directory not found in {folder_name}, skipping frame {ii}...")
+                continue
+            
+            frame_data['vqa'] = vqa_path
 
             scene_data.append(frame_data)
             
@@ -567,11 +555,11 @@ def split_train_val(in_dir, out_dir, val_ratio=0.1):
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
-    argparser.add_argument('--data-root', type=str, default='/home/wang/Project/carla_garage/data/' , help='Root directory of raw PDM Lite data')
-    argparser.add_argument('--out-dir', type=str, default='/home/wang/Project/carla_garage/tmp_data', help='Output directory for processed data')
+    argparser.add_argument('--data-root', type=str, default='/share-data/pdm_lite/' , help='Root directory of raw PDM Lite data')
+    argparser.add_argument('--out-dir', type=str, default='/share-data/pdm_lite/tmp_data', help='Output directory for processed data')
     argparser.add_argument('--obs-horizon', type=int, default=4, help='Number of observation history frames')
-    argparser.add_argument('--action-horizon', type=int, default=8, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
-    argparser.add_argument('--sample-interval', type=int, default=2, help='Interval between training samples (e.g., 10 frames)')
+    argparser.add_argument('--action-horizon', type=int, default=6, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
+    argparser.add_argument('--sample-interval', type=int, default=1, help='Interval between training samples (e.g., 10 frames)')
     argparser.add_argument('--hz-interval', type=int, default=2, help='Interval within a sample to match frequency (e.g., 2 for 2Hz from 4Hz data)')
     argparser.add_argument('--save-mode', type=str, default='frame', choices=['scene', 'frame'], help='Save mode: "scene" to save all frames per scene in one file, "frame" to save each frame separately')
     argparser.add_argument('--workers', type=int, default=4, help='Number of workers for parallel processing')
