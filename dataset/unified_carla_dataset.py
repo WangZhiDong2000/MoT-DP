@@ -154,10 +154,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             elif key == 'vqa':
                 # Add the VQA features if available
                 final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
+                final_sample['reasoning_query_tokens'] = vqa_feature['reasoning_query_tokens']
                 # Handle variable-length answer_token_indexes by padding to fixed size
                 if isinstance(vqa_feature, dict) and 'answer_token_indexes' in vqa_feature:
                     answer_tokens = vqa_feature['answer_token_indexes']
-                    max_answer_tokens = 10  # Fixed maximum length for padding
+                    max_answer_tokens = 8  # Fixed maximum length for padding
                     if answer_tokens.shape[0] < max_answer_tokens:
                         # Pad with -1 (or any invalid token index)
                         padding = torch.full((max_answer_tokens - answer_tokens.shape[0],), -1, dtype=answer_tokens.dtype)
@@ -179,39 +180,30 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         ego_status_components = []
         
         # 1. speed_hist
-        if 'speed' in final_sample:
-            speed_data = final_sample['speed']
-            ego_status_components.append(speed_data.unsqueeze(-1))  # (obs_horizon, 1)
+        speed_data = final_sample['speed']
+        ego_status_components.append(speed_data.unsqueeze(-1))  # (obs_horizon, 1)
         
         # 2. theta_hist
-        if 'theta_hist' in final_sample:
-            theta_data = final_sample['theta_hist']
-            ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
+        theta_data = final_sample['theta_hist']
+        ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
         
-        # 3. throttle_hist
-        if 'throttle_hist' in final_sample:
-            throttle_data = final_sample['throttle_hist']
-            ego_status_components.append(throttle_data.unsqueeze(-1))  # (obs_horizon, 1)
-        
-        # 4. brake_hist
-        if 'brake_hist' in final_sample:
-            brake_data = final_sample['brake_hist']
-            ego_status_components.append(brake_data.unsqueeze(-1))  # (obs_horizon, 1)
+        throttle_data = final_sample['throttle_hist']
+        ego_status_components.append(throttle_data.unsqueeze(-1))  # (obs_horizon, 1)
+
+        brake_data = final_sample['brake_hist']
+        ego_status_components.append(brake_data.unsqueeze(-1))  # (obs_horizon, 1)
         
         # 5. command_hist (one-hot, shape: (obs_horizon, 6))
-        if 'command_hist' in final_sample:
-            command_data = final_sample['command_hist']
-            ego_status_components.append(command_data)  # (obs_horizon, 6)
+        command_data = final_sample['command_hist']
+        ego_status_components.append(command_data)  # (obs_horizon, 6)
 
         # 5. target point
-        if 'target_point_hist' in final_sample:
-            command_data = final_sample['target_point_hist']
-            ego_status_components.append(command_data)  # (obs_horizon, 2)
+        command_data = final_sample['target_point_hist']
+        ego_status_components.append(command_data)  # (obs_horizon, 2)
         
         # 6. waypoints_hist (shape: (obs_horizon, 2))
-        if 'waypoints_hist' in final_sample:
-            waypoints_data = final_sample['waypoints_hist']
-            ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
+        waypoints_data = final_sample['waypoints_hist']
+        ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
         
         # Concatenate all components along the feature dimension
         final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)

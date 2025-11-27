@@ -993,21 +993,26 @@ class TransformerForDiffusion(ModuleAttrMixin):
     def forward(self, 
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
-        vl_embeds: torch.Tensor,
         cond: torch.Tensor,
+        gen_vit_tokens: Optional[torch.Tensor] = None,
+        answer_token_indexes: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
         **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
-        vl_embeds: (B, T_vl, D_vl)
+        gen_vit_tokens: (B, seq_len, feat_dim) - VIT tokens from VQA (used as independent variable)
+        answer_token_indexes: (B, max_answer_tokens) - answer token indices (used as independent variable)
         ego_status: (B, status_dim) current ego status
         output: (B,T,input_dim)
         """
         sample = sample.contiguous()
         cond = cond.contiguous() 
-        # vl_embeds=torch.ones_like(vl_embeds)
+        
+        # gen_vit_tokens and answer_token_indexes are passed as independent variables
+        # Use gen_vit_tokens directly as vl_embeds if provided
+        vl_embeds=gen_vit_tokens
         vl_embeds = vl_embeds.contiguous()
         
         

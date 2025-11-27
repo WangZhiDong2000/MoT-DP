@@ -175,13 +175,15 @@ def get_history_target_points(measurements, current_idx, obs_horizon):
             past_rotation = past_matrix[:, :3]
             
             # Transform target point from past frame's ego coordinate to world coordinate
-            # target_world = past_rotation @ [target_x, target_y, 0] + past_translation
+            # target_point is in past ego frame (x, y)
             target_point_3d = np.array([target_point_in_past_frame[0], 
                                        target_point_in_past_frame[1], 
                                        0.0]).reshape(3, 1)
             target_world = past_rotation @ target_point_3d + past_translation
             
             # Transform from world coordinate to current frame's ego coordinate
+            # This matches the transformation used for historical waypoints (positions)
+            # relative to the reference (current) position.
             target_in_current_frame = current_rotation.T @ (target_world - current_translation)
             
             target_points_hist.append(target_in_current_frame[:2, 0])
