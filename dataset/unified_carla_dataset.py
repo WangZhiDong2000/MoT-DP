@@ -121,33 +121,17 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 print(f"Warning: LiDAR feature files not found for {bev_path}")
                 continue
         
-        if lidar_tokens:
-            lidar_token_tensor = torch.stack(lidar_tokens)  # (obs_horizon, seq_len, 512)
-            lidar_token_global_tensor = torch.stack(lidar_tokens_global)  # (obs_horizon, 1, 512)
-        else:
-            # Fallback if no LiDAR features found
-            lidar_token_tensor = None
-            lidar_token_global_tensor = None
+
+        lidar_token_tensor = torch.stack(lidar_tokens)  # (obs_horizon, seq_len, 512)
+        lidar_token_global_tensor = torch.stack(lidar_tokens_global)  # (obs_horizon, 1, 512)
         
-        # Load VQA feature from pt file (single current frame, not history)
+        # Load VQA feature from pt file
         vqa_path = sample.get('vqa', None)
         vqa_feature_tensor = None
-        
-        if vqa_path is not None:
-            # Load the .pt file
-            full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-            try:
-                vqa_feature_tensor = torch.load(full_vqa_path, weights_only=True)
-            except FileNotFoundError:
-                print(f"Warning: VQA feature file not found for {vqa_path}")
-            except IsADirectoryError:
-                print(f"Warning: VQA path is a directory, not a file: {vqa_path}")
-        
-        if vqa_feature_tensor is not None:
-            vqa_feature = vqa_feature_tensor
-        else:
-            # Fallback if no VQA features found
-            vqa_feature = None
+        full_vqa_path = os.path.join(self.image_data_root, vqa_path)
+        vqa_feature_tensor = torch.load(full_vqa_path, weights_only=True)
+        vqa_feature = vqa_feature_tensor
+  
         
         # Convert sample data
         final_sample = dict()
@@ -164,31 +148,27 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                     final_sample['lidar_token_global'] = lidar_token_global_tensor
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
-                if isinstance(speed_data, np.ndarray):
-                    final_sample['speed'] = torch.from_numpy(speed_data).float()
-                elif isinstance(speed_data, (list, tuple)):
-                    final_sample['speed'] = torch.tensor(speed_data, dtype=torch.float32)
-                else:
-                    final_sample['speed'] = speed_data
+                final_sample['speed'] = torch.from_numpy(speed_data).float()
             elif key == 'ego_waypoints':
                 final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
             elif key == 'vqa':
-                # Add the VQA feature if available
-                if vqa_feature is not None:
-                    # Handle variable-length answer_token_indexes by padding to fixed size
-                    if isinstance(vqa_feature, dict) and 'answer_token_indexes' in vqa_feature:
-                        answer_tokens = vqa_feature['answer_token_indexes']
-                        max_answer_tokens = 10  # Fixed maximum length for padding
-                        if answer_tokens.shape[0] < max_answer_tokens:
-                            # Pad with -1 (or any invalid token index)
-                            padding = torch.full((max_answer_tokens - answer_tokens.shape[0],), -1, dtype=answer_tokens.dtype)
-                            vqa_feature['answer_token_indexes'] = torch.cat([answer_tokens, padding])
-                        elif answer_tokens.shape[0] > max_answer_tokens:
-                            # Truncate if longer than max
-                            vqa_feature['answer_token_indexes'] = answer_tokens[:max_answer_tokens]
-                    final_sample['vqa'] = vqa_feature
-                else:
-                    final_sample['vqa'] = None
+                # Add the VQA features if available
+                final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
+                # Handle variable-length answer_token_indexes by padding to fixed size
+                if isinstance(vqa_feature, dict) and 'answer_token_indexes' in vqa_feature:
+                    answer_tokens = vqa_feature['answer_token_indexes']
+                    max_answer_tokens = 10  # Fixed maximum length for padding
+                    if answer_tokens.shape[0] < max_answer_tokens:
+                        # Pad with -1 (or any invalid token index)
+                        padding = torch.full((max_answer_tokens - answer_tokens.shape[0],), -1, dtype=answer_tokens.dtype)
+                        final_sample['answer_token_indexes'] = torch.cat([answer_tokens, padding])
+                    elif answer_tokens.shape[0] > max_answer_tokens:
+                        # Truncate if longer than max
+                        final_sample['answer_token_indexes'] = answer_tokens[:max_answer_tokens]
+                    else:
+                        final_sample['answer_token_indexes'] = answer_tokens
+
+
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
@@ -196,7 +176,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         # Build ego_status: concatenate historical low-dimensional states
         # Order: speed_hist, theta_hist, throttle_hist, brake_hist, command_hist, waypoints_hist
-        # Ensure the last element is the current state (t)
         ego_status_components = []
         
         # 1. speed_hist
@@ -223,6 +202,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         if 'command_hist' in final_sample:
             command_data = final_sample['command_hist']
             ego_status_components.append(command_data)  # (obs_horizon, 6)
+
+        # 5. target point
+        if 'target_point_hist' in final_sample:
+            command_data = final_sample['target_point_hist']
+            ego_status_components.append(command_data)  # (obs_horizon, 2)
         
         # 6. waypoints_hist (shape: (obs_horizon, 2))
         if 'waypoints_hist' in final_sample:
@@ -230,10 +214,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
         
         # Concatenate all components along the feature dimension
-        if ego_status_components:
-            final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
-        else:
-            final_sample['ego_status'] = None
+        final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
 
         return final_sample
 
@@ -279,17 +260,18 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
     agent_pos = sample.get('agent_pos')
     waypoints_hist = sample.get('waypoints_hist')
     target_point = sample.get('target_point')
+    target_point_hist = sample.get('target_point_hist')
     
-
-    # Convert to numpy if needed
     if isinstance(agent_pos, torch.Tensor):
         agent_pos = agent_pos.numpy()
     if isinstance(waypoints_hist, torch.Tensor):
         waypoints_hist = waypoints_hist.numpy()
     if isinstance(target_point, torch.Tensor):
         target_point = target_point.numpy()
+    if isinstance(target_point_hist, torch.Tensor):
+        target_point_hist = target_point_hist.numpy()
     
-    plt.figure(figsize=(10, 10))
+    plt.figure(figsize=(12, 12))
     
     # ========== Plot Historical Waypoints ==========
     if waypoints_hist is not None and len(waypoints_hist) > 0:
@@ -301,6 +283,18 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
         # Plot each historical waypoint as discrete point
         for i, waypoint in enumerate(waypoints_hist[:-1]):  # Exclude last (current frame)
             plt.plot(waypoint[1], waypoint[0], 'bo', markersize=8, zorder=3)
+    
+    # ========== Plot Historical Target Points ==========
+    if target_point_hist is not None and len(target_point_hist) > 0:
+        # target_point_hist shape: (obs_horizon, 2)
+        # Plot each historical target point with different colors based on time
+        colors = plt.cm.Greens(np.linspace(0.3, 0.9, len(target_point_hist)))
+        for i, target_pt in enumerate(target_point_hist):
+            plt.plot(target_pt[1], target_pt[0], 'D', color=colors[i], 
+                    markersize=6, alpha=0.7, zorder=3)
+            # Add text label for frame index
+            plt.text(target_pt[1], target_pt[0] + 1.5, f't-{len(target_point_hist)-1-i}', 
+                    fontsize=8, ha='center', alpha=0.6)
     
     # ========== Plot Current Position (Origin) ==========
     plt.plot(0, 0, 'ko', markersize=15, label='Current position (t=0)', 
@@ -318,17 +312,17 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
             plt.plot(waypoint[1], waypoint[0], 'r^', markersize=10, 
                     markeredgecolor='darkred', markeredgewidth=1, zorder=4)
     
-    # ========== Plot Target Point ==========
+    # ========== Plot Current Target Point ==========
     if target_point is not None:
         if target_point.ndim == 2:
             target_point = target_point[0]
-        plt.plot(target_point[1], target_point[0], 'g*', markersize=25, 
-                label='Target point', markeredgecolor='darkgreen', markeredgewidth=1.5, zorder=6)
+        plt.plot(target_point[1], target_point[0], 'g*', markersize=30, 
+                label='Current target point (t=0)', markeredgecolor='darkgreen', markeredgewidth=2, zorder=6)
     
     # ========== Formatting ==========
     plt.xlabel('Y (ego frame, lateral / m)', fontsize=12, fontweight='bold')
     plt.ylabel('X (ego frame, longitudinal / m)', fontsize=12, fontweight='bold')
-    plt.title(f'Sample {rand_idx}: Trajectory Visualization', fontsize=13, fontweight='bold')
+    plt.title(f'Sample {rand_idx}: Trajectory with History Target Points', fontsize=13, fontweight='bold')
     
     plt.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     plt.axis('equal')
@@ -422,6 +416,14 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon,
             distance_to_target = np.linalg.norm(target_point - last_obs)
             print(f"目标点距离最后观测点的距离: {distance_to_target:.3f}")
 
+    target_point_hist = sample.get('target_point_hist')
+    if target_point_hist is not None:
+        print(f"\n历史目标点 (target_point_hist):")
+        print(f"  形状: {target_point_hist.shape}")
+        for i, tp in enumerate(target_point_hist):
+            frame_idx = len(target_point_hist) - 1 - i
+            print(f"  t-{frame_idx}: {tp}")
+
     print(f"\nDataset length: {len(dataset)}")
     first_sample = dataset[0]
     print("Sample keys:", first_sample.keys())
@@ -432,7 +434,7 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon,
 
     print("\nKey fields:")
     for key in ['town_name', 'speed', 'command', 'next_command', 'target_point', 
-                'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed', 'vqa']:
+                'target_point_hist', 'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed', 'gen_vit_tokens']:
         if key in first_sample:
             value = first_sample[key]
             print(f"  {key}: shape={getattr(value, 'shape', 'N/A')}, type={type(value)}")

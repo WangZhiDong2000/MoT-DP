@@ -113,6 +113,7 @@ def get_history_waypoints(measurements, current_idx, obs_horizon):
         waypoints_hist: List of waypoints in current ego frame (BEV, 2D), length = obs_horizon
                        Each waypoint represents the relative position of ego at that past frame
                        in the coordinate system of the current frame
+        None: If not enough history frames available (no padding)
     """
     current_anno = measurements[current_idx]
     current_matrix = np.array(current_anno['ego_matrix'])[:3]
@@ -131,11 +132,68 @@ def get_history_waypoints(measurements, current_idx, obs_horizon):
         waypoint_ego_frame = current_rotation.T @ (past_translation - current_translation)
         waypoints_hist.append(waypoint_ego_frame[:2, 0])
     
-    # Pad if we don't have enough history frames
-    while len(waypoints_hist) < obs_horizon:
-        waypoints_hist.insert(0, waypoints_hist[0])
+    # Return None if we don't have enough history frames (no padding)
+    if len(waypoints_hist) < obs_horizon:
+        return None
     
     return waypoints_hist
+
+def get_history_target_points(measurements, current_idx, obs_horizon):
+    """
+    Transform historical target points to the current frame's coordinate system.
+    
+    Args:
+        measurements: List of measurement dicts for the entire sample
+        current_idx: Index of the current frame in measurements list
+        obs_horizon: Number of history frames to extract
+    
+    Returns:
+        target_points_hist: List of target points transformed to current ego frame (BEV, 2D), 
+                           length = obs_horizon
+                           Each historical target point is transformed from its original frame's 
+                           coordinate system to the current frame's coordinate system
+        None: If not enough history frames available (no padding)
+    """
+    current_anno = measurements[current_idx]
+    current_matrix = np.array(current_anno['ego_matrix'])[:3]
+    current_translation = current_matrix[:, 3:4]
+    current_rotation = current_matrix[:, :3]
+    
+    target_points_hist = []
+    
+    # Extract target points for each history frame and transform to current frame
+    for j in range(max(0, current_idx - obs_horizon + 1), current_idx + 1):
+        frame_anno = measurements[j]
+        
+        # Get the target point from this frame (in that frame's ego coordinate)
+        if 'target_point' in frame_anno:
+            target_point_in_past_frame = np.array(frame_anno['target_point'])[:2]  # x, y in BEV
+            
+            # Get the transformation matrix of the past frame
+            past_matrix = np.array(frame_anno['ego_matrix'])[:3]
+            past_translation = past_matrix[:, 3:4]
+            past_rotation = past_matrix[:, :3]
+            
+            # Transform target point from past frame's ego coordinate to world coordinate
+            # target_world = past_rotation @ [target_x, target_y, 0] + past_translation
+            target_point_3d = np.array([target_point_in_past_frame[0], 
+                                       target_point_in_past_frame[1], 
+                                       0.0]).reshape(3, 1)
+            target_world = past_rotation @ target_point_3d + past_translation
+            
+            # Transform from world coordinate to current frame's ego coordinate
+            target_in_current_frame = current_rotation.T @ (target_world - current_translation)
+            
+            target_points_hist.append(target_in_current_frame[:2, 0])
+        else:
+            # If target_point is missing, use [0, 0] as fallback
+            target_points_hist.append(np.array([0.0, 0.0]))
+    
+    # Return None if we don't have enough history frames (no padding)
+    if len(target_points_hist) < obs_horizon:
+        return None
+    
+    return target_points_hist
 
 def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmentation=0.0):
     """
@@ -384,8 +442,20 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             # --- Historical Waypoints (relative positions in BEV) ---
             # Convert past ego positions to relative displacements in current ego frame coordinate
             waypoints_hist = get_history_waypoints(loaded_measurements, current_idx_in_list, obs_horizon)
+            # Skip this sample if not enough history frames (no padding allowed)
+            if waypoints_hist is None:
+                continue
             frame_data['waypoints_hist'] = np.array(waypoints_hist)
             assert frame_data['waypoints_hist'].shape == (obs_horizon, 2)
+            
+            # --- Historical Target Points ---
+            # Get target points for each history frame in their respective ego coordinates
+            target_points_hist = get_history_target_points(loaded_measurements, current_idx_in_list, obs_horizon)
+            # Skip this sample if not enough history frames (no padding allowed)
+            if target_points_hist is None:
+                continue
+            frame_data['target_point_hist'] = np.array(target_points_hist)
+            assert frame_data['target_point_hist'].shape == (obs_horizon, 2)
 
             # --- Image History ---
             rgb_hist = []
@@ -403,13 +473,9 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                     # Store relative path
                     rgb_hist.append(join(folder_name, 'rgb', f"{j:04d}.jpg"))
             
-            # Pad if we don't have enough history frames (e.g., at the start of a scene)
-            while len(rgb_hist) < obs_horizon:
-                if rgb_hist:
-                    rgb_hist.insert(0, rgb_hist[0])
-                else:
-                    # This should not happen if scen_start_frame_offset is correct, but as a fallback:
-                    rgb_hist.insert(0, join(folder_name, 'rgb', f"{obs_start_idx:04d}.jpg"))
+            # Skip this sample if we don't have enough history frames (no padding allowed)
+            if len(rgb_hist) < obs_horizon:
+                continue
                     
             frame_data['rgb_hist_jpg'] = rgb_hist
             
@@ -432,15 +498,11 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                         else:
                             lidar_bev_hist.append(None) # Mark missing BEV image
                 
-                # Pad if we don't have enough history frames
-                while len(lidar_bev_hist) < obs_horizon:
-                    if lidar_bev_hist:
-                        lidar_bev_hist.insert(0, lidar_bev_hist[0])
-                    else:
-                        lidar_bev_hist.insert(0, None)
-            
-            # If lidar_bev directory doesn't exist or no images were found, fill with None
-            if not lidar_bev_hist:
+                # Skip this sample if we don't have enough history frames (no padding allowed)
+                if len(lidar_bev_hist) < obs_horizon:
+                    continue
+            else:
+                # If lidar_bev directory doesn't exist, fill with None
                 lidar_bev_hist = [None] * obs_horizon
                 
             frame_data['lidar_bev_hist'] = lidar_bev_hist
