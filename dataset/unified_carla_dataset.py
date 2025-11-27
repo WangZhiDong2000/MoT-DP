@@ -183,6 +183,46 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             else:
                 final_sample[key] = value
 
+        # Build ego_status: concatenate historical low-dimensional states
+        # Order: speed_hist, theta_hist, throttle_hist, brake_hist, command_hist, waypoints_hist
+        # Ensure the last element is the current state (t)
+        ego_status_components = []
+        
+        # 1. speed_hist
+        if 'speed' in final_sample:
+            speed_data = final_sample['speed']
+            ego_status_components.append(speed_data.unsqueeze(-1))  # (obs_horizon, 1)
+        
+        # 2. theta_hist
+        if 'theta_hist' in final_sample:
+            theta_data = final_sample['theta_hist']
+            ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
+        
+        # 3. throttle_hist
+        if 'throttle_hist' in final_sample:
+            throttle_data = final_sample['throttle_hist']
+            ego_status_components.append(throttle_data.unsqueeze(-1))  # (obs_horizon, 1)
+        
+        # 4. brake_hist
+        if 'brake_hist' in final_sample:
+            brake_data = final_sample['brake_hist']
+            ego_status_components.append(brake_data.unsqueeze(-1))  # (obs_horizon, 1)
+        
+        # 5. command_hist (one-hot, shape: (obs_horizon, 6))
+        if 'command_hist' in final_sample:
+            command_data = final_sample['command_hist']
+            ego_status_components.append(command_data)  # (obs_horizon, 6)
+        
+        # 6. waypoints_hist (shape: (obs_horizon, 2))
+        if 'waypoints_hist' in final_sample:
+            waypoints_data = final_sample['waypoints_hist']
+            ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
+        
+        # Concatenate all components along the feature dimension
+        if ego_status_components:
+            final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
+        else:
+            final_sample['ego_status'] = None
 
         return final_sample
 
