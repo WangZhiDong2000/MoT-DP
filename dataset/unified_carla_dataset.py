@@ -175,6 +175,17 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             elif key == 'vqa':
                 # Add the VQA feature if available
                 if vqa_feature is not None:
+                    # Handle variable-length answer_token_indexes by padding to fixed size
+                    if isinstance(vqa_feature, dict) and 'answer_token_indexes' in vqa_feature:
+                        answer_tokens = vqa_feature['answer_token_indexes']
+                        max_answer_tokens = 10  # Fixed maximum length for padding
+                        if answer_tokens.shape[0] < max_answer_tokens:
+                            # Pad with -1 (or any invalid token index)
+                            padding = torch.full((max_answer_tokens - answer_tokens.shape[0],), -1, dtype=answer_tokens.dtype)
+                            vqa_feature['answer_token_indexes'] = torch.cat([answer_tokens, padding])
+                        elif answer_tokens.shape[0] > max_answer_tokens:
+                            # Truncate if longer than max
+                            vqa_feature['answer_token_indexes'] = answer_tokens[:max_answer_tokens]
                     final_sample['vqa'] = vqa_feature
                 else:
                     final_sample['vqa'] = None
