@@ -156,7 +156,7 @@ def main():
     parser.add_argument(
         '--dataset_path',
         type=str,
-        default='/share-data/pdm_lite/tmp_data/train',
+        default='/share-data/pdm_lite/tmp_data',
         help='Path to processed dataset (containing train/val folders or pkl files)'
     )
     parser.add_argument(
@@ -172,9 +172,9 @@ def main():
         help='Maximum number of samples to process (None = all)'
     )
     parser.add_argument(
-        '--save_to_config',
+        '--no_save',
         action='store_true',
-        help='Save computed stats to config file'
+        help='Do NOT save computed stats to config file'
     )
     parser.add_argument(
         '--output_path',
@@ -196,12 +196,14 @@ def main():
             max_samples=args.max_samples
         )
         
-        if args.save_to_config:
+        # Automatically save to config unless --no_save is specified
+        if not args.no_save:
             if os.path.exists(args.config_path):
                 save_stats_to_config(stats, args.config_path, args.output_path)
             else:
                 print(f"⚠ Config file not found: {args.config_path}")
                 print("  Stats not saved to config.")
+                print("  You can specify a custom config path using --config_path")
         
         print("\n✓ Statistics computation completed successfully!")
         

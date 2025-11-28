@@ -16,20 +16,7 @@ import textwrap
 
 
 class CARLAImageDataset(torch.utils.data.Dataset):
-    """
-    Unified Dataset for preprocessed PDM Lite and Bench2Drive (B2D) data in 'frame' mode.
     
-    Each pickle file is a complete training sample with image paths.
-    Images are loaded dynamically in __getitem__.
-    
-    Supports both:
-    - PDM Lite: Basic driving data with waypoints and sensors
-    - Bench2Drive (B2D): Extended driving data with VQA and meta-actions
-    
-    Args:
-        dataset_path (str): Directory containing individual frame pkl files
-        image_data_root (str): Base path for images
-    """
     
     def __init__(self,
                  dataset_path: str,
@@ -130,18 +117,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         vqa_feature = {}
         if vqa_path is not None:
             full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-            try:
-                vqa_feature_data = torch.load(full_vqa_path, weights_only=True)
-                # Check if loaded data is a dict or tensor
-                if isinstance(vqa_feature_data, dict):
-                    vqa_feature = vqa_feature_data
-                else:
-                    # If it's a tensor, assume it's gen_vit_tokens
-                    vqa_feature = {'gen_vit_tokens': vqa_feature_data}
-                    print(f"Warning: VQA feature at {full_vqa_path} is a tensor, expected dict. Stored as 'gen_vit_tokens'.")
-            except FileNotFoundError:
-                print(f"Warning: VQA feature file not found at {full_vqa_path}")
-                vqa_feature = {}
+            vqa_feature_data = torch.load(full_vqa_path, weights_only=True)
+            vqa_feature = vqa_feature_data
   
         
         # Convert sample data
@@ -163,26 +140,50 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             elif key == 'ego_waypoints':
                 final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
             elif key == 'vqa':
-                # Add the VQA features if available
-                if isinstance(vqa_feature, dict):
-                    if 'gen_vit_tokens' in vqa_feature:
-                        final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
-                    if 'reasoning_query_tokens' in vqa_feature:
-                        final_sample['reasoning_query_tokens'] = vqa_feature['reasoning_query_tokens']
-                    # Handle variable-length answer_token_indexes by padding to fixed size
-                    if 'answer_token_indexes' in vqa_feature:
-                        answer_tokens = vqa_feature['answer_token_indexes']
-                        max_answer_tokens = 8  # Fixed maximum length for padding
-                        if answer_tokens.shape[0] < max_answer_tokens:
-                            # Pad with -1 (or any invalid token index)
-                            padding = torch.full((max_answer_tokens - answer_tokens.shape[0],), -1, dtype=answer_tokens.dtype)
-                            final_sample['answer_token_indexes'] = torch.cat([answer_tokens, padding])
-                        elif answer_tokens.shape[0] > max_answer_tokens:
-                            # Truncate if longer than max
-                            final_sample['answer_token_indexes'] = answer_tokens[:max_answer_tokens]
+                if 'gen_vit_tokens' in vqa_feature:
+                    final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
+                
+                # Use answer_token_indexes to filter valid reasoning_query_tokens
+                if 'reasoning_query_tokens' in vqa_feature and 'answer_token_indexes' in vqa_feature:
+                    reasoning_query_tokens = vqa_feature['reasoning_query_tokens']
+                    answer_token_indexes = vqa_feature['answer_token_indexes']
+                    
+                    # Filter reasoning_query_tokens using answer_token_indexes
+                    # answer_token_indexes contains valid indices into reasoning_query_tokens
+                    valid_tokens = reasoning_query_tokens[answer_token_indexes]
+                    
+                    # Pad to fixed length of 7
+                    max_answer_tokens = 7
+                    token_dim = valid_tokens.shape[-1] if valid_tokens.dim() > 1 else 1
+                    
+                    # Pad reasoning_query_tokens to length 7
+                    if valid_tokens.shape[0] < max_answer_tokens:
+                        # Pad with zeros
+                        padding_size = max_answer_tokens - valid_tokens.shape[0]
+                        if valid_tokens.dim() == 1:
+                            padding = torch.zeros(padding_size, dtype=valid_tokens.dtype)
                         else:
-                            final_sample['answer_token_indexes'] = answer_tokens
-
+                            padding = torch.zeros((padding_size, token_dim), dtype=valid_tokens.dtype)
+                        padded_tokens = torch.cat([valid_tokens, padding], dim=0)
+                    elif valid_tokens.shape[0] > max_answer_tokens:
+                        padded_tokens = valid_tokens[:max_answer_tokens]
+                    else:
+                        padded_tokens = valid_tokens
+                    
+                    final_sample['reasoning_query_tokens'] = padded_tokens
+                    
+                    # Pad answer_token_indexes to fixed length of 7
+                    if answer_token_indexes.shape[0] < max_answer_tokens:
+                        # Pad with -1 (invalid index)
+                        padding = torch.full((max_answer_tokens - answer_token_indexes.shape[0],), -1, dtype=answer_token_indexes.dtype)
+                        final_sample['answer_token_indexes'] = torch.cat([answer_token_indexes, padding])
+                    elif answer_token_indexes.shape[0] > max_answer_tokens:
+                        # Truncate if longer than max
+                        final_sample['answer_token_indexes'] = answer_token_indexes[:max_answer_tokens]
+                    else:
+                        final_sample['answer_token_indexes'] = answer_token_indexes
+                elif 'reasoning_query_tokens' in vqa_feature:
+                    final_sample['reasoning_query_tokens'] = vqa_feature['reasoning_query_tokens']
 
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()

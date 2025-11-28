@@ -250,6 +250,49 @@ def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmenta
 
     return waypoints_aug
 
+def is_sparse_numbering(folder_path):
+    """
+    Check if pt files in dp_vl_feature folder are sparsely numbered (multiples of 5).
+    
+    Args:
+        folder_path: Path to the scene folder
+        
+    Returns:
+        True if files are in multiples of 5 (sparse), False if consecutive or if folder doesn't exist
+    """
+    dp_vl_feature_dir = join(folder_path, 'dp_vl_feature')
+    
+    if not os.path.exists(dp_vl_feature_dir):
+        return False
+    
+    try:
+        pt_files = [f for f in os.listdir(dp_vl_feature_dir) if f.endswith('.pt')]
+        
+        if not pt_files:
+            return False
+        
+        # Extract frame numbers from filenames
+        frame_numbers = []
+        for f in pt_files:
+            try:
+                frame_num = int(f.split('.')[0])
+                frame_numbers.append(frame_num)
+            except (ValueError, IndexError):
+                continue
+        
+        if len(frame_numbers) < 2:
+            return False
+        
+        # Sort frame numbers
+        frame_numbers.sort()
+        
+        # Check if all frame numbers are multiples of 5
+        all_multiples_of_5 = all(num % 5 == 0 for num in frame_numbers)
+        
+        return all_multiples_of_5
+    except Exception as e:
+        return False
+
 def preprocess(folder_list, idx, tmp_dir, data_root, out_dir, 
                obs_horizon, action_horizon, sample_interval, hz_interval, save_mode):
     """
@@ -297,6 +340,13 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
 
     for folder_name in folders:
         folder_path = join(data_root, folder_name)
+        
+        # Check if pt files in dp_vl_feature are sparsely numbered (multiples of 5)
+        # If so, skip this entire scenario
+        if is_sparse_numbering(folder_path):
+            if idx == 0:
+                print(f"\nSkipping scenario {folder_name}: pt files are in multiples of 5 (sparse numbering)")
+            continue
         
         # Check if measurements directory exists
         measurements_dir = join(folder_path, 'measurements')

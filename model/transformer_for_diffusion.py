@@ -995,7 +995,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
         timestep: Union[torch.Tensor, float, int], 
         cond: torch.Tensor,
         gen_vit_tokens: Optional[torch.Tensor] = None,
-        answer_token_indexes: Optional[torch.Tensor] = None,
         reasoning_query_tokens: Optional[torch.Tensor] = None,
         ego_status: Optional[torch.Tensor] = None,
         **kwargs):
