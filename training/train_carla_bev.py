@@ -93,91 +93,6 @@ def safe_wandb_finish(use_wandb=True):
     wandb.finish(quiet=True, exit_code=0)
 
 
-def check_box_collision_2d(boxes1, boxes2):
-    """
-    使用分离轴定理(SAT)检测2D边界框碰撞
-    
-    Args:
-        boxes1: (N, 5) 或 (1, 5) [x, y, w, l, yaw] 边界框
-        boxes2: (N, 5) 或 (M, 5) [x, y, w, l, yaw] 边界框
-    
-    Returns:
-        collision: bool数组 (N,)，True表示发生碰撞
-    """
-    N1, N2 = boxes1.shape[0], boxes2.shape[0]
-    
-    if N1 == 0 or N2 == 0:
-        return np.zeros(max(N1, N2), dtype=bool)
-    
-    def get_box_corners(x, y, w, l, yaw):
-        corners_local = np.array([
-            [-l/2, -w/2],  
-            [l/2, -w/2],   
-            [l/2, w/2],    
-            [-l/2, w/2]    
-        ])
-        
-        cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
-        rot_mat = np.array([[cos_yaw, -sin_yaw],
-                           [sin_yaw, cos_yaw]])
-        corners_global = corners_local @ rot_mat.T + np.array([x, y])
-        return corners_global
-    
-    def get_axes(corners):
-        edges = np.array([
-            corners[1] - corners[0],  
-            corners[2] - corners[1],  
-        ])
-        axes = np.array([
-            [-edges[0, 1], edges[0, 0]],  
-            [-edges[1, 1], edges[1, 0]],  
-        ])
-        norm = np.linalg.norm(axes, axis=1, keepdims=True)
-        norm = np.where(norm < 1e-10, 1.0, norm)
-        axes = axes / norm
-        return axes
-    
-    def project_onto_axis(corners, axis):
-        projections = corners @ axis
-        return np.min(projections), np.max(projections)
-    
-    def check_overlap_on_axis(corners1, corners2, axis):
-        min1, max1 = project_onto_axis(corners1, axis)
-        min2, max2 = project_onto_axis(corners2, axis)
-        return max1 >= min2 and max2 >= min1
-    
-    def check_collision_single_pair(box1, box2):
-        x1, y1, w1, l1, yaw1 = box1
-        x2, y2, w2, l2, yaw2 = box2
-        
-        corners1 = get_box_corners(x1, y1, w1, l1, yaw1)
-        corners2 = get_box_corners(x2, y2, w2, l2, yaw2)
-
-        axes1 = get_axes(corners1)
-        axes2 = get_axes(corners2)
-        all_axes = np.vstack([axes1, axes2])
-
-        for axis in all_axes:
-            if not check_overlap_on_axis(corners1, corners2, axis):
-                return False
-        
-        return True
-    
-    if N1 == 1 and N2 > 1:
-        collision_mask = np.zeros(N2, dtype=bool)
-        for i in range(N2):
-            collision_mask[i] = check_collision_single_pair(boxes1[0], boxes2[i])
-        return collision_mask
-    
-    elif N1 == N2:
-        collision_mask = np.zeros(N1, dtype=bool)
-        for i in range(N1):
-            collision_mask[i] = check_collision_single_pair(boxes1[i], boxes2[i])
-        return collision_mask
-    
-    else:
-        raise ValueError(f"Unsupported box shapes: boxes1 {boxes1.shape}, boxes2 {boxes2.shape}. "
-                        f"Expected either same shape (N, 5) or boxes1=(1, 5), boxes2=(M, 5)")
 
 
 def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obstacles=None):
@@ -272,7 +187,9 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
             obs_dict = {
                 'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
                 'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
-                'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  # (B, obs_horizon, 13)
+                'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
+                'gen_vit_tokens': batch['gen_vit_tokens'],
+                'reasoning_query_tokens': batch['reasoning_query_tokens']
             }
             target_actions = batch['agent_pos']  
             
@@ -621,14 +538,21 @@ def train_pdm_policy(config_path):
                 for key, value in val_metrics.items():
                     if key == 'val_loss':
                         continue  
-                    elif 'L2' in key:
+                    elif key.startswith('val_'):
+                        # Remove 'val_' prefix
                         metric_name = key.replace('val_', '')
-                        log_dict[f"val/L2/{metric_name}"] = value
-                    elif 'collision' in key:
-                        metric_name = key.replace('val_', '')
-                        log_dict[f"val/collision/{metric_name}"] = value
+                        if 'L2' in metric_name:
+                            log_dict[f"val/driving_metrics/{metric_name}"] = value
+                        elif 'collision' in metric_name:
+                            log_dict[f"val/collision/{metric_name}"] = value
+                        else:
+                            log_dict[f"val/{metric_name}"] = value
                     else:
-                        log_dict[f"val/{key.replace('val_', '')}"] = value
+                        # Shouldn't happen, but handle it just in case
+                        if 'L2' in key:
+                            log_dict[f"val/driving_metrics/{key}"] = value
+                        else:
+                            log_dict[f"val/{key}"] = value
             
                 print("Logging to wandb...")
                 sys.stdout.flush()
@@ -682,7 +606,7 @@ def train_pdm_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
-    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml", 
+    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_pdm_policy(config_path=args.config_path)

@@ -92,8 +92,8 @@ noise_scheduler:
 training:
   num_epochs: 1000
   max_grad_norm: 1.0
-  dataset_path: /share-data/pdm_lite/tmp_data
-  image_data_root: /share-data/pdm_lite
+  dataset_path: /share-data/pdm_lite_mini/tmp_data
+  image_data_root: /share-data/pdm_lite_mini
   sample_interval: 1
   lr_final: 1e-7
   validation_freq: 5
@@ -126,17 +126,17 @@ model_optimization:
   lr_scheduler: cosine
 action_stats:
   min:
-  - -14.108696937561035
-  - -43.720863342285156
+  - -0.06638534367084503
+  - -17.525903701782227
   max:
   - 74.04539489746094
-  - 41.13515090942383
+  - 32.73622512817383
   mean:
-  - 6.945382118225098
-  - -0.008451690897345543
+  - 12.758530616760254
+  - 0.354688435792923
   std:
-  - 10.920757293701172
-  - 2.322951555252075
+  - 16.723825454711914
+  - 2.5529885292053223
 controller:
   turn_KP: 0.75
   turn_KI: 0.75

@@ -313,14 +313,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征（推荐）
             'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
             
-            # nuScenes必需字段
             'agent_pos': (B, horizon, 2) - 未来轨迹点
             'ego_status': (B, obs_horizon, 13) - 车辆状态 [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
         }
         """
         device = next(self.parameters()).device
         nobs = {}
-        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos']
+        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 'reasoning_query_tokens', 'gen_vit_tokens']
         
         for field in required_fields:
             if field in batch:
@@ -371,8 +370,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        gen_vit_tokens = batch.get('gen_vit_tokens', None)
-        reasoning_query_tokens = batch.get('reasoning_query_tokens', None)
+        gen_vit_tokens = batch['gen_vit_tokens']
+        reasoning_query_tokens = batch['reasoning_query_tokens']
         
         # Process gen_vit_tokens through feature_encoder
         gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)
@@ -473,8 +472,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
 
         # run sampling
-        gen_vit_tokens = nobs.get('gen_vit_tokens', None)
-        reasoning_query_tokens = nobs.get('reasoning_query_tokens', None)
+        gen_vit_tokens = nobs['gen_vit_tokens']
+        reasoning_query_tokens = nobs['reasoning_query_tokens']
         
         # Process gen_vit_tokens through feature_encoder
         gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)

@@ -156,13 +156,13 @@ def main():
     parser.add_argument(
         '--dataset_path',
         type=str,
-        default='/share-data/pdm_lite/tmp_data',
+        default='/share-data/pdm_lite_mini/tmp_data',
         help='Path to processed dataset (containing train/val folders or pkl files)'
     )
     parser.add_argument(
         '--config_path',
         type=str,
-        default='/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml',
+        default='/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml',
         help='Path to config file to save stats'
     )
     parser.add_argument(

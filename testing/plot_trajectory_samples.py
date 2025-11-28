@@ -229,8 +229,7 @@ def plot_trajectory_samples(predictions, ground_truths, num_samples_per_page=4,
             if page_sample_idx == 0:
                 ax.legend(loc='best', fontsize=8)
         
-        # 调整布局
-        plt.tight_layout()
+        # 调整布局（通过bbox_inches='tight'处理）
         
         # 保存
         save_path = os.path.join(save_dir, f'trajectories_page_{page_idx+1:03d}.png')

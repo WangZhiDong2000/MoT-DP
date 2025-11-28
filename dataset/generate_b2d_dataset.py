@@ -220,7 +220,7 @@ def visualize_trajectory(sample, obs_horizon, rand_idx):
     # Add origin marker
     plt.plot(0, 0, 'ko', markersize=10, label='Current position (origin)', zorder=5)
     plt.legend(fontsize=10, loc='best')  # Update legend after adding origin
-    plt.tight_layout()
+    # plt.tight_layout() removed due to numpy/matplotlib compatibility issues
     
     save_path = f'/home/wang/Project/MoT-DP/image/sample_{rand_idx}_agent_pos.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -261,7 +261,7 @@ def visualize_observation_images(sample, obs_horizon, rand_idx):
         plt.imshow(img_vis)
         plt.title(f'Random Sample {rand_idx} - Obs Image t={t}')
         plt.axis('off')
-        plt.tight_layout()
+        # plt.tight_layout() removed due to numpy/matplotlib compatibility issues
 
         save_path = f'/home/wang/Project/MoT-DP/image/sample_{rand_idx}_obs_image_t{t}.png'
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
