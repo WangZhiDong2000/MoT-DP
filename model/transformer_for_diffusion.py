@@ -463,9 +463,8 @@ class CustomEncoderBlock(nn.Module):
         
         # 3. Combine condition embeddings (no timestep here)
         cond_list = []
-        if self.obs_as_cond and cond is not None:
-            cond_obs_emb = self.cond_obs_emb(cond)
-            cond_list.append(cond_obs_emb)
+        cond_obs_emb = self.cond_obs_emb(cond)
+        cond_list.append(cond_obs_emb)
         
         cond_list.append(vl_features_processed)
         cond_list.append(reasoning_features_processed)
@@ -545,22 +544,15 @@ class CustomDecoderLayer(nn.Module):
     def forward(self, tgt, memory, vl_features, reasoning_features=None, conditioning=None, tgt_mask=None, memory_mask=None, 
                 vl_key_padding_mask=None, reasoning_key_padding_mask=None):
         
-        # 如果提供了 conditioning，生成调制参数
-        if conditioning is not None:
-            mod_params = self.adaLN_modulation(conditioning)
-            shift_mem_vl, scale_mem_vl, gate_mem_vl, \
-            shift_traj_mem, scale_traj_mem, gate_traj_mem, \
-            shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(9, dim=1)
-        else:
-            # 如果没有 conditioning，使用默认值（不进行modulation）
-            shift_mem_vl = scale_mem_vl = gate_mem_vl = None
-            shift_traj_mem = scale_traj_mem = gate_traj_mem = None
-            shift_ffn = scale_ffn = gate_ffn = None
+        # 生成调制参数
+        mod_params = self.adaLN_modulation(conditioning)
+        shift_mem_vl, scale_mem_vl, gate_mem_vl, \
+        shift_traj_mem, scale_traj_mem, gate_traj_mem, \
+        shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(9, dim=1)
         
         # 1. Enhance Memory with VL features (Condition Fusion)
         memory2 = self.norm1(memory)
-        if conditioning is not None:
-            memory2 = self.modulate(memory2, shift_mem_vl, scale_mem_vl)
+        memory2 = self.modulate(memory2, shift_mem_vl, scale_mem_vl)
             
         # Combine VL and Reasoning features for cross attention
         cross_attn_kv = vl_features
@@ -585,31 +577,20 @@ class CustomDecoderLayer(nn.Module):
         
         enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, cross_attn_kv, cross_attn_kv, 
                                                       key_padding_mask=cross_attn_mask)
-        if conditioning is not None:
-            enhanced_memory = memory + gate_mem_vl.unsqueeze(1) * enhanced_memory_output
-        else:
-            enhanced_memory = memory + self.dropout1(enhanced_memory_output)
+        enhanced_memory = memory + gate_mem_vl.unsqueeze(1) * enhanced_memory_output
         
         # 2. Trajectory attends to Enhanced Condition (Direct Condition Utilization)
         tgt2 = self.norm2(tgt)
-        if conditioning is not None:
-            tgt2 = self.modulate(tgt2, shift_traj_mem, scale_traj_mem)
+        tgt2 = self.modulate(tgt2, shift_traj_mem, scale_traj_mem)
         tgt2, _ = self.traj_memory_cross_attn(tgt2, enhanced_memory, enhanced_memory, 
                                              attn_mask=memory_mask, key_padding_mask=None)
-        if conditioning is not None:
-            tgt = tgt + gate_traj_mem.unsqueeze(1) * tgt2
-        else:
-            tgt = tgt + self.dropout2(tgt2)
+        tgt = tgt + gate_traj_mem.unsqueeze(1) * tgt2
         
         # 3. Feed forward with modulation
         tgt2 = self.norm3(tgt)
-        if conditioning is not None:
-            tgt2 = self.modulate(tgt2, shift_ffn, scale_ffn)
+        tgt2 = self.modulate(tgt2, shift_ffn, scale_ffn)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        if conditioning is not None:
-            tgt = tgt + gate_ffn.unsqueeze(1) * tgt2
-        else:
-            tgt = tgt + self.dropout(tgt2)
+        tgt = tgt + gate_ffn.unsqueeze(1) * tgt2
             
         return tgt
 
@@ -634,7 +615,7 @@ class CustomTransformerDecoder(nn.Module):
         S_actual = actual_memory_length 
         time_pos = 0  
         obs_start = 1   
-        obs_end = obs_start + (cond.shape[1] if cond is not None and self.obs_as_cond else 0)
+        obs_end = obs_start + cond.shape[1] 
         
         # VL features are pooled to 1 token
         vl_start = obs_end
@@ -651,7 +632,7 @@ class CustomTransformerDecoder(nn.Module):
                 memory_mask_dynamic[t, vl_start:vl_end] = True
             
             # Observation conditions: causal visibility
-            if self.obs_as_cond and cond is not None and obs_start < obs_end:
+            if obs_start < obs_end:
                 visible_obs_end = min(obs_start + t + 1, obs_end)
                 memory_mask_dynamic[t, obs_start:visible_obs_end] = True
         
@@ -739,13 +720,11 @@ class TrajectoryRefinementHead(nn.Module):
         x_norm = self.ln_f(x)
         x_norm = self.drop(x_norm)
         
-        # Prepare initial hidden state from conditioning if available
-        h_0 = None
-        if conditioning is not None:
-            # conditioning: (B, n_emb) -> (1, B, n_emb)
-            h_0 = self.cond_proj(conditioning).unsqueeze(0)
-            # Ensure contiguous
-            h_0 = h_0.contiguous()
+        # Prepare initial hidden state from conditioning
+        # conditioning: (B, n_emb) -> (1, B, n_emb)
+        h_0 = self.cond_proj(conditioning).unsqueeze(0)
+        # Ensure contiguous
+        h_0 = h_0.contiguous()
         
         # Temporal processing with GRU
         # GRU processes temporal sequence: (B, T, n_emb) -> (B, T, n_emb)
@@ -1130,12 +1109,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             
         # Check Reasoning padding
         reasoning_padding_mask = None
-        if reasoning_embeds is not None:
-            if 'reasoning_mask' in kwargs and kwargs['reasoning_mask'] is not None:
-                reasoning_padding_mask = ~kwargs['reasoning_mask']
-            else:
-                reasoning_norm = torch.norm(reasoning_embeds, dim=-1)
-                reasoning_padding_mask = (reasoning_norm == 0)
+        if 'reasoning_mask' in kwargs and kwargs['reasoning_mask'] is not None:
+            reasoning_padding_mask = ~kwargs['reasoning_mask']
+        else:
+            reasoning_norm = torch.norm(reasoning_embeds, dim=-1)
+            reasoning_padding_mask = (reasoning_norm == 0)
         
         # 4. Process conditions through encoder block to get memory (no timestep)
         memory, vl_features, reasoning_features = self.encoder_block(

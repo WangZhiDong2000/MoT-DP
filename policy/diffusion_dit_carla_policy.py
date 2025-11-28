@@ -342,23 +342,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         trajectory = nactions.float()
         if self.enable_action_normalization and self.action_stats is not None:
             trajectory = self.normalize_action(trajectory)
-            if torch.isnan(trajectory).any() or torch.isinf(trajectory).any():
-                print("Warning: NaN or Inf detected in normalized trajectory")
-                trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(trajectory).any() or torch.isinf(trajectory).any():
+            print("Warning: NaN or Inf detected in normalized trajectory")
+            trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        if self.obs_as_global_cond:
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            cond = batch_features.reshape(batch_size, To, feature_dim).float()  # (B, To, feature_dim)  
-        else:
-            this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
-            nobs_features = self.extract_tcp_features(this_nobs)
-            nobs_features = nobs_features.reshape(batch_size, horizon, -1)
+        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
+        batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
+        feature_dim = batch_features.shape[-1]
+        cond = batch_features.reshape(batch_size, To, feature_dim).float()  # (B, To, feature_dim)  
 
-        condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
-
-        # Sample noise that we'll add to the images
+        condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)        # Sample noise that we'll add to the images
         noise = torch.randn(trajectory.shape, device=trajectory.device)
         bsz = trajectory.shape[0]
         # Sample a random timestep for each image
@@ -470,26 +463,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond = None
         cond_data = None
         cond_mask = None
-        if self.obs_as_global_cond:
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-            shape = (B, T, Da)
-           
-            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-        else:
-            # condition through impainting
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            nobs_features = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-            shape = (B, T, Da+Do)
-            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            cond_data[:,:To,Da:] = nobs_features
-            cond_mask[:,:To,Da:] = True
+        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
+        batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
+        feature_dim = batch_features.shape[-1]
+        cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
+        shape = (B, T, Da)
+       
+        cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
+        cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
 
         # run sampling
         gen_vit_tokens = nobs.get('gen_vit_tokens', None)
