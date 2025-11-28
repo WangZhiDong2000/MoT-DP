@@ -10,6 +10,8 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from collections import defaultdict
 import argparse
+import datetime
+from torch.distributed.elastic.multiprocessing.errors import record
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
@@ -242,29 +244,40 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     
     return safe_metrics
 
-def validate_model(policy, val_loader, device):
-
+def validate_model(policy, val_loader, device, rank=0, world_size=1):
+    """
+    Validation function for distributed training
+    Only rank 0 will compute and log metrics
+    """
     policy.eval()
+    
+    # Get the actual model (unwrap DDP if needed)
+    model_for_inference = policy.module if world_size > 1 else policy
+    
     val_metrics = defaultdict(list)
     with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Validating", leave=False)
+        if rank == 0:
+            pbar = tqdm(val_loader, desc="Validating", leave=False)
+        else:
+            pbar = val_loader
+        
         for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
 
-            loss = policy.compute_loss(batch)
+            loss = model_for_inference.compute_loss(batch)
             val_metrics['loss'].append(loss.item())
             
             obs_dict = {
-                'lidar_token': batch['lidar_token'][:, :policy.n_obs_steps],
-                'lidar_token_global': batch['lidar_token_global'][:, :policy.n_obs_steps],
-                'ego_status': batch['ego_status'][:, :policy.n_obs_steps],  # (B, obs_horizon, 13)
+                'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
+                'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
+                'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  # (B, obs_horizon, 13)
             }
             target_actions = batch['agent_pos']  
             
             try:
-                result = policy.predict_action(obs_dict)
+                result = model_for_inference.predict_action(obs_dict)
                 predicted_actions = torch.from_numpy(result['action']).to(device)
                 
                 if target_actions.dim() == 3:  # (B, T, 2)
@@ -282,12 +295,14 @@ def validate_model(policy, val_loader, device):
                 for key, value in driving_metrics.items():
                     val_metrics[key].append(value)
                     
-                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+                if rank == 0:
+                    pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
             except Exception as e:
                 print(f"Warning: Error in action prediction during validation: {e}")
                 continue
     
-    pbar.close() 
+    if rank == 0:
+        pbar.close() 
     
     averaged_metrics = {}
     for key, values in val_metrics.items():
@@ -304,17 +319,54 @@ def validate_model(policy, val_loader, device):
         
     return averaged_metrics
 
+@record  # Records error and tracebacks in case of failure
 def train_pdm_policy(config_path):
     """
+    Multi-GPU distributed training for PDM policy
     
     Args:
         config_path: 配置文件路径
     """
+    torch.cuda.empty_cache()
+    
     print("Initializing pdm driving policy training...")
     config = load_config(config_path=config_path)
 
+    # Initialize distributed training
+    rank = int(os.environ.get('RANK', 0))  # Rank across all processes
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))  # Rank on Node
+    world_size = int(os.environ.get('WORLD_SIZE', 1))  # Number of processes
+    
+    # Single GPU fallback
+    if world_size == 1:
+        print("Running in single GPU mode")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    else:
+        print(f'RANK, LOCAL_RANK and WORLD_SIZE: {rank}/{local_rank}/{world_size}')
+        device = torch.device(f'cuda:{local_rank}')
+        
+        # Initialize process group
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank,
+            timeout=datetime.timedelta(minutes=15)
+        )
+        
+        torch.cuda.set_device(device)
+    
+    # Enable performance optimizations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.allow_tf32 = True
+    
+    print(f'Rank: {rank}, Device: {device}, World size: {world_size}')
+    
+    # Only rank 0 should initialize wandb
     wandb_mode = os.environ.get('WANDB_MODE', 'online') 
-    use_wandb = config.get('logging', {}).get('use_wandb', True)
+    use_wandb = config.get('logging', {}).get('use_wandb', True) and (rank == 0)
     
     if use_wandb:
         try:
@@ -361,22 +413,6 @@ def train_pdm_policy(config_path):
         except Exception as e:
             print(f"⚠ WandB initialization failed: {e}")
             use_wandb = False
-    else:
-        use_wandb = False
-    
-    # 从config读取GPU ID配置
-    device_config = config.get('device', {})
-    gpu_ids = device_config.get('gpu_ids', [0])
-    
-    # 设置GPU和CUDA相关环境变量
-    if torch.cuda.is_available() and gpu_ids:
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
-        device = torch.device(f'cuda:{gpu_ids[0]}')
-        print(f"✓ Using GPU(s): {gpu_ids}")
-    else:
-        device = torch.device('cpu')
-        print("✓ Using CPU")
-
 
     # dataset
     dataset_path_root = config.get('training', {}).get('dataset_path')
@@ -386,8 +422,9 @@ def train_pdm_policy(config_path):
     train_dataset = CARLAImageDataset(dataset_path=train_dataset_path, image_data_root=image_data_root)
     val_dataset = CARLAImageDataset(dataset_path=val_dataset_path, image_data_root=image_data_root)
 
-    print(f"\nTraining samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
+    if rank == 0:
+        print(f"\nTraining samples: {len(train_dataset)}")
+        print(f"Validation samples: {len(val_dataset)}")
     
     '''
     TODO:  how to load action stats from config file
@@ -405,29 +442,68 @@ def train_pdm_policy(config_path):
     persistent_workers = config.get('dataloader', {}).get('persistent_workers', True)
     prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
     
+    # Use DistributedSampler for multi-GPU training
+    if world_size > 1:
+        sampler_train = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            shuffle=True,
+            num_replicas=world_size,
+            rank=rank,
+            drop_last=True
+        )
+        sampler_val = torch.utils.data.distributed.DistributedSampler(
+            val_dataset,
+            shuffle=False,
+            num_replicas=world_size,
+            rank=rank,
+            drop_last=True
+        )
+    else:
+        sampler_train = None
+        sampler_val = None
+    
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
+        batch_size=batch_size,
+        sampler=sampler_train,
+        shuffle=(sampler_train is None),  # Only shuffle if not using sampler
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=persistent_workers if num_workers > 0 else False,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        drop_last=True
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
+        sampler=sampler_val,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=persistent_workers if num_workers > 0 else False,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        drop_last=True
     )
     
-    print("Initializing policy model...")
-    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)  
-    print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
+    if rank == 0:
+        print("Initializing policy model...")
+    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
+    
+    # Wrap model with DistributedDataParallel for multi-GPU training
+    if world_size > 1:
+        policy = torch.nn.parallel.DistributedDataParallel(
+            policy,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False
+        )
+        if rank == 0:
+            print(f"✓ Model wrapped with DistributedDataParallel")
+            print(f"Policy action steps (n_action_steps): {policy.module.n_action_steps}")
+    else:
+        if rank == 0:
+            print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
     
     lr = config.get('optimizer', {}).get('lr', 5e-5)
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
@@ -435,35 +511,49 @@ def train_pdm_policy(config_path):
 
     # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    print(f"✓ Checkpoint directory: {checkpoint_dir}")
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
+    best_l2_3s = float('inf')
     val_loss = None  # 初始化验证损失
     val_metrics = {}  # 初始化验证指标  
     
     for epoch in range(num_epochs):
+        # Update the seed depending on the epoch for distributed sampler
+        if world_size > 1:
+            sampler_train.set_epoch(epoch)
+        
         policy.train()
         train_losses = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+        
+        if rank == 0:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+        else:
+            pbar = train_loader
+            
         for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
             
-            loss = policy.compute_loss(batch)
+            # Use .module to access the original model's methods when using DDP
+            model_for_loss = policy.module if world_size > 1 else policy
+            loss = model_for_loss.compute_loss(batch)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             train_losses.append(loss.item())
             
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{np.mean(train_losses):.4f}'
-            })
+            if rank == 0:
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg_loss': f'{np.mean(train_losses):.4f}'
+                })
             
-            if batch_idx % 10 == 0:
+            if batch_idx % 10 == 0 and rank == 0:
                 step = epoch * len(train_loader) + batch_idx
                 safe_wandb_log({
                     "train/loss_step": loss.item(),
@@ -473,110 +563,125 @@ def train_pdm_policy(config_path):
                     "train/batch_idx": batch_idx
                 }, use_wandb)
         
-        pbar.close() 
+        if rank == 0:
+            pbar.close() 
         
         avg_train_loss = np.mean(train_losses)
-        print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
+        if rank == 0:
+            print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
         
-        torch.save({
-                    'model_state_dict': policy.state_dict(),
-                    'config': config,
-                    'epoch': epoch,
-                    'val_loss': val_loss,
-                    'train_loss': avg_train_loss,
-                    'val_metrics': val_metrics
-                    }, os.path.join(checkpoint_dir, "carla_policy.pt"))
+        # Get model state dict (handle DDP wrapper)
+        model_to_save = policy.module if world_size > 1 else policy
         
-        safe_wandb_log({
-            "train/loss_epoch": avg_train_loss,
-            "train/epoch": 0.0,
-            "train/samples_processed": (epoch + 1) * len(train_dataset)
-        }, use_wandb)
-
-        validation_freq = config.get('training', {}).get('validation_freq', 1)
-        if (epoch + 1) % validation_freq == 0:
-            print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
-            sys.stdout.flush()
-            try:
-                val_metrics = validate_model(policy, val_loader, device)
-                print(f"✓ Validation completed")
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"✗ Error during validation: {e}")
-                import traceback
-                traceback.print_exc()
-                sys.stdout.flush()
-                continue
-
-            sys.stdout.flush()
-                
-            log_dict = {
-                    "epoch": epoch,
-                    "train/loss": avg_train_loss,
-                }
-        
-            if 'val_loss' in val_metrics:
-                log_dict["val/loss"] = val_metrics['val_loss']
-        
-            for key, value in val_metrics.items():
-                if key == 'val_loss':
-                    continue  
-                elif 'L2' in key:
-                    metric_name = key.replace('val_', '')
-                    log_dict[f"val/L2/{metric_name}"] = value
-                elif 'collision' in key:
-                    metric_name = key.replace('val_', '')
-                    log_dict[f"val/collision/{metric_name}"] = value
-                else:
-                    log_dict[f"val/{key.replace('val_', '')}"] = value
-        
-            print("Logging to wandb...")
-            sys.stdout.flush()
-            safe_wandb_log(log_dict, use_wandb)
-            sys.stdout.flush()
-
-        
-            print(f"Validation metrics:")
-            for key, value in val_metrics.items():
-                print(f"  {key}: {value:.4f}")
-        
-            val_loss = val_metrics.get('val_loss', float('inf'))
-            l2_3s = val_metrics.get('val_L2_3s', float('inf'))
-            
-            # Save best model based on L2_3s instead of val_loss
-            if l2_3s < best_l2_3s:
-                best_l2_3s = l2_3s
-                torch.save({
-                        'model_state_dict': policy.state_dict(),
+        if rank == 0:
+            torch.save({
+                        'model_state_dict': model_to_save.state_dict(),
                         'config': config,
                         'epoch': epoch,
                         'val_loss': val_loss,
                         'train_loss': avg_train_loss,
                         'val_metrics': val_metrics
-                        }, os.path.join(checkpoint_dir, "carla_policy_best.pt"))
-                print(f"✓ New best model saved with L2_3s: {l2_3s:.4f} (val_loss: {val_loss:.4f})")
-               
-                safe_wandb_log({
-                        "best_model/epoch": epoch,
-                        "best_model/L2_3s": l2_3s,
-                        "best_model/val_loss": val_loss,
-                        "best_model/train_loss": avg_train_loss
-                    }, use_wandb)
+                        }, os.path.join(checkpoint_dir, "carla_policy.pt"))
+        
+            safe_wandb_log({
+                "train/loss_epoch": avg_train_loss,
+                "train/epoch": 0.0,
+                "train/samples_processed": (epoch + 1) * len(train_dataset)
+            }, use_wandb)
+
+        validation_freq = config.get('training', {}).get('validation_freq', 1)
+        if (epoch + 1) % validation_freq == 0:
+            if rank == 0:
+                print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
+                sys.stdout.flush()
+            try:
+                val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size)
+                if rank == 0:
+                    print(f"✓ Validation completed")
+                    sys.stdout.flush()
+            except Exception as e:
+                if rank == 0:
+                    print(f"✗ Error during validation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                continue
+
+            if rank == 0:
+                sys.stdout.flush()
+                    
+                log_dict = {
+                        "epoch": epoch,
+                        "train/loss": avg_train_loss,
+                    }
+            
+                if 'val_loss' in val_metrics:
+                    log_dict["val/loss"] = val_metrics['val_loss']
+            
+                for key, value in val_metrics.items():
+                    if key == 'val_loss':
+                        continue  
+                    elif 'L2' in key:
+                        metric_name = key.replace('val_', '')
+                        log_dict[f"val/L2/{metric_name}"] = value
+                    elif 'collision' in key:
+                        metric_name = key.replace('val_', '')
+                        log_dict[f"val/collision/{metric_name}"] = value
+                    else:
+                        log_dict[f"val/{key.replace('val_', '')}"] = value
+            
+                print("Logging to wandb...")
+                sys.stdout.flush()
+                safe_wandb_log(log_dict, use_wandb)
+                sys.stdout.flush()
+
+            
+                print(f"Validation metrics:")
+                for key, value in val_metrics.items():
+                    print(f"  {key}: {value:.4f}")
+        
+                val_loss = val_metrics.get('val_loss', float('inf'))
+                l2_3s = val_metrics.get('val_L2_3s', float('inf'))
+                
+                # Save best model based on L2_3s instead of val_loss
+                if l2_3s < best_l2_3s:
+                    best_l2_3s = l2_3s
+                    torch.save({
+                            'model_state_dict': model_to_save.state_dict(),
+                            'config': config,
+                            'epoch': epoch,
+                            'val_loss': val_loss,
+                            'train_loss': avg_train_loss,
+                            'val_metrics': val_metrics
+                            }, os.path.join(checkpoint_dir, "carla_policy_best.pt"))
+                    print(f"✓ New best model saved with L2_3s: {l2_3s:.4f} (val_loss: {val_loss:.4f})")
+                   
+                    safe_wandb_log({
+                            "best_model/epoch": epoch,
+                            "best_model/L2_3s": l2_3s,
+                            "best_model/val_loss": val_loss,
+                            "best_model/train_loss": avg_train_loss
+                        }, use_wandb)
     
-    print("Training completed!")
-    print(f"Best L2_3s: {best_l2_3s:.4f}")
-    safe_wandb_log({
-        "training/completed": 0.0,
-        "training/total_epochs": num_epochs,
-        "training/best_l2_3s": best_l2_3s,
-        "training/final_train_loss": avg_train_loss
-    }, use_wandb)
+    if rank == 0:
+        print("Training completed!")
+        print(f"Best L2_3s: {best_l2_3s:.4f}")
+        safe_wandb_log({
+            "training/completed": 0.0,
+            "training/total_epochs": num_epochs,
+            "training/best_l2_3s": best_l2_3s,
+            "training/final_train_loss": avg_train_loss
+        }, use_wandb)
+        
+        safe_wandb_finish(use_wandb)
+        print("✓ Training session finished")
     
-    safe_wandb_finish(use_wandb)
-    print("✓ Training session finished")
+    # Clean up distributed process group
+    if world_size > 1:
+        torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT")
+    parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
     parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
