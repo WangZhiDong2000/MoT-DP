@@ -99,26 +99,22 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             token_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token.pt')
             token_global_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token_global.pt')
 
-            try:
-                lidar_token = torch.load(token_path, weights_only=True)
-                lidar_token_global = torch.load(token_global_path, weights_only=True)
-                lidar_tokens.append(lidar_token)
-                lidar_tokens_global.append(lidar_token_global)
-            except FileNotFoundError:
-                print(f"Warning: LiDAR feature files not found for {bev_path}")
-                continue
+            lidar_token = torch.load(token_path, weights_only=True)
+            lidar_token_global = torch.load(token_global_path, weights_only=True)
+            lidar_tokens.append(lidar_token)
+            lidar_tokens_global.append(lidar_token_global)
         
 
         lidar_token_tensor = torch.stack(lidar_tokens)  # (obs_horizon, seq_len, 512)
         lidar_token_global_tensor = torch.stack(lidar_tokens_global)  # (obs_horizon, 1, 512)
+        lidar_tokens.clear()  # Clear list to release references
+        lidar_tokens_global.clear()  # Clear list to release references
         
         # Load VQA feature from pt file
         vqa_path = sample.get('vqa', None)
         vqa_feature = {}
-        if vqa_path is not None:
-            full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-            vqa_feature_data = torch.load(full_vqa_path, weights_only=True)
-            vqa_feature = vqa_feature_data
+        full_vqa_path = os.path.join(self.image_data_root, vqa_path)
+        vqa_feature = torch.load(full_vqa_path, weights_only=True)
   
         
         # Convert sample data
@@ -212,9 +208,9 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         command_data = final_sample['command_hist']
         ego_status_components.append(command_data)  # (obs_horizon, 6)
 
-        # 5. target point
-        command_data = final_sample['target_point_hist']
-        ego_status_components.append(command_data)  # (obs_horizon, 2)
+        # 6. target point
+        target_point_data = final_sample['target_point_hist']
+        ego_status_components.append(target_point_data)  # (obs_horizon, 2)
         
         # 6. waypoints_hist (shape: (obs_horizon, 2))
         waypoints_data = final_sample['waypoints_hist']
@@ -235,6 +231,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 img = Image.open(full_img_path)
                 img_tensor = self.image_transform(img)
                 images.append(img_tensor)
+                img.close()  # Close image object to prevent file handle leak
             except Exception as e:
                 print(f"Error loading image {full_img_path}: {e}")
                 images.append(torch.zeros(3, 256, 928))
@@ -243,6 +240,8 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             images_tensor = torch.stack(images)
         else:
             images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
+        
+        images.clear()  # Clear list to release references
 
         return images_tensor
 
@@ -253,8 +252,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             bev_image = Image.open(full_bev_path)
             bev_tensor = self.lidar_bev_transform(bev_image)
             images.append(bev_tensor)
+            bev_image.close()  # Close image object to prevent file handle leak
 
         images_tensor = torch.stack(images)
+        images.clear()  # Clear list to release references
 
         return images_tensor
 

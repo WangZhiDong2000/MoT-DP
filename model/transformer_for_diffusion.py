@@ -345,7 +345,7 @@ class CustomEncoderBlock(nn.Module):
     Encoder block that handles condition embedding, VL pooling, encoding, and memory projection
     """
     def __init__(self, n_emb, n_head, n_cond_layers, p_drop_emb, p_drop_attn, vl_emb_dim, 
-                 obs_as_cond, cond_dim, T_cond):
+                 obs_as_cond, cond_dim, T_cond, reasoning_emb_dim=1536):
         super().__init__()
         self.n_emb = n_emb
         self.obs_as_cond = obs_as_cond
@@ -370,6 +370,19 @@ class CustomEncoderBlock(nn.Module):
             norm_type="rmsnorm"
         )
         self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
+
+        # Reasoning features processing
+        self.reasoning_emb_dim = reasoning_emb_dim
+        self.reasoning_emb_proj = nn.Linear(reasoning_emb_dim, n_emb)
+        self.reasoning_emb_norm = nn.LayerNorm(n_emb)
+        self.reasoning_attention_pooling = MultiheadAttentionWithQKNorm(
+                embed_dim=n_emb,
+                num_heads=n_head,
+                dropout=p_drop_attn,
+                batch_first=True,
+                norm_type="rmsnorm"
+            )
+        self.reasoning_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
         
         # Position embedding and preprocessing
         self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
@@ -411,13 +424,28 @@ class CustomEncoderBlock(nn.Module):
             key_padding_mask=vl_padding_mask  # (B, T_vl)
         )
         return pooled_features  # (B, 1, n_emb)
+
+    def _attention_pool_reasoning_features(self, reasoning_features: torch.Tensor, reasoning_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Apply attention pooling to reasoning features"""
+        batch_size = reasoning_features.shape[0]
+        query = self.reasoning_pool_query.expand(batch_size, -1, -1)  # (B, 1, n_emb)
+        pooled_features, _ = self.reasoning_attention_pooling(
+            query=query,                    # (B, 1, n_emb)
+            key=reasoning_features,         # (B, T_r, n_emb)
+            value=reasoning_features,       # (B, T_r, n_emb)
+            key_padding_mask=reasoning_padding_mask  # (B, T_r)
+        )
+        return pooled_features  # (B, 1, n_emb)
     
-    def forward(self, vl_embeds: torch.Tensor, cond: Optional[torch.Tensor] = None, 
-                vl_padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, vl_embeds: torch.Tensor, reasoning_embeds: Optional[torch.Tensor] = None, 
+                cond: Optional[torch.Tensor] = None, vl_padding_mask: Optional[torch.Tensor] = None,
+                reasoning_padding_mask: Optional[torch.Tensor] = None):
         """
         vl_embeds: (B, T_vl, D_vl) vision-language embeddings
+        reasoning_embeds: (B, T_r, D_r) reasoning embeddings
         cond: (B, T_cond, cond_dim) condition tensor
         vl_padding_mask: (B, T_vl) padding mask for VL features
+        reasoning_padding_mask: (B, T_r) padding mask for reasoning features
         Note: timestep is removed - memory generation does not use timesteps
         """
         
@@ -425,14 +453,26 @@ class CustomEncoderBlock(nn.Module):
         vl_features = self.vl_emb_proj(vl_embeds)  # (B, T_vl, n_emb)
         vl_features = self.vl_emb_norm(vl_features)
         vl_features_processed = self._attention_pool_vl_features(vl_features, vl_padding_mask)
+
+        # 2. Process Reasoning features
+        reasoning_features = None
+        reasoning_features_processed = None
+        reasoning_features = self.reasoning_emb_proj(reasoning_embeds)
+        reasoning_features = self.reasoning_emb_norm(reasoning_features)
+        reasoning_features_processed = self._attention_pool_reasoning_features(reasoning_features, reasoning_padding_mask)
         
-        # 2. Combine condition embeddings (no timestep here)
-        cond_embeddings = vl_features_processed
+        # 3. Combine condition embeddings (no timestep here)
+        cond_list = []
         if self.obs_as_cond and cond is not None:
             cond_obs_emb = self.cond_obs_emb(cond)
-            cond_embeddings = torch.cat([cond_obs_emb, cond_embeddings], dim=1)
+            cond_list.append(cond_obs_emb)
         
-        # 3. Add position embedding
+        cond_list.append(vl_features_processed)
+        cond_list.append(reasoning_features_processed)
+            
+        cond_embeddings = torch.cat(cond_list, dim=1)
+        
+        # 4. Add position embedding
         tc = cond_embeddings.shape[1]
         if tc <= self.cond_pos_emb.shape[1]:
             position_embeddings = self.cond_pos_emb[:, :tc, :]
@@ -443,18 +483,18 @@ class CustomEncoderBlock(nn.Module):
             if tc > self.cond_pos_emb.shape[1]:
                 torch.nn.init.normal_(position_embeddings[:, self.cond_pos_emb.shape[1]:, :], mean=0.0, std=0.02)
         
-        # 4. Apply dropout and pre-norm
+        # 5. Apply dropout and pre-norm
         x = self.drop(cond_embeddings + position_embeddings)
         x = self.pre_encoder_norm(x)
         
-        # 5. Transformer encoder
+        # 6. Transformer encoder
         x = self.encoder(x)
         
-        # 6. Memory processing
+        # 7. Memory processing
         memory = self.memory_norm(x)
         memory = memory + self.memory_proj(memory)
         
-        return memory, vl_features
+        return memory, vl_features, reasoning_features
 
 
 class CustomDecoderLayer(nn.Module):
@@ -502,8 +542,8 @@ class CustomDecoderLayer(nn.Module):
             return x * (1 + scale.unsqueeze(1))
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
     
-    def forward(self, tgt, memory, vl_features, conditioning=None, tgt_mask=None, memory_mask=None, 
-                vl_key_padding_mask=None):
+    def forward(self, tgt, memory, vl_features, reasoning_features=None, conditioning=None, tgt_mask=None, memory_mask=None, 
+                vl_key_padding_mask=None, reasoning_key_padding_mask=None):
         
         # 如果提供了 conditioning，生成调制参数
         if conditioning is not None:
@@ -521,8 +561,30 @@ class CustomDecoderLayer(nn.Module):
         memory2 = self.norm1(memory)
         if conditioning is not None:
             memory2 = self.modulate(memory2, shift_mem_vl, scale_mem_vl)
-        enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, vl_features, vl_features, 
-                                                      key_padding_mask=vl_key_padding_mask)
+            
+        # Combine VL and Reasoning features for cross attention
+        cross_attn_kv = vl_features
+        cross_attn_mask = vl_key_padding_mask
+        
+        cross_attn_kv = torch.cat([vl_features, reasoning_features], dim=1)
+            
+        # Handle masks
+        if vl_key_padding_mask is not None:
+            if reasoning_key_padding_mask is not None:
+                cross_attn_mask = torch.cat([vl_key_padding_mask, reasoning_key_padding_mask], dim=1)
+            else:
+                # If reasoning mask is None, assume all valid (False)
+                r_mask = torch.zeros((reasoning_features.shape[0], reasoning_features.shape[1]), 
+                                         device=vl_key_padding_mask.device, dtype=torch.bool)
+                cross_attn_mask = torch.cat([vl_key_padding_mask, r_mask], dim=1)
+        elif reasoning_key_padding_mask is not None:
+            # If vl mask is None, assume all valid
+            v_mask = torch.zeros((vl_features.shape[0], vl_features.shape[1]), 
+                                      device=reasoning_key_padding_mask.device, dtype=torch.bool)
+            cross_attn_mask = torch.cat([v_mask, reasoning_key_padding_mask], dim=1)
+        
+        enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, cross_attn_kv, cross_attn_kv, 
+                                                      key_padding_mask=cross_attn_mask)
         if conditioning is not None:
             enhanced_memory = memory + gate_mem_vl.unsqueeze(1) * enhanced_memory_output
         else:
@@ -599,17 +661,18 @@ class CustomTransformerDecoder(nn.Module):
         
         return memory_mask
         
-    def forward(self, tgt, memory, vl_features, cond=None, tgt_mask=None, 
-                vl_key_padding_mask=None, conditioning=None):
+    def forward(self, tgt, memory, vl_features, reasoning_features=None, cond=None, tgt_mask=None, 
+                vl_key_padding_mask=None, reasoning_key_padding_mask=None, conditioning=None):
         # Generate dynamic memory mask
         memory_mask = self._generate_memory_mask(tgt, memory, cond, tgt_mask)
         
         # Decoder layers
         output = tgt
         for layer in self.layers:
-            output = layer(output, memory, vl_features, conditioning=conditioning, 
-                          tgt_mask=tgt_mask, memory_mask=memory_mask,
-                          vl_key_padding_mask=vl_key_padding_mask)
+            output = layer(output, memory, vl_features, reasoning_features=reasoning_features, 
+                          conditioning=conditioning, tgt_mask=tgt_mask, memory_mask=memory_mask,
+                          vl_key_padding_mask=vl_key_padding_mask, 
+                          reasoning_key_padding_mask=reasoning_key_padding_mask)
         return output
 
 
@@ -713,6 +776,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             obs_as_cond: bool=False,
             n_cond_layers: int = 4,
             vl_emb_dim: int = 1536,
+            reasoning_emb_dim: int = 1536, 
             status_dim: int = 15,  
             ego_status_seq_len: int = 1  
         ) -> None:
@@ -733,6 +797,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.target_vl_tokens = None
         vl_tokens_count = 1 
         T_cond += vl_tokens_count   
+
+        # Compute Reasoning tokens count for T_cond
+        reasoning_tokens_count = 1
+        T_cond += reasoning_tokens_count
 
         # input embedding stem
         self.input_emb = nn.Linear(input_dim, n_emb)
@@ -767,7 +835,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             vl_emb_dim=vl_emb_dim,
             obs_as_cond=obs_as_cond,
             cond_dim=cond_dim,
-            T_cond=T_cond
+            T_cond=T_cond,
+            reasoning_emb_dim=reasoning_emb_dim # Pass reasoning_emb_dim
         )
         # Custom decoder that integrates VL cross attention and pre-processing
         custom_decoder_layer = CustomDecoderLayer(
@@ -806,6 +875,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.horizon = horizon
         self.obs_as_cond = obs_as_cond
         self.vl_emb_dim = vl_emb_dim
+        self.reasoning_emb_dim = reasoning_emb_dim
 
         self.apply(self._init_weights)
         
@@ -1002,19 +1072,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
-        gen_vit_tokens: (B, seq_len, feat_dim) - VIT tokens from VQA (used as independent variable)
-        answer_token_indexes: (B, max_answer_tokens) - answer token indices (used as independent variable)
+        gen_vit_tokens: (B, seq_len, feat_dim) - VIT tokens from VQA
+        answer_token_indexes: (B, max_answer_tokens) - answer token indices
         ego_status: (B, status_dim) current ego status
         output: (B,T,input_dim)
         """
         sample = sample.contiguous()
         cond = cond.contiguous() 
-        
-        # gen_vit_tokens and answer_token_indexes are passed as independent variables
-        # Use gen_vit_tokens directly as vl_embeds if provided
-        vl_embeds=gen_vit_tokens
-        vl_embeds = vl_embeds.contiguous()
-        
+        vl_embeds=gen_vit_tokens.contiguous()
+        reasoning_embeds = reasoning_query_tokens.contiguous()
         
         # 1. Prepare timesteps
         timesteps = timestep
@@ -1028,44 +1094,30 @@ class TransformerForDiffusion(ModuleAttrMixin):
         time_embedding = self.time_emb(timesteps)  # (B, n_emb)
         conditioning = None
         hist_features = None
-        if ego_status is not None:
-            # Handle 3D ego_status (B, To, status_dim)
-            if ego_status.dim() == 3:
-                current_status = ego_status[:, -1, :]
+        # Handle 3D ego_status (B, To, status_dim)
+        current_status = ego_status[:, -1, :]
+        hist_state = ego_status
+        # 1. Embed history for concatenation (Local Context)
+        hist_tokens = self.hist_feature_emb(hist_state)
                 
-                # Use full history state (B, To, status_dim)
-                # We assume the input ego_status contains the history we want
-                hist_state = ego_status
+        # Add position embedding
+        t_hist = hist_tokens.shape[1]
+        if t_hist <= self.hist_pos_emb.shape[1]:
+            hist_pos = self.hist_pos_emb[:, :t_hist, :]
+        else:
+            hist_pos = self.hist_pos_emb
                 
-                # 1. Embed history for concatenation (Local Context)
-                hist_tokens = self.hist_feature_emb(hist_state)
+        # Add segment embedding for history
+        hist_features = hist_tokens + hist_pos + self.hist_segment_emb
                 
-                # Add position embedding
-                t_hist = hist_tokens.shape[1]
-                if t_hist <= self.hist_pos_emb.shape[1]:
-                    hist_pos = self.hist_pos_emb[:, :t_hist, :]
-                else:
-                    hist_pos = self.hist_pos_emb
+        # 2. Encode history for modulation (Global Context)
+        hist_global_embedding = self.history_encoder(hist_state)
                 
-                # Add segment embedding for history
-                hist_features = hist_tokens + hist_pos + self.hist_segment_emb
-                
-                # 2. Encode history for modulation (Global Context)
-                # This summarizes the motion trend into a single vector
-                hist_global_embedding = self.history_encoder(hist_state)
-                
-            else:
-                current_status = ego_status
-                # If no history provided, use zero or projection of current as fallback for global
-                # But ideally we should have history. For now, if 2D, we can't use history encoder properly
-                # unless we treat it as sequence of length 1.
-                hist_global_embedding = torch.zeros_like(time_embedding)
-
-            # Project ego_status (current)
-            status_embedding = self.ego_status_proj(current_status)  # (B, n_emb)
+        # Project ego_status (current)
+        status_embedding = self.ego_status_proj(current_status)  # (B, n_emb)
             
-            # Add to timestep embedding: Time + Current Status + History Trend
-            conditioning = time_embedding + status_embedding + hist_global_embedding # (B, n_emb)
+        # Add to timestep embedding: Time + Current Status + History Trend
+        conditioning = time_embedding + status_embedding + hist_global_embedding # (B, n_emb)
 
         
         # 3. Check VL padding
@@ -1075,12 +1127,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
         else:
             vl_norm = torch.norm(vl_embeds, dim=-1)  # (B, T_vl)
             vl_padding_mask = (vl_norm == 0) 
+            
+        # Check Reasoning padding
+        reasoning_padding_mask = None
+        if reasoning_embeds is not None:
+            if 'reasoning_mask' in kwargs and kwargs['reasoning_mask'] is not None:
+                reasoning_padding_mask = ~kwargs['reasoning_mask']
+            else:
+                reasoning_norm = torch.norm(reasoning_embeds, dim=-1)
+                reasoning_padding_mask = (reasoning_norm == 0)
         
         # 4. Process conditions through encoder block to get memory (no timestep)
-        memory, vl_features = self.encoder_block(
+        memory, vl_features, reasoning_features = self.encoder_block(
             vl_embeds=vl_embeds, 
+            reasoning_embeds=reasoning_embeds,
             cond=cond, 
-            vl_padding_mask=vl_padding_mask)
+            vl_padding_mask=vl_padding_mask,
+            reasoning_padding_mask=reasoning_padding_mask)
         
         # 5. Pre-decoder processing
         token_embeddings = self.input_emb(sample)
@@ -1109,9 +1172,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             tgt=x,
             memory=memory,
             vl_features=vl_features,
+            reasoning_features=reasoning_features,
             cond=cond,
             tgt_mask=tgt_mask,
             vl_key_padding_mask=vl_padding_mask,
+            reasoning_key_padding_mask=reasoning_padding_mask,
             conditioning=conditioning  # 传递 conditioning
         )        
         
@@ -1151,13 +1216,13 @@ def test():
     
     # Test 1: Without ego_status_history (backward compatibility)
     print("Test 1: Without ego_status_history")
-    out = transformer(sample, timestep, vl_embeds, cond)
+    out = transformer(sample, timestep, cond, vl_embeds)
     print(f"Output shape: {out.shape}")
     
     # Test 2: With ego_status (AdaLN modulation)
     print("\nTest 2: With ego_status (AdaLN modulation)")
     ego_status = torch.randn((4, 13))  # (B, status_dim=13) - 2D for simple modulation
-    out_with_status = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status)
+    out_with_status = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status)
     print(f"Output shape with status: {out_with_status.shape}")
     
     # Test 3: Verify outputs are different with/without status
@@ -1173,7 +1238,7 @@ def test():
     print("\nTest 4: With 3D ego_status (History concatenation)")
     # ego_status with history: (B, To=4, status_dim=13)
     ego_status_3d = torch.randn((4, 4, 13)) 
-    out_with_hist = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status_3d)
+    out_with_hist = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status_3d)
     print(f"Output shape with history: {out_with_hist.shape}")
     
     diff_hist = torch.abs(out_with_status - out_with_hist).mean()
@@ -1192,7 +1257,7 @@ def test():
     
     # Run with different conditioning (different timestep)
     timestep2 = torch.tensor(10)
-    out_diff_time = transformer(sample, timestep2, vl_embeds, cond, ego_status=ego_status_3d)
+    out_diff_time = transformer(sample, timestep2, cond, vl_embeds, ego_status=ego_status_3d)
     
     diff_time = torch.abs(out_with_hist - out_diff_time).mean()
     print(f"Mean difference with different timestep (Global Context Injection): {diff_time:.6f}")
@@ -1211,13 +1276,42 @@ def test():
     ego_status_B[:, :3, :] = torch.randn((4, 3, 13))
     
     # Run model
-    out_A = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status_A)
-    out_B = transformer(sample, timestep, vl_embeds, cond, ego_status=ego_status_B)
+    out_A = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status_A)
+    out_B = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status_B)
     
     diff_hist_mod = torch.abs(out_A - out_B).mean()
     print(f"Mean difference with different history (same current): {diff_hist_mod:.6f}")
     if diff_hist_mod > 0:
         print("✓ Global History Modulation is working!")
+
+    # Test 7: Verify Reasoning Tokens Integration
+    print("\nTest 7: Verify Reasoning Tokens Integration")
+    reasoning_tokens = torch.randn((4, 10, 1536)) # (B, seq_len, dim)
+    
+    # Initialize with reasoning dim
+    transformer_reasoning = TransformerForDiffusion(
+        input_dim=2,
+        output_dim=2,
+        horizon=8,
+        n_obs_steps=4,
+        cond_dim=10,
+        causal_attn=True,
+        n_cond_layers=4,
+        vl_emb_dim=1536,
+        reasoning_emb_dim=1536, # Enable reasoning
+        status_dim=13,
+        ego_status_seq_len=4
+    )
+    
+    out_no_reasoning = transformer_reasoning(sample, timestep, cond, vl_embeds, ego_status=ego_status_3d)
+    out_with_reasoning = transformer_reasoning(sample, timestep, cond, vl_embeds, 
+                                             reasoning_query_tokens=reasoning_tokens, 
+                                             ego_status=ego_status_3d)
+    
+    diff_reasoning = torch.abs(out_no_reasoning - out_with_reasoning).mean()
+    print(f"Mean difference with reasoning tokens: {diff_reasoning:.6f}")
+    if diff_reasoning > 0:
+        print("✓ Reasoning Tokens Integration is working!")
 
     print("\n✓ All tests passed!")
 

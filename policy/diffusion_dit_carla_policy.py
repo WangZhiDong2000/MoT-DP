@@ -115,7 +115,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         vlm_feature_dim = 2560  # 隐藏层维度
         self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
-        self.feature_encoder.eval()
 
         obs_feature_dim = 256  
 
@@ -426,27 +425,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         device = condition_data.device
         bs = condition_data.shape[0]
 
-        # Initialize trajectory based on anchor configuration
-        if self.use_anchor and self.plan_anchor is not None:
-            # 1. 准备 plan_anchor：使用anchor轨迹，加噪声到归一化后的anchor
-            plan_anchor = self.plan_anchor.to(device).repeat(bs, 1, 1)  # (bs, 8, 2)
-            odo_info_fut = self.normalize_action(plan_anchor)  # 归一化到[-1, 1]
-            
-            # 添加噪声到归一化后的 plan_anchor
-            noise = torch.randn(odo_info_fut.shape, device=device)
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.get('num_train_timesteps', 100),
-                (bs,), device=device
-            ).long()
-            noisy_trajectory = scheduler.add_noise(
-                original_samples=odo_info_fut,
-                noise=noise,
-                timesteps=timesteps
-            ).float()
-            trajectory = torch.clamp(noisy_trajectory, min=-1, max=1)
-        else:
-            # 直接从高斯分布采样
-            trajectory = torch.randn(
+        # 直接从高斯分布采样
+        trajectory = torch.randn(
                 size=condition_data.shape, 
                 dtype=condition_data.dtype,
                 device=device,
@@ -516,14 +496,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         reasoning_query_tokens = nobs.get('reasoning_query_tokens', None)
         
         # Process gen_vit_tokens through feature_encoder
-        if gen_vit_tokens is not None:
-            gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)
-            gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
+        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)
+        gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
         
         # Process reasoning_query_tokens through feature_encoder
-        if reasoning_query_tokens is not None:
-            reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=torch.float32)
-            reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
+        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=torch.float32)
+        reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
         
         
         # Use current ego_status instead of full history
@@ -548,7 +526,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             naction_pred = self.unnormalize_action(naction_pred)
         
         action_pred = naction_pred.detach().cpu().numpy()
-        # 直接返回整个预测序列，因为horizon=action_horizon
         action = action_pred
         result = {
             'action': action,
