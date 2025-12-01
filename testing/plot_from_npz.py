@@ -20,8 +20,8 @@ def visualize_from_npz(npz_path, save_path):
     
     print(f"Loaded data for {len(sample_indices)} samples")
     
-    # Create figure
-    fig = plt.figure(figsize=(16, 16))
+    # Create figure with square subplots
+    fig = plt.figure(figsize=(10, 10))
     
     for idx in range(4):
         ax = plt.subplot(2, 2, idx + 1)
@@ -45,6 +45,7 @@ def visualize_from_npz(npz_path, save_path):
         
         # 3. Plot ground truth future trajectory (green)
         if gt_traj is not None and len(gt_traj) > 0:
+            print(gt_traj)
             gt_trajectory = np.vstack([[[0, 0]], gt_traj])
             ax.plot(gt_trajectory[:, 1], gt_trajectory[:, 0], 'g--', 
                    linewidth=2.5, alpha=0.7, label='Ground truth')
@@ -75,8 +76,8 @@ def visualize_from_npz(npz_path, save_path):
         # Formatting
         ax.set_xlabel('Y (lateral / m)', fontsize=11)
         ax.set_ylabel('X (longitudinal / m)', fontsize=11)
+        #ax.set_aspect('equal')
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-        ax.set_aspect('equal', adjustable='box')
         ax.legend(fontsize=9, loc='best', framealpha=0.9)
         
         # Add axis lines at origin
@@ -84,7 +85,7 @@ def visualize_from_npz(npz_path, save_path):
         ax.axvline(x=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
     
     # Adjust layout
-    plt.subplots_adjust(left=0.08, right=0.96, top=0.95, bottom=0.08, hspace=0.3, wspace=0.3)
+    plt.subplots_adjust(left=0.1, right=0.95, top=0.95, bottom=0.1, hspace=0.35, wspace=0.35)
     
     # Save
     plt.savefig(save_path, dpi=150, format='png')
