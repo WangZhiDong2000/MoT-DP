@@ -11,13 +11,12 @@ import math
 import yaml
 from collections import OrderedDict
 import torch
-import carla
 import numpy as np
 from PIL import Image
 from torchvision import transforms as T
 import imageio
 import laspy
-
+# /data/z_projects/carla
 # Add the project directories to the Python path
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
 leaderboard_root = os.path.join(project_root, 'leaderboard')
@@ -59,18 +58,13 @@ def load_best_model(checkpoint_path, config, device):
     print(f"Loading best model from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-#     action_stats = {
-#     'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-#     'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-#     'mean': torch.tensor([10.975193977355957, 0.04004639387130737]),
-#     'std': torch.tensor([14.96833324432373, 3.419595956802368]),
-# }
     action_stats = {
-    'min': torch.tensor([-21.217477798461914, -22.13955307006836]),
-    'max': torch.tensor([33.02915954589844, 26.23844337463379]),
-    'mean': torch.tensor([3.9731080532073975, -0.05837925150990486]),
-    'std': torch.tensor([4.942440032958984, 1.4319489002227783]),
-}
+    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
+    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
+    'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
+    'std': torch.tensor([14.527670860290527, 3.224050521850586]),
+    }
+
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
     policy.load_state_dict(checkpoint['model_state_dict'])
     policy.eval()

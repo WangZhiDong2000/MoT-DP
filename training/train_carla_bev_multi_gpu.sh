@@ -5,7 +5,7 @@
 
 # Default values
 NUM_GPUS=${1:-2}  # Default to 2 GPUs
-CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml"}
+CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml"}
 
 # Set environment variables for better performance
 export OMP_NUM_THREADS=8
@@ -26,6 +26,6 @@ torchrun \
     --max_restarts=0 \
     --rdzv_id=123456789 \
     --rdzv_backend=c10d \
-    --rdzv_endpoint=localhost:29500 \
+    --rdzv_endpoint=localhost:29501 \
     train_carla_bev.py \
     --config_path "$CONFIG_PATH"
