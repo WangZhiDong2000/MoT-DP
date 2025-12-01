@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
-"""
-轨迹预测可视化脚本
-根据训练脚本加载模型权重，随机选取4个样本进行可视化
-每个图片展示4个子图，绘制历史轨迹、真实未来轨迹和模型预测轨迹
-"""
 import os
 import sys
 import torch
 import yaml
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 import random
+from PIL import Image
 
-# Add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
@@ -24,20 +18,14 @@ from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 
 
 def load_config(config_path):
-    """加载配置文件"""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
 
 
 def load_model(config, checkpoint_path, device):
-    """加载模型和权重"""
     print(f"Loading model from {checkpoint_path}...")
-    
-    # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Get action stats from checkpoint config if available
     checkpoint_config = checkpoint['config']
     action_stats = {
     'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
@@ -46,12 +34,8 @@ def load_model(config, checkpoint_path, device):
     'std': torch.tensor([14.527670860290527, 3.224050521850586]),
     }
     
-   
-    
-    # Initialize policy
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
     
-    # Load state dict
     if 'model_state_dict' in checkpoint:
         policy.load_state_dict(checkpoint['model_state_dict'])
         print(f"✓ Loaded model weights from checkpoint")
@@ -72,8 +56,6 @@ def main():
     # Configuration
     config_path = os.path.join(project_root, "config", "pdm_server.yaml")
     checkpoint_path = os.path.join(project_root, "checkpoints", "carla_dit_best", "carla_policy_best.pt")
-    
-    # Load config
     config = load_config(config_path)
     
     # Dataset paths
@@ -85,17 +67,10 @@ def main():
     print(f"Dataset path: {dataset_path}")
     print(f"Image data root: {image_data_root}")
     
-    # Check if paths exist
-    if not os.path.exists(dataset_path):
-        print(f"⚠ Dataset path does not exist: {dataset_path}")
-        print("Please update the config file or specify the correct path")
-        return
-    
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load dataset
     print("Loading dataset...")
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
@@ -104,32 +79,42 @@ def main():
     )
     print(f"✓ Loaded {len(dataset)} validation samples")
     
-    if len(dataset) < 4:
-        print(f"⚠ Dataset has only {len(dataset)} samples, need at least 4")
-        return
-    
-    # Load model
-    if not os.path.exists(checkpoint_path):
-        print(f"⚠ Checkpoint not found: {checkpoint_path}")
-        print("Please specify the correct checkpoint path")
-        return
-    
     policy = load_model(config, checkpoint_path, device)
     
-    # Randomly select 4 samples
     random.seed(42)  # For reproducibility
     sample_indices = random.sample(range(len(dataset)), 4)
     print(f"Selected sample indices: {sample_indices}")
     
     samples = []
     predictions = []
+    rgb_images = []
+    rgb_last_frames = []  
     
     # Process each sample
     with torch.no_grad():
         for idx in sample_indices:
             sample = dataset[idx]
+            rgb_hist_paths = sample['rgb_hist_jpg']
+            loaded_frames = []
+            for path in rgb_hist_paths:
+                full_path = os.path.join(image_data_root, path)
+                img = Image.open(full_path)
+                img_array = np.array(img)
+                loaded_frames.append(img_array)
+  
+            rgb_hist = np.array(loaded_frames)
+            print(f"  Sample {idx}: Loaded {len(loaded_frames)} frames from paths, RGB hist shape: {rgb_hist.shape}")
+            rgb_images.append(rgb_hist)
+            last_frame = rgb_hist[-1]
+            rgb_last_frames.append(last_frame)
+
             
-            # Prepare observation dict for model
+            # Prepare observation dict for dp model
+            mot_dict ={
+                'rgb_hist_jpg': rgb_hist,  # List of file paths
+            }
+            gen_vit_tokens, reasoning_query_tokens= mot_model.forward(mot_dict)
+
             obs_dict = {
                 'lidar_token': sample['lidar_token'].unsqueeze(0).to(device),  # (1, obs_horizon, seq_len, 512)
                 'lidar_token_global': sample['lidar_token_global'].unsqueeze(0).to(device),  # (1, obs_horizon, 1, 512)
@@ -137,6 +122,7 @@ def main():
                 'gen_vit_tokens': sample['gen_vit_tokens'].unsqueeze(0).to(device),  # (1, ...)
                 'reasoning_query_tokens': sample['reasoning_query_tokens'].unsqueeze(0).to(device),  # (1, ...)
             }
+
             
             # Predict
             result = policy.predict_action(obs_dict)
@@ -147,7 +133,6 @@ def main():
             
             print(f"  Sample {idx}: Prediction shape {pred.shape}")
     
-    # Save data first before visualization
     save_dir = os.path.join(project_root, "image")
     os.makedirs(save_dir, exist_ok=True)
     data_save_path = os.path.join(save_dir, "trajectory_data.npz")
@@ -159,6 +144,87 @@ def main():
              waypoints_hist=[s['waypoints_hist'].cpu().numpy() if isinstance(s['waypoints_hist'], torch.Tensor) else s['waypoints_hist'] for s in samples],
              agent_pos=[s['agent_pos'].cpu().numpy() if isinstance(s['agent_pos'], torch.Tensor) else s['agent_pos'] for s in samples])
     print(f"✓ Saved trajectory data to: {data_save_path}")
+    
+    # Save RGB images (individual frames)
+    for i, (sample_idx, rgb_image) in enumerate(zip(sample_indices, rgb_images)):
+        # Convert different types to numpy
+        if isinstance(rgb_image, torch.Tensor):
+            rgb_array = rgb_image.cpu().numpy()
+        elif isinstance(rgb_image, list):
+            rgb_array = np.array(rgb_image)
+        else:
+            rgb_array = rgb_image
+        
+        # If it's a sequence of frames, save the last one
+        if rgb_array.ndim == 4:  # (T, H, W, C) or similar
+            rgb_array = rgb_array[-1]
+        
+        # Handle different possible shapes (C, H, W) or (H, W, C)
+        if rgb_array.ndim == 3:
+            if rgb_array.shape[0] in [3, 4]:  # Likely (C, H, W) format
+                rgb_array = np.transpose(rgb_array, (1, 2, 0))
+            
+            # Normalize to 0-255 if values are in 0-1 range
+            if rgb_array.max() <= 1.0:
+                rgb_array = (rgb_array * 255).astype(np.uint8)
+            else:
+                rgb_array = rgb_array.astype(np.uint8)
+            
+            # Save image
+            if rgb_array.shape[2] >= 3:
+                img = Image.fromarray(rgb_array[:, :, :3])
+            else:
+                img = Image.fromarray(rgb_array)
+            image_save_path = os.path.join(save_dir, f"rgb_sample_{sample_idx}.png")
+            img.save(image_save_path)
+            print(f"✓ Saved RGB image to: {image_save_path}")
+    
+    # # Create figure with 4 subplots for last frames
+    # fig = plt.figure(figsize=(16, 12))
+    # for i, (sample_idx, last_frame) in enumerate(zip(sample_indices, rgb_last_frames)):
+    #     ax = plt.subplot(2, 2, i + 1)
+        
+    #     # Convert different types to numpy
+    #     if isinstance(last_frame, torch.Tensor):
+    #         frame_array = last_frame.cpu().numpy()
+    #     elif isinstance(last_frame, list):
+    #         frame_array = np.array(last_frame)
+    #     else:
+    #         frame_array = last_frame
+        
+    #     print(f"  Frame {i} - Before processing: shape={frame_array.shape}, ndim={frame_array.ndim}, dtype={frame_array.dtype}")
+        
+    #     # Handle different possible shapes (C, H, W) or (H, W, C)
+    #     if frame_array.ndim == 3:
+    #         if frame_array.shape[0] in [3, 4]:  # Likely (C, H, W) format
+    #             frame_array = np.transpose(frame_array, (1, 2, 0))
+            
+    #         # Normalize to 0-255 if values are in 0-1 range
+    #         if frame_array.max() <= 1.0:
+    #             frame_array = (frame_array * 255).astype(np.uint8)
+    #         else:
+    #             frame_array = frame_array.astype(np.uint8)
+            
+    #         print(f"  Frame {i} - After processing: shape={frame_array.shape}")
+            
+    #         # Display image, handle both RGB and RGBA
+    #         if frame_array.shape[2] >= 3:
+    #             ax.imshow(frame_array[:, :, :3])
+    #         else:
+    #             ax.imshow(frame_array)
+    #     else:
+    #         print(f"  ⚠ Frame {i} - Unexpected shape: {frame_array.shape}, skipping...")
+    #         ax.text(0.5, 0.5, f'Invalid frame shape: {frame_array.shape}', 
+    #                ha='center', va='center', transform=ax.transAxes)
+        
+    #     ax.set_title(f'Sample {sample_idx} - Last Frame', fontsize=12, fontweight='bold')
+    #     ax.axis('off')
+    
+    # plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05, hspace=0.2, wspace=0.2)
+    # last_frame_path = os.path.join(save_dir, "rgb_samples_last_frames.png")
+    # plt.savefig(last_frame_path, dpi=150, format='png', bbox_inches='tight')
+    # plt.close()
+    # print(f"✓ Saved last frames figure to: {last_frame_path}")
     
 
     
