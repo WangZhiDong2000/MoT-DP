@@ -113,7 +113,7 @@ def main():
             mot_dict ={
                 'rgb_hist_jpg': rgb_hist,  # List of file paths
             }
-            gen_vit_tokens, reasoning_query_tokens= mot_model.forward(mot_dict)
+            # gen_vit_tokens, reasoning_query_tokens= mot_model.forward(mot_dict)
 
             obs_dict = {
                 'lidar_token': sample['lidar_token'].unsqueeze(0).to(device),  # (1, obs_horizon, seq_len, 512)

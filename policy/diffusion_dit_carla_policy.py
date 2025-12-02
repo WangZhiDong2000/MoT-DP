@@ -426,14 +426,36 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
+        
+        # ===== OPTIMIZATION: Cache encoder outputs =====
+        # Encoder output doesn't depend on timestep or trajectory,
+        # so we only compute it once and reuse for all diffusion steps
+        with torch.no_grad():
+            memory, vl_features, reasoning_features, vl_padding_mask, reasoning_padding_mask = \
+                model.encode_conditions(
+                    cond=cond,
+                    gen_vit_tokens=gen_vit_tokens,
+                    reasoning_query_tokens=reasoning_query_tokens
+                )
 
+        
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
-            # 2. predict model output
-            model_output = model(trajectory, t, cond, gen_vit_tokens=gen_vit_tokens, reasoning_query_tokens=reasoning_query_tokens, ego_status=ego_status)
-
+            # 2. predict model output using cached encoder outputs
+            
+            model_output = model.decode_with_cache(
+                sample=trajectory,
+                timestep=t,
+                memory=memory,
+                vl_features=vl_features,
+                reasoning_features=reasoning_features,
+                cond=cond,
+                ego_status=ego_status,
+                vl_padding_mask=vl_padding_mask,
+                reasoning_padding_mask=reasoning_padding_mask
+            )
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -441,6 +463,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 generator=generator,
                 **kwargs
                 ).prev_sample
+        
+       
         
         # finally make sure conditioning is enforced
         trajectory[condition_mask] = condition_data[condition_mask]        

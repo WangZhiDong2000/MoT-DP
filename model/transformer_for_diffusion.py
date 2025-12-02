@@ -1039,6 +1039,149 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         return optimizer
 
+    def encode_conditions(self,
+        cond: torch.Tensor,
+        gen_vit_tokens: Optional[torch.Tensor] = None,
+        reasoning_query_tokens: Optional[torch.Tensor] = None,
+        **kwargs):
+        """
+        Encode conditions (VL, reasoning, observations) to memory.
+        This can be cached during diffusion sampling since it doesn't depend on timestep or trajectory.
+        
+        Returns:
+            memory: (B, T_cond, n_emb)
+            vl_features: (B, T_vl, n_emb)
+            reasoning_features: (B, T_r, n_emb)
+            vl_padding_mask: (B, T_vl)
+            reasoning_padding_mask: (B, T_r)
+        """
+        cond = cond.contiguous()
+        vl_embeds = gen_vit_tokens.contiguous()
+        reasoning_embeds = reasoning_query_tokens.contiguous()
+        
+        # Check VL padding
+        vl_padding_mask = None
+        if 'vl_mask' in kwargs and kwargs['vl_mask'] is not None:
+            vl_padding_mask = ~kwargs['vl_mask']
+        else:
+            vl_norm = torch.norm(vl_embeds, dim=-1)
+            vl_padding_mask = (vl_norm == 0)
+        
+        # Check Reasoning padding
+        reasoning_padding_mask = None
+        if 'reasoning_mask' in kwargs and kwargs['reasoning_mask'] is not None:
+            reasoning_padding_mask = ~kwargs['reasoning_mask']
+        else:
+            reasoning_norm = torch.norm(reasoning_embeds, dim=-1)
+            reasoning_padding_mask = (reasoning_norm == 0)
+        
+        # Process conditions through encoder block
+        memory, vl_features, reasoning_features = self.encoder_block(
+            vl_embeds=vl_embeds,
+            reasoning_embeds=reasoning_embeds,
+            cond=cond,
+            vl_padding_mask=vl_padding_mask,
+            reasoning_padding_mask=reasoning_padding_mask
+        )
+        
+        return memory, vl_features, reasoning_features, vl_padding_mask, reasoning_padding_mask
+
+    def decode_with_cache(self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        memory: torch.Tensor,
+        vl_features: torch.Tensor,
+        reasoning_features: torch.Tensor,
+        cond: torch.Tensor,
+        ego_status: Optional[torch.Tensor] = None,
+        vl_padding_mask: Optional[torch.Tensor] = None,
+        reasoning_padding_mask: Optional[torch.Tensor] = None,
+        **kwargs):
+        """
+        Decode trajectory using cached encoder outputs.
+        This is much faster during diffusion sampling.
+        
+        Args:
+            sample: (B, T, input_dim) - noisy trajectory
+            timestep: diffusion timestep
+            memory: cached encoder output
+            vl_features: cached VL features
+            reasoning_features: cached reasoning features
+            cond: observation conditions
+            ego_status: ego vehicle status
+        """
+        sample = sample.contiguous()
+        cond = cond.contiguous()
+        
+        # 1. Prepare timesteps
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        timesteps = timesteps.expand(sample.shape[0])
+        
+        # 2. Generate conditioning from timestep and ego_status
+        time_embedding = self.time_emb(timesteps)
+        conditioning = None
+        hist_features = None
+        
+        current_status = ego_status[:, -1, :]
+        hist_state = ego_status
+        hist_tokens = self.hist_feature_emb(hist_state)
+        
+        t_hist = hist_tokens.shape[1]
+        if t_hist <= self.hist_pos_emb.shape[1]:
+            hist_pos = self.hist_pos_emb[:, :t_hist, :]
+        else:
+            hist_pos = self.hist_pos_emb
+        
+        hist_features = hist_tokens + hist_pos + self.hist_segment_emb
+        hist_global_embedding = self.history_encoder(hist_state)
+        status_embedding = self.ego_status_proj(current_status)
+        conditioning = time_embedding + status_embedding + hist_global_embedding
+        
+        # 3. Pre-decoder processing
+        token_embeddings = self.input_emb(sample)
+        t = token_embeddings.shape[1]
+        position_embeddings = self.pos_emb[:, :t, :]
+        x = self.drop(token_embeddings + position_embeddings + self.fut_segment_emb)
+        x = self.pre_decoder_norm(x)
+        
+        # Concatenate history
+        tgt_mask = self.mask
+        if hist_features is not None:
+            hist_x = self.drop(hist_features)
+            hist_x = self.pre_decoder_norm(hist_x)
+            x = torch.cat([hist_x, x], dim=1)
+            
+            if tgt_mask is not None:
+                total_len = x.shape[1]
+                mask = (torch.triu(torch.ones(total_len, total_len, device=x.device)) == 1).transpose(0, 1)
+                tgt_mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        
+        # 4. Decoder with cached memory
+        x = self.decoder(
+            tgt=x,
+            memory=memory,
+            vl_features=vl_features,
+            reasoning_features=reasoning_features,
+            cond=cond,
+            tgt_mask=tgt_mask,
+            vl_key_padding_mask=vl_padding_mask,
+            reasoning_key_padding_mask=reasoning_padding_mask,
+            conditioning=conditioning
+        )
+        
+        # 5. Trajectory head
+        x = self.trajectory_head(x, conditioning=conditioning)
+        
+        # Slice output if history was added
+        if hist_features is not None:
+            x = x[:, -t:, :]
+        
+        return x
+
     def forward(self, 
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
