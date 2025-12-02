@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -442,6 +443,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         vl_embeds = self.feature_encoder(vl_features)
 
+        import time
+        time1=time.time()
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -456,7 +459,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 generator=generator,
                 **kwargs
                 ).prev_sample
-        
+        time2=time.time()
+        print(f"Diffusion sampling time: {time2-time1:.4f}")
         # finally make sure conditioning is enforced
         trajectory[condition_mask] = condition_data[condition_mask]        
 

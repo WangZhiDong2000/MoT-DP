@@ -496,6 +496,6 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Test DiffusionDiTCarlaPolicy on full test dataset")
-    parser.add_argument('--config_path', type=str, default=os.path.join(project_root, "config/nuscenes.yaml"), help='Path to the configuration file')
+    parser.add_argument('--config_path', type=str, default=os.path.join(project_root, "config/nuscences_server.yaml"), help='Path to the configuration file')
     args = parser.parse_args()
     main(args)
