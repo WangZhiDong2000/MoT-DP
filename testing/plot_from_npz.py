@@ -20,7 +20,7 @@ def visualize_from_npz(npz_path, save_path):
     
     print(f"Loaded data for {len(sample_indices)} samples")
     
-    # Create figure with square subplots
+    # Create figure with square subplots (maximize space usage)
     fig = plt.figure(figsize=(10, 10))
     
     for idx in range(4):
@@ -30,6 +30,26 @@ def visualize_from_npz(npz_path, save_path):
         pred = predictions[idx]
         hist_traj = waypoints_hist[idx]
         gt_traj = agent_pos[idx]
+        
+        # Calculate axis limits for this subplot only
+        sub_x = [0]
+        sub_y = [0]
+        
+        if hist_traj is not None and len(hist_traj) > 0:
+            sub_x.extend(hist_traj[:, 0])
+            sub_y.extend(hist_traj[:, 1])
+        
+        if gt_traj is not None and len(gt_traj) > 0:
+            sub_x.extend(gt_traj[:, 0])
+            sub_y.extend(gt_traj[:, 1])
+        
+        if pred is not None and len(pred) > 0:
+            sub_x.extend(pred[:, 0])
+            sub_y.extend(pred[:, 1])
+        
+        # Set symmetric limits around origin for this subplot
+        max_range = max(max(np.abs(sub_x)), max(np.abs(sub_y)))
+        axis_limit = max_range * 1.1  # Add 10% padding
         
         # 1. Plot historical trajectory (blue)
         if hist_traj is not None and len(hist_traj) > 0:
@@ -76,7 +96,9 @@ def visualize_from_npz(npz_path, save_path):
         # Formatting
         ax.set_xlabel('Y (lateral / m)', fontsize=11)
         ax.set_ylabel('X (longitudinal / m)', fontsize=11)
-        #ax.set_aspect('equal')
+        ax.set_aspect('equal')  # XY等比例
+        ax.set_xlim(-axis_limit, axis_limit)  # 设置相同的x范围
+        ax.set_ylim(-axis_limit, axis_limit)  # 设置相同的y范围
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         ax.legend(fontsize=9, loc='best', framealpha=0.9)
         
@@ -84,8 +106,8 @@ def visualize_from_npz(npz_path, save_path):
         ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
         ax.axvline(x=0, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
     
-    # Adjust layout
-    plt.subplots_adjust(left=0.1, right=0.95, top=0.95, bottom=0.1, hspace=0.35, wspace=0.35)
+    # Adjust layout to maximize subplot space
+    plt.subplots_adjust(left=0.08, right=0.97, top=0.97, bottom=0.08, hspace=0.25, wspace=0.25)
     
     # Save
     plt.savefig(save_path, dpi=150, format='png')
