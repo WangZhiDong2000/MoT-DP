@@ -9,14 +9,12 @@ import carla
 from collections import deque
 import math
 import yaml
-from collections import OrderedDict
 import torch
 import numpy as np
 from PIL import Image
 from torchvision import transforms as T
 import imageio
-import laspy
-# /data/z_projects/carla
+
 # Add the project directories to the Python path
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
 leaderboard_root = os.path.join(project_root, 'leaderboard')
@@ -49,7 +47,7 @@ def get_entry_point():
 
 def create_carla_config(config_path=None):
     if config_path is None:
-        config_path = "/home/wang/Project/MoT-DP/config/b2d_8obs_20pred.yaml"
+        config_path = "/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
@@ -87,10 +85,6 @@ def load_best_model(checkpoint_path, config, device):
 class MOTAgent(autonomous_agent.AutonomousAgent):
 	def setup(self, path_to_conf_file):
 		self.track = autonomous_agent.Track.SENSORS
-		self.steer_step = 0
-		self.last_moving_status = 0
-		self.last_moving_step = -1
-		self.last_steers = deque()
 		if IS_BENCH2DRIVE:
 			self.save_name = path_to_conf_file.split('+')[-1]
 			self.config_path = path_to_conf_file.split('+')[0]
@@ -103,7 +97,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/b2d_best")
+		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP-1/checkpoints/carla_dit_best")
 		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
 
@@ -114,15 +108,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.save_path = None
 		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
 
-
-		self.last_steers = deque()
 		# self.lat_ref, self.lon_ref = 42.0, 2.0
 		if SAVE_PATH is not None:
 			now = datetime.datetime.now()
 			# string = pathlib.Path(os.environ['ROUTES']).stem + '_'
 			# string += self.save_name
 			string = self.save_name
-
 			print (string)
 
 		self.save_path = pathlib.Path(os.environ['SAVE_PATH']) / string
@@ -140,14 +131,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_lidar = None
 		
 		# Initialize observation history buffers for accumulating historical observations
-		obs_horizon = self.config.get('obs_horizon', 2)
+		obs_horizon = self.config.get('obs_horizon', 4)   
 		self.obs_horizon = obs_horizon
-		self.lidar_bev_history = deque(maxlen=obs_horizon)
-		self.speed_history = deque(maxlen=obs_horizon)
-		self.target_point_history = deque(maxlen=obs_horizon)
-		self.next_command_history = deque(maxlen=obs_horizon)
+		self.lidar_bev_history = deque(maxlen=obs_horizon*10) # tick frequency 20hz -> 2hz
+		self.rgb_history = deque(maxlen=obs_horizon*10)
+		self.speed_history = deque(maxlen=obs_horizon*10)
+		self.theta_history = deque(maxlen=obs_horizon*10)
+		self.throttle_history = deque(maxlen=obs_horizon*10)
+		self.next_command_history = deque(maxlen=obs_horizon*10)
+		self.target_point_history = deque(maxlen=obs_horizon*10)
+		self.waypoint_history = deque(maxlen=obs_horizon*10)
+		self.last_throttle = deque(maxlen=obs_horizon*10) 
+		self.last_brake = deque(maxlen=obs_horizon*10) 
+
 		
-		# Frame skip counter for 10Hz obs_dict construction (20Hz tick -> 10Hz obs_dict)
+		# Frame skip counter for 2Hz obs_dict construction (20Hz tick -> 2Hz obs_dict)
 		self.obs_accumulate_counter = 0
 
 	def _init(self):
@@ -177,9 +175,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		sensors =  [
 				{
 					'type': 'sensor.camera.rgb',
-					'x': 0.80, 'y': 0.0, 'z': 1.60,
+					'x': -1.50, 'y': 0.0, 'z': 2.0,
 					'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
-					'width': 1600, 'height': 900, 'fov': 70,
+					'width': 1024, 'height': 512, 'fov': 110,
 					'id': 'CAM_FRONT'
 					},
 				# lidar
@@ -304,6 +302,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		local_command_point = np.array([next_wp[0]-pos[0], next_wp[1]-pos[1]])
 		local_command_point = R.dot(local_command_point)
 		result['target_point'] = tuple(local_command_point)
+		result['theta']=theta
 
 		return result
 	
@@ -317,7 +316,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			control.steer = 0.0
 			control.throttle = 0.0
 			control.brake = 0.0
-			
 			return control
 
 		gt_velocity = torch.FloatTensor([tick_data['speed']]).to('cuda', dtype=torch.float32)
@@ -330,35 +328,60 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cmd_one_hot[command] = 1
 		cmd_one_hot = torch.tensor(cmd_one_hot).view(1, 6).to('cuda', dtype=torch.float32)
 		speed = torch.FloatTensor([float(tick_data['speed'])]).view(1,1).to('cuda', dtype=torch.float32)
+		theta = torch.FloatTensor([float(tick_data['theta'])]).view(1,1).to('cuda', dtype=torch.float32)
 		lidar = tick_data['lidar_bev'].to('cuda', dtype=torch.float32)
-		# Add batch dimension to lidar_bev: (C, H, W) -> (1, C, H, W)
-		lidar = lidar.unsqueeze(0)
+		rgb_front = tick_data['rgb_front'].to('cuda', dtype=torch.float32)
+		waypoint = tick_data['gps'].to('cuda', dtype=torch.float32)		
 		tick_data['target_point'] = [torch.FloatTensor([tick_data['target_point'][0]]),
 										torch.FloatTensor([tick_data['target_point'][1]])]
 		target_point = torch.stack(tick_data['target_point'], dim=1).to('cuda', dtype=torch.float32)
 
-		# Accumulate observation every 2 frames (20Hz tick -> 10Hz obs_dict)
-		self.obs_accumulate_counter += 1
-		if self.obs_accumulate_counter % 2 == 0:
-			# Accumulate observation history into buffers (only every 2 frames)
-			self.lidar_bev_history.append(lidar)
-			self.speed_history.append(speed)
-			self.target_point_history.append(target_point)
-			self.next_command_history.append(cmd_one_hot)
+
+		# Accumulate observation history into buffers 
+		self.lidar_bev_history.append(lidar)
+		self.rgb_history.append(rgb_front)
+		self.speed_history.append(speed)
+		self.target_point_history.append(target_point)
+		self.next_command_history.append(cmd_one_hot)
+		self.theta_history.append(theta)
+		self.waypoint_history.append(waypoint)
 		
 		# Build obs_dict from historical observations
-		lidar_list = list(self.lidar_bev_history)
-		speed_list = list(self.speed_history)
-		target_point_list = list(self.target_point_history)
-		cmd_list = list(self.next_command_history)
+		lidar_history_list = list(self.lidar_bev_history)
+		speed_history_list = list(self.speed_history)
+		target_point_history_list = list(self.target_point_history)
+		cmd_history_list = list(self.next_command_history)
+		theta_history_list = list(self.theta_history)
+		throttle_history_list = list(self.last_throttle)
+		brake_history_list = list(self.last_brake)
+		rgb_history_list = list(self.rgb_history)
+		waypoint_history_list = list(self.waypoint_history)
 		
-		# If buffer is empty or not full, pad with the current observation
+		# Sample every 10th element: indices 9, 19, 29, ..., (obs_horizon*10-1)
+		lidar_list = [lidar_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(lidar_history_list)]
+		speed_list = [speed_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(speed_history_list)]
+		target_point_list = [target_point_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(target_point_history_list)]
+		cmd_list = [cmd_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(cmd_history_list)]
+		theta_list = [theta_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(theta_history_list)]
+		throttle_list = [throttle_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(throttle_history_list)]
+		brake_list = [brake_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(brake_history_list)]
+		waypoint_list = [waypoint_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(waypoint_history_list)]
+		# sample every 5 for rgb
+		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
+		rgb_list = rgb_list[::-1]  # Reverse to get chronological order (oldest to newest)
+		
+		# If sampled list is empty or not full, pad with the current observation
 		if len(lidar_list) == 0:
 			# First few frames - initialize buffer with current observation
 			lidar_list = [lidar] * self.obs_horizon
 			speed_list = [speed] * self.obs_horizon
 			target_point_list = [target_point] * self.obs_horizon
 			cmd_list = [cmd_one_hot] * self.obs_horizon
+			rgb_list = [rgb_front] * 5
+			theta_list = [theta] * self.obs_horizon
+			throttle_list = [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
+			brake_list = [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
+			waypoint_list = [waypoint] * self.obs_horizon
 		elif len(lidar_list) < self.obs_horizon:
 			# Buffer not yet full - pad with the oldest observation
 			pad_size = self.obs_horizon - len(lidar_list)
@@ -366,20 +389,98 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			speed_list = [speed_list[0]] * pad_size + speed_list
 			target_point_list = [target_point_list[0]] * pad_size + target_point_list
 			cmd_list = [cmd_list[0]] * pad_size + cmd_list
+			theta_list = [theta_list[0]] * pad_size + theta_list if len(theta_list) > 0 else [theta] * self.obs_horizon
+			throttle_list = [throttle_list[0]] * pad_size + throttle_list if len(throttle_list) > 0 else [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
+			brake_list = [brake_list[0]] * pad_size + brake_list if len(brake_list) > 0 else [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
+			rgb_list = [rgb_front] * 5 if len(rgb_list) == 0 else rgb_list
+			waypoint_list = [waypoint_list[0]] * pad_size + waypoint_list if len(waypoint_list) > 0 else [waypoint] * self.obs_horizon
 		
-		# Stack along time dimension: from [(1, C, H, W), ...] to (1, obs_horizon, C, H, W)
+		# Stack along time dimension
 		lidar_stacked = torch.cat(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
 		speed_stacked = torch.cat(speed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
-		target_point_stacked = torch.cat(target_point_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		theta_stacked = torch.cat(theta_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
+		throttle_stacked = torch.cat(throttle_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
+		brake_stacked = torch.cat(brake_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
 		cmd_stacked = torch.cat(cmd_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 6)
+		target_point_stacked = torch.cat(target_point_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		waypoint_stacked = torch.cat(waypoint_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		rgb_stacked = torch.cat(rgb_list, dim=0).unsqueeze(0)  # (1, 5, C, H, W)
 		
-		obs_dict = {
+		# Transform historical waypoints and target_points to be relative to current position
+		# Current frame info for transformation
+		current_pos = tick_data['gps']  # numpy array [x, y]
+		current_theta = tick_data['theta']  # theta = compass - np.pi/2
+		current_R = np.array([
+			[np.cos(current_theta), np.sin(current_theta)],
+			[-np.sin(current_theta), np.cos(current_theta)]
+		])
+		
+		# Transform each historical waypoint to current frame
+		waypoint_relative_list = []
+		for i in range(self.obs_horizon):
+			past_waypoint = waypoint_stacked[0, i].cpu().numpy()  # [x, y] in global coordinates
+			# Transform: current_R.T @ (past - current)
+			relative_waypoint = current_R.T @ (past_waypoint - current_pos)
+			waypoint_relative_list.append(torch.from_numpy(relative_waypoint).float().to('cuda'))
+		
+		# Stack the transformed waypoints
+		waypoint_relative_stacked = torch.stack(waypoint_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		
+		# Transform each historical target_point to current frame
+		# target_point_list contains points that are relative to their respective historical frames
+		# We need to transform them to be relative to the current frame
+		target_point_relative_list = []
+		theta_history_list_np = [theta_list[i].cpu().numpy()[0, 0] for i in range(self.obs_horizon)]
+		waypoint_history_list_np = [waypoint_stacked[0, i].cpu().numpy() for i in range(self.obs_horizon)]
+		
+		for i in range(self.obs_horizon):
+			# Get target point in past frame's ego coordinate
+			target_in_past_frame = target_point_stacked[0, i].cpu().numpy()  # [x, y] relative to past frame
+			
+			# Get past frame's position and rotation
+			past_pos = waypoint_history_list_np[i]  # [x, y] in global coordinates
+			past_theta = theta_history_list_np[i]
+			past_R = np.array([
+				[np.cos(past_theta), np.sin(past_theta)],
+				[-np.sin(past_theta), np.cos(past_theta)]
+			])
+			
+			# Transform target point from past frame's ego coordinate to world coordinate
+			# target_world = past_R @ target_in_past_frame + past_pos
+			target_world = past_R @ target_in_past_frame + past_pos
+			
+			# Transform from world coordinate to current frame's ego coordinate
+			# target_in_current_frame = current_R.T @ (target_world - current_pos)
+			target_in_current_frame = current_R.T @ (target_world - current_pos)
+			
+			target_point_relative_list.append(torch.from_numpy(target_in_current_frame).float().to('cuda'))
+		
+		# Stack the transformed target points
+		target_point_relative_stacked = torch.stack(target_point_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		
+		# Concatenate all ego status features: speed + theta + throttle + brake + cmd + target_point_relative + waypoint_relative
+		# ego_status_stacked: (1, obs_horizon, 1+1+1+1+6+2+2) = (1, obs_horizon, 14)
+		ego_status_stacked = torch.cat([
+			speed_stacked,                  # (1, obs_horizon, 1)
+			theta_stacked,                  # (1, obs_horizon, 1)
+			throttle_stacked,               # (1, obs_horizon, 1)
+			brake_stacked,                  # (1, obs_horizon, 1)
+			cmd_stacked,                    # (1, obs_horizon, 6)
+			target_point_relative_stacked,  # (1, obs_horizon, 2) - target points in current frame
+			waypoint_relative_stacked       # (1, obs_horizon, 2) - ego positions in current frame
+		], dim=-1)  # Concatenate along feature dimension
+		
+		
+
+		mot_obs_dict = {
+				'rgb_hist': rgb_stacked,  # (1, 5, C, H, W)
+				'lidar_bev': lidar_list[-1].unsqueeze(0),  # (1, C, H, W)
+			}
+		dp_obs_dict = {
                 'lidar_bev': lidar_stacked,  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
-                'speed': speed_stacked,  # (B, obs_horizon, 1)
-                'target_point': target_point_stacked,  # (B, obs_horizon, 2)
-                'next_command': cmd_stacked,  # (B, obs_horizon, 6)
+                'ego_status': ego_status_stacked,  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
             }
-		result = self.net.predict_action(obs_dict)
+		result = self.net.predict_action(dp_obs_dict)
         
 		pred = torch.from_numpy(result['action'])
 		print(pred)
@@ -409,16 +510,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			max_throttle = 0.5
 		control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
 
-		# if control.brake > 0:
-		# 	control.brake = 1.0
-		# if control.brake > 0.5:
-		# 	control.throttle = float(0)
 
 		self.pid_metadata['steer'] = control.steer
 		self.pid_metadata['throttle'] = control.throttle
 		self.pid_metadata['brake'] = control.brake
 		metric_info = self.get_metric_info()
 		self.metric_info[self.step] = metric_info
+		self.last_brake.append(control.brake)
+		self.last_throttle.append(control.throttle)
 		if SAVE_PATH is not None and self.step % 1 == 0:
 			self.save(tick_data)
 		return control

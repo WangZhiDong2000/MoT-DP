@@ -80,7 +80,7 @@ policy:
   obs_as_cond: true
   n_cond_layers: 6
   action_horizon: 6
-  num_inference_steps: 5 # 100
+  num_inference_steps: 10 # 100
   use_anchor: false
 
 noise_scheduler:
