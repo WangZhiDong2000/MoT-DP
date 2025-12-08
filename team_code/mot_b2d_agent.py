@@ -814,8 +814,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			dp_obs_dict = {
 	                'lidar_bev': lidar_stacked,  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
 	                'ego_status': ego_status_stacked,  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
-					'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to(device),  # (1, ...)
-                	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to(device),  # (1, ...)
+					'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to('cuda'),  
+                	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to('cuda'),  
 	            }
 			result = self.net.predict_action(dp_obs_dict)
 			pred = torch.from_numpy(result['action'])
