@@ -32,6 +32,27 @@ from team_code.planner import RoutePlanner
 from team_code.controller_pid import WaypointPIDController
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 from scipy.optimize import fsolve
+# mot dependencies
+from transformers import HfArgumentParser
+import json
+from dataclasses import dataclass, field
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+from PIL import Image
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+sys.path.append(os.path.join(project_root, 'mot'))
+from safetensors.torch import load_file
+import glob
+from data.reasoning.data_utils import add_special_tokens
+from mot.modeling.automotive import (
+    AutoMoTConfig, AutoMoT,
+    Qwen3VLTextConfig, Qwen3VLTextModel, Qwen3VLForConditionalGenerationMoT
+)
+from dataset.unified_carla_dataset import CARLAImageDataset
+from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
+from mot.evaluation.inference import InterleaveInferencer
+from transformers import AutoTokenizer
 
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
@@ -42,7 +63,7 @@ print(PLANNER_TYPE)
 print('*'*10)
 EARTH_RADIUS_EQUA = 6378137.0
 
-
+# dp utils
 def get_entry_point():
 	return 'MOTAgent'
 
@@ -81,7 +102,260 @@ def load_best_model(checkpoint_path, config, device):
 
     return policy
 
+# mot utils
+@dataclass
+class ModelArguments:
+    model_path: str = field(
+        default="/mnt/data/qihang_projects/load_qwen3_vl_4b_fast_thinking_origin/0007200",
+        metadata={"help": "Path to the converted AutoMoT model checkpoint"}
+    )
+    qwen3vl_path: str = field(
+        default="/mnt/data/models/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17",
+        metadata={"help": "Path to the Qwen3VL base model for config loading"}
+    )
+    max_latent_size: int = field(
+        default=64,
+        metadata={"help": "Maximum size of latent representations"}
+    )
+    latent_patch_size: int = field(
+        default=2,
+        metadata={"help": "Patch size for latent space processing"}
+    )
+    vit_max_num_patch_per_side: int = field(
+        default=70,
+        metadata={"help": "Maximum number of patches per side for vision transformer"}
+    )
+    connector_act: str = field(
+        default="gelu_pytorch_tanh",
+        metadata={"help": "Activation function for connector layers"}
+    )
+    mot_num_attention_heads: int = field(
+        default=16,
+        metadata={"help": "Number of attention heads for MoT attention components. Defaults to half of regular attention heads if not specified."}
+    )
+    mot_num_key_value_heads: int = field(
+        default=4,
+        metadata={"help": "Number of key-value heads for MoT attention components. Defaults to half of regular KV heads if not specified."}
+    )
+    mot_intermediate_size: int = field(
+        default=4864,
+        metadata={"help": "Intermediate size for MoT MLP components. Defaults to same as regular intermediate_size if not specified."}
+    )
+    reasoning_query_dim: int = field(
+        default=588,
+        metadata={"help": "Dimension of the reasoning query embedding."}
+    )
+    reasoning_query_max_num_tokens: int = field(
+        default=8, #256, #64,
+        metadata={"help": "Maximum number of tokens in the reasoning query."}
+    )
 
+@dataclass
+class InferenceArguments:
+    dataset_jsonl: str = field(
+        default="b2d_data_val.jsonl",
+        metadata={"help": "Path to the input dataset JSONL file"}
+    )
+    output_jsonl: str = field(
+        default="",
+        metadata={"help": "Path to the output JSONL file. If empty, will use input filename with .pred.jsonl suffix"}
+    )
+    base_path: str = field(
+        default="/share-data/pdm_lite",
+        metadata={"help": "Base path for resolving relative image paths. If empty, use current working directory"}
+    )
+    visual_gen: bool = field(
+        default=True,
+        metadata={"help": "Enable visual generation capabilities"}
+    )
+    visual_und: bool = field(
+        default=True,
+        metadata={"help": "Enable visual understanding capabilities"}
+    )
+    max_num_tokens: int = field(
+        default=16384,
+        metadata={"help": "Maximum number of tokens for inference"}
+    )
+    start_idx: int = field(
+        default=0,
+        metadata={"help": "Starting index for processing dataset samples"}
+    )
+    max_samples: int = field(
+        default=-1,
+        metadata={"help": "Maximum number of samples to process. -1 means process all samples"}
+    )
+
+def load_safetensors_weights(model_path):
+    """Load weights from single or multiple safetensors files."""
+    # Try single file first (like AutoMoT 2B)
+    single_file = os.path.join(model_path, "model.safetensors")
+    if os.path.exists(single_file):
+        print(f"Loading from single file: {single_file}")
+        return load_file(single_file)
+    
+    # Try multiple files (like Qwen3VL-4B)
+    pattern = os.path.join(model_path, "model-*.safetensors")
+    safetensor_files = sorted(glob.glob(pattern))
+    
+    if not safetensor_files:
+        raise FileNotFoundError(f"No safetensors files found in {model_path}")
+    
+    print(f"Loading from multiple files: {safetensor_files}")
+    combined_state_dict = {}
+    
+    for file_path in safetensor_files:
+        file_state_dict = load_file(file_path)
+        combined_state_dict.update(file_state_dict)
+        print(f"Loaded {len(file_state_dict)} parameters from {os.path.basename(file_path)}")
+    
+    print(f"Total loaded parameters: {len(combined_state_dict)}")
+    return combined_state_dict
+
+def convert_model_dtype_with_exceptions(model, target_dtype, exclude_buffer_patterns=None):
+    if exclude_buffer_patterns is None:
+        exclude_buffer_patterns = []
+    
+    for name, param in model.named_parameters():
+        param.data = param.data.to(target_dtype)
+
+    for name, buffer in model.named_buffers():
+        should_exclude = any(pattern in name for pattern in exclude_buffer_patterns)
+        
+        if should_exclude:
+            print(f"⊗ Skipped buffer: {name} (kept as {buffer.dtype})")
+        else:
+            buffer.data = buffer.data.to(target_dtype)
+            print(f"✓ Converted buffer: {name} to {target_dtype}")   
+    return model
+
+def load_model_mot(device):
+
+    parser = HfArgumentParser((ModelArguments, InferenceArguments))
+    model_args, inference_args = parser.parse_args_into_dataclasses()
+    qwen3vl_config_path = model_args.qwen3vl_path
+    
+    # Load the unified config and extract text_config and vision_config
+    with open(f"{qwen3vl_config_path}/config.json", "r") as f:
+        full_config = json.load(f)
+    
+    # Extract and create LLM config using Qwen3VL LLM with mRoPE support
+    text_config_dict = full_config["text_config"]
+    llm_config = Qwen3VLTextConfig(**text_config_dict)
+    llm_config.qk_norm = True
+    llm_config.tie_word_embeddings = True #False
+    llm_config.layer_module = "Qwen3VLMoTDecoderLayer"  # Disable MoT for debugging
+    # llm_config.layer_module = "Qwen3VLMoTDecoderLayer"  
+    llm_config.mot_num_attention_heads = model_args.mot_num_attention_heads
+    llm_config.mot_num_key_value_heads = model_args.mot_num_key_value_heads
+    llm_config.mot_intermediate_size = model_args.mot_intermediate_size
+
+    # Extract and create Vision config
+    vision_config_dict = full_config["vision_config"]
+    vit_config = Qwen3VLVisionConfig(**vision_config_dict)
+
+    config = AutoMoTConfig(
+        visual_gen=inference_args.visual_gen,
+        visual_und=inference_args.visual_und,
+        llm_config=llm_config,
+        vision_config=vit_config,  # Changed from vit_config to vision_config
+        latent_patch_size=model_args.latent_patch_size,
+        max_latent_size=model_args.max_latent_size,
+        connector_act=model_args.connector_act,
+        reasoning_query_dim=model_args.reasoning_query_dim,
+        reasoning_query_tokens=model_args.reasoning_query_max_num_tokens,
+        interpolate_pos=False,
+    )
+
+    # Initialize model with Qwen3VL LLM (supports mRoPE)
+    language_model = Qwen3VLForConditionalGenerationMoT(llm_config)
+    vit_model = Qwen3VLVisionModel(vit_config)
+    # print(f"Debug - Official vision config: depth={vit_config.depth}, hidden_size={vit_config.hidden_size}, out_hidden_size={vit_config.out_hidden_size}")
+    model = AutoMoT(language_model, vit_model, config)
+    model.to(device)
+    state_dict = load_safetensors_weights(model_args.model_path)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    # Filter out lm_head.weight from missing keys if tie_word_embeddings=True
+    actual_missing_keys = [k for k in missing_keys if k != 'language_model.lm_head.weight']
+    print(f"Loaded weights: {len(actual_missing_keys)} missing, {len(unexpected_keys)} unexpected")
+    device_map = {"": "cuda:0"}
+    if actual_missing_keys:
+        print(f"Missing keys: {actual_missing_keys[:10]}")
+    if unexpected_keys:
+        print(f"Unexpected keys: {unexpected_keys[:5]}")
+    # Move to device and siet dtype
+    # model = model.to(device_map[""]).eval().to(torch.bfloat16)
+    model = model.to(device_map[""]).eval()
+    model = convert_model_dtype_with_exceptions(
+        model,
+        torch.bfloat16,
+        exclude_buffer_patterns=['inv_freq']
+    )
+    # Verify tie_word_embeddings is working correctly
+    embed_weight = model.language_model.model.embed_tokens.weight
+    lm_head_weight = model.language_model.lm_head.weight
+    weights_tied = embed_weight is lm_head_weight
+    weights_equal = torch.equal(embed_weight, lm_head_weight)
+    embed_norm = torch.norm(embed_weight).item()
+    
+    print(f"Weight tying verification:")
+    print(f"  - Weights are tied (same object): {weights_tied}")
+    print(f"  - Weight values are equal: {weights_equal}")
+    print(f"  - embed_tokens weight norm: {embed_norm:.4f} (should be > 100, not random)")
+    
+    if not weights_tied or not weights_equal:
+        print("WARNING: tie_word_embeddings may not be working correctly!")
+    elif embed_norm < 10:
+        print("WARNING: embed_tokens weights appear to be randomly initialized!")
+    else:
+        print("✓ tie_word_embeddings is working correctly")
+    
+    # Explicitly move any remaining CPU tensors to GPU
+    print("Ensuring all parameters are on CUDA...")
+    for name, param in model.named_parameters():
+        if param.device.type == 'cpu':
+            print(f"Moving {name} from CPU to CUDA")
+            param.data = param.data.to("cuda:0")
+    
+    for name, buffer in model.named_buffers():
+        if buffer.device.type == 'cpu':
+            print(f"Moving buffer {name} from CPU to CUDA")
+            buffer.data = buffer.data.to("cuda:0")
+
+    print("Model loaded successfully")
+
+    return model
+
+def attach_debugger():
+    import debugpy
+    debugpy.listen(5683)
+    print("Waiting for debugger!")
+    debugpy.wait_for_client()
+    print("Attached!")
+
+def build_cleaned_prompt_and_modes(target_point):
+
+    if isinstance(target_point, torch.Tensor):
+        tp = target_point.detach().cpu().view(-1)
+        x, y = float(tp[0].item()), float(tp[1].item())
+    elif isinstance(target_point, np.ndarray):
+        tp = target_point.reshape(-1)
+        x, y = float(tp[0]), float(tp[1])
+    elif isinstance(target_point, (list, tuple)):
+        assert len(target_point) >= 2
+        x, y = float(target_point[0]), float(target_point[1])
+    else:
+        raise TypeError(f"Unsupported type for target_point: {type(target_point)}")
+
+    x_str = f"{x:.6f}"
+    y_str = f"{y:.6f}"
+
+    prompt = f"Your target point is ({x_str}, {y_str}), what's your driving suggestion?"
+
+    understanding_output = False
+    reasoning_output = True
+
+    return prompt, understanding_output, reasoning_output
 
 class MOTAgent(autonomous_agent.AutonomousAgent):
 	def setup(self, path_to_conf_file):
@@ -96,11 +370,31 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.wall_start = time.time()
 		self.initialized = False
 
+		# Load diffusion policy
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP-1/checkpoints/carla_dit_best")
 		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
+		print("✓ Diffusion policy loaded.")
+
+		# Load MoT model
+		parser = HfArgumentParser((ModelArguments, InferenceArguments))
+		model_args, inference_args = parser.parse_args_into_dataclasses()
+		self.AutoMoT = load_model_mot(device)
+		tokenizer = AutoTokenizer.from_pretrained(model_args.qwen3vl_path)
+		tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
+		self.AutoMoT.language_model.tokenizer = tokenizer
+		self.inferencer = InterleaveInferencer(
+        model=self.AutoMoT,
+        vae_model=None,
+        tokenizer=tokenizer,
+        vae_transform=None,
+        vit_transform=None,  # Not used for Qwen3VL, handled internally by model
+        new_token_ids=new_token_ids,
+        max_num_tokens=inference_args.max_num_tokens,
+    	)
+		print("✓ MoT model loaded.")
 		
 		# Initialize PID controller
 		self.pid_controller = WaypointPIDController(self.config)
@@ -493,18 +787,35 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				tick_data, lidar, rgb_front, speed, theta, target_point, 
 				cmd_one_hot, waypoint
 			)
-
+			# Get MoT reasoning
 			mot_obs_dict = {
-					'rgb_hist': rgb_stacked,  # (1, 5, C, H, W)
 					'lidar_bev': lidar_stacked[:, -1, :, :, :],  # (1, C, H, W) - last frame
+					'rgb_hist_jpg': rgb_stacked,  # (1, 5, C, H, W)
+					'target_point': target_point,  # (1, 2)
 				}
+			prompt_cleaned , understanding_output, reasoning_output = build_cleaned_prompt_and_modes(mot_obs_dict['target_point'])
+			predicted_answer = self.inferencer(
+                image=mot_obs_dict["rgb_hist_jpg"],
+                lidar=mot_obs_dict["lidar_bev"],
+                text=prompt_cleaned,
+                understanding_output=understanding_output,
+                reasoning_output=reasoning_output,
+                max_think_token_n=self.inference_args.max_num_tokens,
+                do_sample=False,
+                text_temperature=0.0,
+            )
+
+			# Get diffusion policy action
 			dp_obs_dict = {
 	                'lidar_bev': lidar_stacked,  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
 	                'ego_status': ego_status_stacked,  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
+					'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to(device),  # (1, ...)
+                	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to(device),  # (1, ...)
 	            }
 			result = self.net.predict_action(dp_obs_dict)
-	        
 			pred = torch.from_numpy(result['action'])
+
+			# Control with PID controller
 			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(pred, gt_velocity, target_point)
 			# if brake_traj < 0.05: brake_traj = 0.0
 			# if throttle_traj > brake_traj: brake_traj = 0.0
