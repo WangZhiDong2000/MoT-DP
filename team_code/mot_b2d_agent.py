@@ -33,6 +33,9 @@ from team_code.controller_pid import WaypointPIDController
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 from scipy.optimize import fsolve
 # mot dependencies
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+sys.path.append(os.path.join(project_root, 'mot'))
 from transformers import HfArgumentParser
 import json
 from dataclasses import dataclass, field
@@ -278,14 +281,15 @@ def load_model_mot(device):
     # Filter out lm_head.weight from missing keys if tie_word_embeddings=True
     actual_missing_keys = [k for k in missing_keys if k != 'language_model.lm_head.weight']
     print(f"Loaded weights: {len(actual_missing_keys)} missing, {len(unexpected_keys)} unexpected")
-    device_map = {"": "cuda:0"}
+    # Use the device parameter instead of hardcoding cuda:0
+    device_str = str(device) if isinstance(device, torch.device) else device
     if actual_missing_keys:
         print(f"Missing keys: {actual_missing_keys[:10]}")
     if unexpected_keys:
         print(f"Unexpected keys: {unexpected_keys[:5]}")
-    # Move to device and siet dtype
-    # model = model.to(device_map[""]).eval().to(torch.bfloat16)
-    model = model.to(device_map[""]).eval()
+    # Move to device and set dtype
+    # model = model.to(device).eval().to(torch.bfloat16)
+    model = model.to(device).eval()
     model = convert_model_dtype_with_exceptions(
         model,
         torch.bfloat16,
@@ -315,12 +319,12 @@ def load_model_mot(device):
     for name, param in model.named_parameters():
         if param.device.type == 'cpu':
             print(f"Moving {name} from CPU to CUDA")
-            param.data = param.data.to("cuda:0")
+            param.data = param.data.to(device)
     
     for name, buffer in model.named_buffers():
         if buffer.device.type == 'cpu':
             print(f"Moving buffer {name} from CPU to CUDA")
-            buffer.data = buffer.data.to("cuda:0")
+            buffer.data = buffer.data.to(device)
 
     print("Model loaded successfully")
 
@@ -364,6 +368,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.save_name = path_to_conf_file.split('+')[-1]
 			self.config_path = path_to_conf_file.split('+')[0]
 		else:
+			now = datetime.datetime.now()
 			self.config_path = path_to_conf_file
 			self.save_name = '_'.join(map(lambda x: '%02d' % x, (now.month, now.day, now.hour, now.minute, now.second)))
 		self.step = -1
@@ -935,8 +940,53 @@ def algin_lidar(lidar, translation, yaw):
 
 
 if __name__ == "__main__":
-	test_config = create_carla_config()
-	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-	checkpoint_base_path = test_config.get('training', {}).get('checkpoint_dir')
-	checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
-	policy = load_best_model(checkpoint_path, test_config, device)
+	print("="*60)
+	print("Testing MOTAgent setup method")
+	print("="*60)
+	
+	# Test setup method
+	try:
+		# Create agent instance
+		agent = MOTAgent()
+		print("✓ MOTAgent instance created successfully")
+		
+		# Test with a mock config file path
+		# Set environment variable to avoid SAVE_PATH issues
+		os.environ['SAVE_PATH'] = '/tmp/mot_test'
+		
+		# Create a test config path
+		test_config_path = "/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml"
+		
+		print(f"\nTesting setup with config: {test_config_path}")
+		print("-"*60)
+		
+		# Call setup method
+		agent.setup(test_config_path)
+		
+		print("\n" + "="*60)
+		print("✓ Setup completed successfully!")
+		print("="*60)
+		
+		# Verify key attributes are initialized
+		print("\nVerifying initialized attributes:")
+		print(f"  - config loaded: {agent.config is not None}")
+		print(f"  - diffusion policy loaded: {agent.net is not None}")
+		print(f"  - MoT model loaded: {agent.AutoMoT is not None}")
+		print(f"  - inferencer initialized: {agent.inferencer is not None}")
+		print(f"  - PID controller initialized: {agent.pid_controller is not None}")
+		print(f"  - obs_horizon: {agent.obs_horizon}")
+		print(f"  - initialized flag: {agent.initialized}")
+		
+	except Exception as e:
+		print("\n" + "="*60)
+		print("✗ Setup failed with error:")
+		print("="*60)
+		import traceback
+		traceback.print_exc()
+		print("\nError details:")
+		print(f"  Type: {type(e).__name__}")
+		print(f"  Message: {str(e)}")
+	
+	print("\n" + "="*60)
+	print("Test completed")
+	print("="*60)
