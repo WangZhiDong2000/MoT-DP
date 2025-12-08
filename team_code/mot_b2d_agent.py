@@ -108,6 +108,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.save_path = None
 		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
 
+		# Store previous control for odd steps
+		self.prev_control = None
 
 		# self.lat_ref, self.lon_ref = 42.0, 2.0
 		if SAVE_PATH is not None:
@@ -142,8 +144,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.next_command_history = deque(maxlen=obs_horizon*10)
 		self.target_point_history = deque(maxlen=obs_horizon*10)
 		self.waypoint_history = deque(maxlen=obs_horizon*10)
-		self.last_throttle = deque(maxlen=obs_horizon*10) 
-		self.last_brake = deque(maxlen=obs_horizon*10) 
+		self.throttle_history = deque(maxlen=obs_horizon*10) 
+		self.brake_history = deque(maxlen=obs_horizon*10) 
 
 		
 		# Frame skip counter for 2Hz obs_dict construction (20Hz tick -> 2Hz obs_dict)
@@ -187,8 +189,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		target_point_history_list = list(self.target_point_history)
 		cmd_history_list = list(self.next_command_history)
 		theta_history_list = list(self.theta_history)
-		throttle_history_list = list(self.last_throttle)
-		brake_history_list = list(self.last_brake)
+		throttle_history_list = list(self.throttle_history)
+		brake_history_list = list(self.brake_history)
 		rgb_history_list = list(self.rgb_history)
 		waypoint_history_list = list(self.waypoint_history)
 		
@@ -453,6 +455,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			control.steer = 0.0
 			control.throttle = 0.0
 			control.brake = 0.0
+			self.prev_control = control
 			return control
 
 		gt_velocity = torch.FloatTensor([tick_data['speed']]).to('cuda', dtype=torch.float32)
@@ -483,58 +486,68 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.theta_history.append(theta)
 		self.waypoint_history.append(waypoint)
 		
-		# Build observation dictionaries from historical data
-		lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
-			tick_data, lidar, rgb_front, speed, theta, target_point, 
-			cmd_one_hot, waypoint
-		)
+		# Only compute new action and control on even steps
+		if self.step % 2 == 0:
+			# Build observation dictionaries from historical data
+			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
+				tick_data, lidar, rgb_front, speed, theta, target_point, 
+				cmd_one_hot, waypoint
+			)
 
-		mot_obs_dict = {
-				'rgb_hist': rgb_stacked,  # (1, 5, C, H, W)
-				'lidar_bev': lidar_stacked[:, -1, :, :, :],  # (1, C, H, W) - last frame
-			}
-		dp_obs_dict = {
-                'lidar_bev': lidar_stacked,  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
-                'ego_status': ego_status_stacked,  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
-            }
-		result = self.net.predict_action(dp_obs_dict)
-        
-		pred = torch.from_numpy(result['action'])
-		print(pred)
-		steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(pred, gt_velocity, target_point)
-		# if brake_traj < 0.05: brake_traj = 0.0
-		# if throttle_traj > brake_traj: brake_traj = 0.0
+			mot_obs_dict = {
+					'rgb_hist': rgb_stacked,  # (1, 5, C, H, W)
+					'lidar_bev': lidar_stacked[:, -1, :, :, :],  # (1, C, H, W) - last frame
+				}
+			dp_obs_dict = {
+	                'lidar_bev': lidar_stacked,  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
+	                'ego_status': ego_status_stacked,  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
+	            }
+			result = self.net.predict_action(dp_obs_dict)
+	        
+			pred = torch.from_numpy(result['action'])
+			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(pred, gt_velocity, target_point)
+			# if brake_traj < 0.05: brake_traj = 0.0
+			# if throttle_traj > brake_traj: brake_traj = 0.0
 
-		control = carla.VehicleControl()
+			control = carla.VehicleControl()
 
-		self.pid_metadata = metadata_traj
-		self.pid_metadata['agent'] = 'only_traj'
-		control.steer = np.clip(float(steer_traj), -1, 1)
-		control.throttle = np.clip(float(throttle_traj), 0, 0.75)
-		control.brake = np.clip(float(brake_traj), 0, 1)
+			self.pid_metadata = metadata_traj
+			self.pid_metadata['agent'] = 'only_traj'
+			control.steer = np.clip(float(steer_traj), -1, 1)
+			control.throttle = np.clip(float(throttle_traj), 0, 0.75)
+			control.brake = np.clip(float(brake_traj), 0, 1)
+			
+			self.pid_metadata['steer_traj'] = float(steer_traj)
+			self.pid_metadata['throttle_traj'] = float(throttle_traj)
+			self.pid_metadata['brake_traj'] = float(brake_traj)
+
+			if abs(control.steer) > 0.07: ## In turning
+				speed_threshold = 1.0 ## Avoid stuck during turning
+			else:
+				speed_threshold = 1.5 ## Avoid pass stop/red light/collision
+			if float(tick_data['speed']) > speed_threshold:
+				max_throttle = 0.05
+			else:
+				max_throttle = 0.5
+			control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
+
+
+			self.pid_metadata['steer'] = control.steer
+			self.pid_metadata['throttle'] = control.throttle
+			self.pid_metadata['brake'] = control.brake
+			
+			# Store control for next odd step
+			self.prev_control = control
+		else:
+			# On odd steps, use previous control
+			control = self.prev_control if self.prev_control is not None else carla.VehicleControl()
+			self.pid_metadata = {}
+			self.pid_metadata['agent'] = 'reused_control'
 		
-		self.pid_metadata['steer_traj'] = float(steer_traj)
-		self.pid_metadata['throttle_traj'] = float(throttle_traj)
-		self.pid_metadata['brake_traj'] = float(brake_traj)
-
-		if abs(control.steer) > 0.07: ## In turning
-			speed_threshold = 1.0 ## Avoid stuck during turning
-		else:
-			speed_threshold = 1.5 ## Avoid pass stop/red light/collision
-		if float(tick_data['speed']) > speed_threshold:
-			max_throttle = 0.05
-		else:
-			max_throttle = 0.5
-		control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
-
-
-		self.pid_metadata['steer'] = control.steer
-		self.pid_metadata['throttle'] = control.throttle
-		self.pid_metadata['brake'] = control.brake
 		metric_info = self.get_metric_info()
 		self.metric_info[self.step] = metric_info
-		self.last_brake.append(control.brake)
-		self.last_throttle.append(control.throttle)
+		self.brake_history.append(control.brake)
+		self.throttle_history.append(control.throttle)
 		if SAVE_PATH is not None and self.step % 1 == 0:
 			self.save(tick_data)
 		return control
