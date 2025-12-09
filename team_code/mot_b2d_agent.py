@@ -847,7 +847,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				max_throttle = 0.5
 			control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
 
-
 			self.pid_metadata['steer'] = control.steer
 			self.pid_metadata['throttle'] = control.throttle
 			self.pid_metadata['brake'] = control.brake
