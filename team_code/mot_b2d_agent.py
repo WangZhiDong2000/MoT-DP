@@ -575,12 +575,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		brake_list = brake_list[::-1]
 		waypoint_list = waypoint_list[::-1]
 		
-		# Debug: print list lengths before padding
-		print(f"DEBUG: List lengths before padding - lidar:{len(lidar_list)}, speed:{len(speed_list)}, theta:{len(theta_list)}, throttle:{len(throttle_list)}, brake:{len(brake_list)}, waypoint:{len(waypoint_list)}, rgb:{len(rgb_list)}")
-		
 		# sample every 5 for rgb from the end
 		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
 		rgb_list = rgb_list[::-1]  # Reverse to get chronological order (oldest to newest)
+		
+		# Debug: print list lengths before padding
+		print(f"DEBUG: List lengths before padding - lidar:{len(lidar_list)}, speed:{len(speed_list)}, theta:{len(theta_list)}, throttle:{len(throttle_list)}, brake:{len(brake_list)}, waypoint:{len(waypoint_list)}, rgb:{len(rgb_list)}")
 		
 		# If sampled list is empty or not full, pad with the current observation
 		if len(lidar_list) == 0:
@@ -880,7 +880,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.waypoint_history.append(waypoint)
 		
 		# Append throttle and brake from previous step (or 0 for first step)
-		if self.step == 0:
+		if self.step == 1:
 			# First step: initialize with 0
 			self.throttle_history.append(torch.tensor(0.0).view(1, 1).to('cuda'))
 			self.brake_history.append(torch.tensor(0.0).view(1, 1).to('cuda'))
