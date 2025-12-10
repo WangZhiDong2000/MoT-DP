@@ -124,12 +124,29 @@ class WaypointPIDController:
 		steer = np.clip(steer, -1.0, 1.0)
 
 		speed = velocity[0].data.cpu().numpy()
-		brake = desired_speed < self.brake_speed or (speed / desired_speed) > self.brake_ratio
-
+		
+		# Safer braking logic - brake more readily
+		should_brake = desired_speed < self.brake_speed or (speed / desired_speed) > self.brake_ratio
+		
+		# Calculate throttle based on speed difference
 		delta = np.clip(desired_speed - speed, 0.0, self.clip_delta)
 		throttle = self.speed_controller.step(delta)
 		throttle = np.clip(throttle, 0.0, self.max_throttle)
-		throttle = throttle if not brake else 0.0
+		
+		# Braking logic with graduated response
+		if should_brake:
+			throttle = 0.0
+			# Progressive braking - stronger brake for more overspeed
+			if speed > desired_speed:
+				# More aggressive braking formula for safety
+				overspeed = speed - desired_speed
+				brake_intensity = min(1.0, overspeed / max(desired_speed * 0.3, 0.5))  # Brake harder, faster
+				brake = float(np.clip(brake_intensity, 0.3, 1.0))  # Minimum 0.3 brake when needed
+			else:
+				brake = 0.8  # Strong brake for very low desired speed
+		else:
+			brake = 0.0
+			throttle = throttle  # Use PID output directly
 
 		metadata = {
 			'speed': float(speed.astype(np.float64)),

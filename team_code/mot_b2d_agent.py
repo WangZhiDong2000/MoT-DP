@@ -579,40 +579,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
 		rgb_list = rgb_list[::-1]  # Reverse to get chronological order (oldest to newest)
 		
-		# Debug: print list lengths before padding
-		print(f"DEBUG: List lengths before padding - lidar:{len(lidar_list)}, speed:{len(speed_list)}, theta:{len(theta_list)}, throttle:{len(throttle_list)}, brake:{len(brake_list)}, waypoint:{len(waypoint_list)}, rgb:{len(rgb_list)}")
-		
-		# If sampled list is empty or not full, pad with the current observation
-		if len(lidar_list) == 0:
-			# First few frames - initialize buffer with current observation
-			lidar_list = [lidar] * self.obs_horizon
-			speed_list = [speed] * self.obs_horizon
-			target_point_list = [target_point] * self.obs_horizon
-			cmd_list = [cmd_one_hot] * self.obs_horizon
-			rgb_list = [rgb_front] * 5
-			theta_list = [theta] * self.obs_horizon
-			throttle_list = [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
-			brake_list = [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
-			waypoint_list = [waypoint] * self.obs_horizon
-		elif len(lidar_list) < self.obs_horizon:
-			# Buffer not yet full - pad with the oldest observation
-			pad_size = self.obs_horizon - len(lidar_list)
-			lidar_list = [lidar_list[0]] * pad_size + lidar_list
-			speed_list = [speed_list[0]] * pad_size + speed_list
-			target_point_list = [target_point_list[0]] * pad_size + target_point_list
-			cmd_list = [cmd_list[0]] * pad_size + cmd_list
-			theta_list = [theta_list[0]] * pad_size + theta_list if len(theta_list) > 0 else [theta] * self.obs_horizon
-			throttle_list = [throttle_list[0]] * pad_size + throttle_list if len(throttle_list) > 0 else [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
-			brake_list = [brake_list[0]] * pad_size + brake_list if len(brake_list) > 0 else [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
-			waypoint_list = [waypoint_list[0]] * pad_size + waypoint_list if len(waypoint_list) > 0 else [waypoint] * self.obs_horizon
-		
-		# Pad RGB list if needed (separate check since RGB has different sample rate)
-		if len(rgb_list) < 5:
-			if len(rgb_list) == 0:
-				rgb_list = [rgb_front] * 5
-			else:
-				rgb_pad_size = 5 - len(rgb_list)
-				rgb_list = [rgb_list[0]] * rgb_pad_size + rgb_list
+		# Debug: print list lengths (no padding needed - buffer is guaranteed to be full)
+		print(f"DEBUG: List lengths - lidar:{len(lidar_list)}, speed:{len(speed_list)}, theta:{len(theta_list)}, throttle:{len(throttle_list)}, brake:{len(brake_list)}, waypoint:{len(waypoint_list)}, rgb:{len(rgb_list)}")
 		
 		# Stack along time dimension
 		lidar_stacked = torch.stack(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
@@ -837,14 +805,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if not self.initialized:
 			self._init()
 		tick_data = self.tick(input_data)
-		if self.step < 1:
-			control = carla.VehicleControl()
-			control.steer = 0.0
-			control.throttle = 1.0
-			control.brake = 0.0
-			self.prev_control = control
-			return control
-
+		
+		# Prepare current observations
 		gt_velocity = torch.FloatTensor([tick_data['speed']]).to('cuda', dtype=torch.float32)
 		command = tick_data['next_command']
 		if command < 0:
@@ -869,7 +831,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 										torch.FloatTensor([tick_data['target_point'][1]])]
 		target_point = torch.stack(tick_data['target_point'], dim=1).to('cuda', dtype=torch.float32)
 
-
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
 		self.rgb_history.append(rgb_front)
@@ -880,7 +841,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.waypoint_history.append(waypoint)
 		
 		# Append throttle and brake from previous step (or 0 for first step)
-		if self.step == 1:
+		if self.step < 1:
 			# First step: initialize with 0
 			self.throttle_history.append(torch.tensor(0.0).view(1, 1).to('cuda'))
 			self.brake_history.append(torch.tensor(0.0).view(1, 1).to('cuda'))
@@ -890,8 +851,22 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.throttle_history.append(torch.tensor(prev_control.throttle).view(1, 1).to('cuda'))
 			self.brake_history.append(torch.tensor(prev_control.brake).view(1, 1).to('cuda'))
 		
-		# Only compute new action and control on even steps
-		if (self.step+1) % 2 == 0:
+		# Check if buffer is full (need at least 31 steps for sampling -1, -11, -21, -31)
+		buffer_size_needed = 31  # For obs_horizon=4, need at least 31 elements
+		buffer_is_full = len(self.lidar_bev_history) >= buffer_size_needed
+		
+		if not buffer_is_full:
+			# Buffer not full yet - use simple control to fill buffer
+			control = carla.VehicleControl()
+			control.steer = 0.0
+			control.throttle = 1.0
+			control.brake = 0.0
+			self.prev_control = control
+			self.pid_metadata = {}
+			self.pid_metadata['agent'] = 'filling_buffer'
+			print(f"Filling buffer: {len(self.lidar_bev_history)}/{buffer_size_needed}")
+		elif (self.step+1) % 2 == 0:
+			# Buffer is full and it's time to update (even steps)
 			# Build observation dictionaries from historical data
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
 				tick_data, lidar, rgb_front, speed, theta, target_point, 
@@ -944,29 +919,47 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 			# Control with PID controller
 			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(pred, gt_velocity, target_point)
-			# if brake_traj < 0.05: brake_traj = 0.0
-			# if throttle_traj > brake_traj: brake_traj = 0.0
 
 			control = carla.VehicleControl()
 
 			self.pid_metadata = metadata_traj
 			self.pid_metadata['agent'] = 'only_traj'
+			
+			# Use PID outputs with reasonable limits
 			control.steer = np.clip(float(steer_traj), -1, 1)
-			control.throttle = np.clip(float(throttle_traj), 0, 0.75)
+			control.throttle = np.clip(float(throttle_traj), 0.0, 0.75)
 			control.brake = np.clip(float(brake_traj), 0, 1)
+			
+			# Reduce micro-braking noise
+			if control.brake < 0.05:
+				control.brake = 0.0
 			
 			self.pid_metadata['steer_traj'] = float(steer_traj)
 			self.pid_metadata['throttle_traj'] = float(throttle_traj)
 			self.pid_metadata['brake_traj'] = float(brake_traj)
 
-			if abs(control.steer) > 0.07: ## In turning
-				speed_threshold = 1.0 ## Avoid stuck during turning
+			# Safety speed limits based on steering angle
+			if abs(control.steer) > 0.3:  ## Sharp turn
+				speed_threshold = 3.5  ## ~12.6 km/h for sharp turns
+			elif abs(control.steer) > 0.15:  ## Medium turn
+				speed_threshold = 5.0  ## ~18 km/h for medium turns
+			else:  ## Straight or gentle turn
+				speed_threshold = 7.0  ## ~25.2 km/h for straight
+			
+			# Apply speed-based throttle limiting for safety
+			current_speed = float(tick_data['speed'])
+			if current_speed > speed_threshold:
+				# Reduce throttle proportionally to overspeed
+				overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
+				if overspeed_ratio > 0.5:  # Significantly over limit
+					max_throttle = 0.0  # Coast
+				elif overspeed_ratio > 0.2:  # Moderately over limit
+					max_throttle = 0.2  # Gentle throttle
+				else:  # Slightly over limit
+					max_throttle = 0.4  # Reduced throttle
 			else:
-				speed_threshold = 1.5 ## Avoid pass stop/red light/collision
-			if float(tick_data['speed']) > speed_threshold:
-				max_throttle = 0.05
-			else:
-				max_throttle = 0.5
+				max_throttle = 0.75  # Normal throttle
+			
 			control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
 
 			self.pid_metadata['steer'] = control.steer
