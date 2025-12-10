@@ -194,8 +194,14 @@ class InterfuserBEVEncoder(nn.Module):
             # Step 1: 使用 bev_model_mot 处理原始图像
             lidar_token_raw, lidar_token_global_raw = self.bev_model_mot(image)
             
-            # 添加位置编码
-            lidar_token_raw = lidar_token_raw + self.position_encoding(lidar_token_raw)
+            # Ensure outputs match the model's dtype (important for bfloat16 models)
+            target_dtype = next(self.parameters()).dtype
+            lidar_token_raw = lidar_token_raw.to(dtype=target_dtype)
+            lidar_token_global_raw = lidar_token_global_raw.to(dtype=target_dtype)
+            
+            # 添加位置编码 (ensure position encoding output matches target dtype)
+            pos_encoding = self.position_encoding(lidar_token_raw).to(dtype=target_dtype)
+            lidar_token_raw = lidar_token_raw + pos_encoding
             
             # 重塑为序列格式
             lidar_token_raw = lidar_token_raw.flatten(2).permute(2, 0, 1)  # (seq_len, batch, embed_dim)

@@ -14,17 +14,21 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms as T
 import imageio
+import random
 
 # Add the project directories to the Python path
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
-leaderboard_root = os.path.join(project_root, 'leaderboard')
-scenario_runner_root = os.path.join(project_root, 'scenario_runner')
-mot_dp_root = os.path.join(project_root, 'MoT-DP')
-carla_api_root = os.path.join(project_root.replace('Bench2Drive', 'carla'), 'PythonAPI', 'carla')
+leaderboard_root = str(os.path.join(project_root, 'leaderboard'))
+scenario_runner_root = str(os.path.join(project_root, 'scenario_runner'))
+mot_dp_root = str(os.path.join(project_root, 'MoT-DP'))
+carla_api_root = str(os.path.join(project_root.replace('Bench2Drive', 'carla'), 'PythonAPI', 'carla'))
 
 for path in [project_root, leaderboard_root, scenario_runner_root, mot_dp_root, carla_api_root]:
     if os.path.exists(path) and path not in sys.path:
         sys.path.insert(0, path)
+
+# Clean sys.path to ensure all entries are strings (fix for torch.compile issue)
+sys.path = [str(p) for p in sys.path]
 
 from leaderboard.autoagents import autonomous_agent
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
@@ -33,18 +37,23 @@ from team_code.controller_pid import WaypointPIDController
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 from scipy.optimize import fsolve
 # mot dependencies
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+project_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, 'mot'))
+# Add MoT-DP paths
+mot_dp_path = str(os.path.join(os.path.dirname(os.path.dirname(project_root)), 'MoT-DP'))
+mot_path = str(os.path.join(mot_dp_path, 'mot'))
+sys.path.append(mot_dp_path)
+sys.path.append(mot_path)
+
+# Clean sys.path to ensure all entries are strings (fix for torch.compile issue)
+sys.path = [str(p) for p in sys.path]
+
 from transformers import HfArgumentParser
 import json
 from dataclasses import dataclass, field
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 from PIL import Image
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, 'mot'))
 from safetensors.torch import load_file
 import glob
 from data.reasoning.data_utils import add_special_tokens
@@ -72,13 +81,21 @@ def get_entry_point():
 
 def create_carla_config(config_path=None):
     if config_path is None:
-        config_path = "/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml"
+        config_path = "/home/wang/Project/MoT-DP/config/pdm_local.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
 
 def load_best_model(checkpoint_path, config, device):
     print(f"Loading best model from: {checkpoint_path}")
+    
+    # Fix for numpy compatibility issue
+    import sys
+    import numpy as np
+    if not hasattr(np, '_core'):
+        sys.modules['numpy._core'] = np.core
+        sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
+    
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     action_stats = {
@@ -109,11 +126,11 @@ def load_best_model(checkpoint_path, config, device):
 @dataclass
 class ModelArguments:
     model_path: str = field(
-        default="/mnt/data/qihang_projects/load_qwen3_vl_4b_fast_thinking_origin/0007200",
+        default="/home/wang/Project/MoT-DP/checkpoints/mot",
         metadata={"help": "Path to the converted AutoMoT model checkpoint"}
     )
     qwen3vl_path: str = field(
-        default="/mnt/data/models/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17",
+        default="/home/wang/Project/MoT-DP/config/mot_config",
         metadata={"help": "Path to the Qwen3VL base model for config loading"}
     )
     max_latent_size: int = field(
@@ -151,6 +168,14 @@ class ModelArguments:
     reasoning_query_max_num_tokens: int = field(
         default=8, #256, #64,
         metadata={"help": "Maximum number of tokens in the reasoning query."}
+    )
+    action_query_dim: int = field(
+        default=588,
+        metadata={"help": "Dimension of the action query embedding."}
+    )
+    action_query_tokens: int = field(
+        default=1,
+        metadata={"help": "Number of tokens in the action query."}
     )
 
 @dataclass
@@ -233,8 +258,22 @@ def convert_model_dtype_with_exceptions(model, target_dtype, exclude_buffer_patt
 
 def load_model_mot(device):
 
+    # Parse arguments - use empty args to avoid conflicts with leaderboard args
     parser = HfArgumentParser((ModelArguments, InferenceArguments))
-    model_args, inference_args = parser.parse_args_into_dataclasses()
+    model_args, inference_args = parser.parse_args_into_dataclasses(args=[])
+
+    assert torch.cuda.is_available(), "CUDA is required"
+
+    # Set random seed
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Load configs from Qwen3VL model
     qwen3vl_config_path = model_args.qwen3vl_path
     
     # Load the unified config and extract text_config and vision_config
@@ -264,48 +303,50 @@ def load_model_mot(device):
         latent_patch_size=model_args.latent_patch_size,
         max_latent_size=model_args.max_latent_size,
         connector_act=model_args.connector_act,
+        interpolate_pos=False,
         reasoning_query_dim=model_args.reasoning_query_dim,
         reasoning_query_tokens=model_args.reasoning_query_max_num_tokens,
-        interpolate_pos=False,
+        action_query_dim=model_args.action_query_dim,
+        action_query_tokens=model_args.action_query_tokens,
     )
 
     # Initialize model with Qwen3VL LLM (supports mRoPE)
     language_model = Qwen3VLForConditionalGenerationMoT(llm_config)
     vit_model = Qwen3VLVisionModel(vit_config)
-    # print(f"Debug - Official vision config: depth={vit_config.depth}, hidden_size={vit_config.hidden_size}, out_hidden_size={vit_config.out_hidden_size}")
+        
     model = AutoMoT(language_model, vit_model, config)
-    model.to(device)
+
+    device_map = {"": "cuda:0"}
+
+    # Load converted AutoMoT checkpoint manually (accelerate has weight issues)
+    print(f"Loading converted AutoMoT checkpoint from {model_args.model_path}...")
+    
     state_dict = load_safetensors_weights(model_args.model_path)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
     # Filter out lm_head.weight from missing keys if tie_word_embeddings=True
     actual_missing_keys = [k for k in missing_keys if k != 'language_model.lm_head.weight']
     print(f"Loaded weights: {len(actual_missing_keys)} missing, {len(unexpected_keys)} unexpected")
-    # Use the device parameter instead of hardcoding cuda:0
-    device_str = str(device) if isinstance(device, torch.device) else device
+    
     if actual_missing_keys:
         print(f"Missing keys: {actual_missing_keys[:10]}")
     if unexpected_keys:
         print(f"Unexpected keys: {unexpected_keys[:5]}")
-    # Move to device and set dtype
-    # model = model.to(device).eval().to(torch.bfloat16)
-    model = model.to(device).eval()
+        
+    # Move to device and siet dtype
+    model = model.to(device_map[""]).eval()
     model = convert_model_dtype_with_exceptions(
         model,
         torch.bfloat16,
         exclude_buffer_patterns=['inv_freq']
     )
+    
     # Verify tie_word_embeddings is working correctly
     embed_weight = model.language_model.model.embed_tokens.weight
     lm_head_weight = model.language_model.lm_head.weight
     weights_tied = embed_weight is lm_head_weight
     weights_equal = torch.equal(embed_weight, lm_head_weight)
     embed_norm = torch.norm(embed_weight).item()
-    
-    print(f"Weight tying verification:")
-    print(f"  - Weights are tied (same object): {weights_tied}")
-    print(f"  - Weight values are equal: {weights_equal}")
-    print(f"  - embed_tokens weight norm: {embed_norm:.4f} (should be > 100, not random)")
     
     if not weights_tied or not weights_equal:
         print("WARNING: tie_word_embeddings may not be working correctly!")
@@ -319,14 +360,15 @@ def load_model_mot(device):
     for name, param in model.named_parameters():
         if param.device.type == 'cpu':
             print(f"Moving {name} from CPU to CUDA")
-            param.data = param.data.to(device)
+            param.data = param.data.to("cuda:0")
     
     for name, buffer in model.named_buffers():
         if buffer.device.type == 'cpu':
             print(f"Moving buffer {name} from CPU to CUDA")
-            buffer.data = buffer.data.to(device)
+            buffer.data = buffer.data.to("cuda:0")
 
     print("Model loaded successfully")
+
 
     return model
 
@@ -376,16 +418,35 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.initialized = False
 
 		# Load diffusion policy
+		print("Loading diffusion policy...")
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/root/z_projects/code/MoT-DP-1/checkpoints/carla_dit_best")
+		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
 		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
+		
+		# Load diffusion policy in bfloat16 to save memory
 		self.net = load_best_model(checkpoint_path, self.config, device)
-		print("✓ Diffusion policy loaded.")
+		# Convert to bfloat16 to reduce memory usage (ensure all submodules are converted)
+		self.net = self.net.to(torch.bfloat16)
+		# Explicitly convert obs_encoder to bfloat16 to ensure compatibility
+		if hasattr(self.net, 'obs_encoder'):
+			self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
+		print("✓ Diffusion policy loaded (bfloat16).")
+		
+		
+		# Clear cache after loading diffusion policy
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+			import gc
+			gc.collect()
+
 
 		# Load MoT model
+		print("Loading MoT model...")
 		parser = HfArgumentParser((ModelArguments, InferenceArguments))
-		model_args, inference_args = parser.parse_args_into_dataclasses()
+		# Parse empty args to use defaults, avoiding conflicts with leaderboard args
+		model_args, inference_args = parser.parse_args_into_dataclasses(args=[])
+		self.inference_args = inference_args  # Store as instance variable
 		self.AutoMoT = load_model_mot(device)
 		tokenizer = AutoTokenizer.from_pretrained(model_args.qwen3vl_path)
 		tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
@@ -493,16 +554,31 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_history_list = list(self.rgb_history)
 		waypoint_history_list = list(self.waypoint_history)
 		
-		# Sample every 10th element: indices 9, 19, 29, ..., (obs_horizon*10-1)
-		lidar_list = [lidar_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(lidar_history_list)]
-		speed_list = [speed_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(speed_history_list)]
-		target_point_list = [target_point_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(target_point_history_list)]
-		cmd_list = [cmd_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(cmd_history_list)]
-		theta_list = [theta_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(theta_history_list)]
-		throttle_list = [throttle_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(throttle_history_list)]
-		brake_list = [brake_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(brake_history_list)]
-		waypoint_list = [waypoint_history_list[i*10 - 1] for i in range(1, self.obs_horizon + 1) if i*10 - 1 < len(waypoint_history_list)]
-		# sample every 5 for rgb
+		# Sample every 10th element from the end: -1, -11, -21, -31 (corresponding to 0s, -0.5s, -1s, -1.5s)
+		# Then reverse to get chronological order: oldest to newest
+		lidar_list = [lidar_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(lidar_history_list)]
+		speed_list = [speed_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(speed_history_list)]
+		target_point_list = [target_point_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(target_point_history_list)]
+		cmd_list = [cmd_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(cmd_history_list)]
+		theta_list = [theta_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(theta_history_list)]
+		throttle_list = [throttle_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(throttle_history_list)]
+		brake_list = [brake_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(brake_history_list)]
+		waypoint_list = [waypoint_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(waypoint_history_list)]
+		
+		# Reverse to get chronological order (oldest to newest)
+		lidar_list = lidar_list[::-1]
+		speed_list = speed_list[::-1]
+		target_point_list = target_point_list[::-1]
+		cmd_list = cmd_list[::-1]
+		theta_list = theta_list[::-1]
+		throttle_list = throttle_list[::-1]
+		brake_list = brake_list[::-1]
+		waypoint_list = waypoint_list[::-1]
+		
+		# Debug: print list lengths before padding
+		print(f"DEBUG: List lengths before padding - lidar:{len(lidar_list)}, speed:{len(speed_list)}, theta:{len(theta_list)}, throttle:{len(throttle_list)}, brake:{len(brake_list)}, waypoint:{len(waypoint_list)}, rgb:{len(rgb_list)}")
+		
+		# sample every 5 for rgb from the end
 		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
 		rgb_list = rgb_list[::-1]  # Reverse to get chronological order (oldest to newest)
 		
@@ -528,24 +604,32 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			theta_list = [theta_list[0]] * pad_size + theta_list if len(theta_list) > 0 else [theta] * self.obs_horizon
 			throttle_list = [throttle_list[0]] * pad_size + throttle_list if len(throttle_list) > 0 else [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
 			brake_list = [brake_list[0]] * pad_size + brake_list if len(brake_list) > 0 else [torch.tensor(0.0).view(1, 1).to('cuda')] * self.obs_horizon
-			rgb_list = [rgb_front] * 5 if len(rgb_list) == 0 else rgb_list
 			waypoint_list = [waypoint_list[0]] * pad_size + waypoint_list if len(waypoint_list) > 0 else [waypoint] * self.obs_horizon
 		
+		# Pad RGB list if needed (separate check since RGB has different sample rate)
+		if len(rgb_list) < 5:
+			if len(rgb_list) == 0:
+				rgb_list = [rgb_front] * 5
+			else:
+				rgb_pad_size = 5 - len(rgb_list)
+				rgb_list = [rgb_list[0]] * rgb_pad_size + rgb_list
+		
 		# Stack along time dimension
-		lidar_stacked = torch.cat(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
+		lidar_stacked = torch.stack(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
 		speed_stacked = torch.cat(speed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
 		theta_stacked = torch.cat(theta_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
 		throttle_stacked = torch.cat(throttle_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
 		brake_stacked = torch.cat(brake_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
 		cmd_stacked = torch.cat(cmd_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 6)
 		target_point_stacked = torch.cat(target_point_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
-		waypoint_stacked = torch.cat(waypoint_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
-		rgb_stacked = torch.cat(rgb_list, dim=0).unsqueeze(0)  # (1, 5, C, H, W)
+		waypoint_stacked = torch.stack(waypoint_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		rgb_stacked = torch.stack(rgb_list, dim=0).unsqueeze(0)  # (1, 5, C, H, W)
 		
 		# Transform historical waypoints and target_points to be relative to current position
 		# Current frame info for transformation
 		current_pos = tick_data['gps']  # numpy array [x, y]
 		current_theta = tick_data['theta']  # theta = compass - np.pi/2
+		# Rotation matrix from world frame to ego frame (inverse rotation by current_theta)
 		current_R = np.array([
 			[np.cos(current_theta), np.sin(current_theta)],
 			[-np.sin(current_theta), np.cos(current_theta)]
@@ -553,10 +637,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Transform each historical waypoint to current frame
 		waypoint_relative_list = []
+		print(f"\n=== Waypoint Transformation Debug ===")
+		print(f"current_pos: {current_pos}, current_theta: {current_theta:.4f}")
 		for i in range(self.obs_horizon):
 			past_waypoint = waypoint_stacked[0, i].cpu().numpy()  # [x, y] in global coordinates
-			# Transform: current_R.T @ (past - current)
-			relative_waypoint = current_R.T @ (past_waypoint - current_pos)
+			# Transform from world to ego frame: R @ (past - current)
+			relative_waypoint = current_R @ (past_waypoint - current_pos)
+			print(f"  [{i}] world: {past_waypoint}, relative: {relative_waypoint}")
 			waypoint_relative_list.append(torch.from_numpy(relative_waypoint).float().to('cuda'))
 		
 		# Stack the transformed waypoints
@@ -576,18 +663,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Get past frame's position and rotation
 			past_pos = waypoint_history_list_np[i]  # [x, y] in global coordinates
 			past_theta = theta_history_list_np[i]
+			# Rotation matrix from world to ego for the past frame
 			past_R = np.array([
 				[np.cos(past_theta), np.sin(past_theta)],
 				[-np.sin(past_theta), np.cos(past_theta)]
 			])
 			
 			# Transform target point from past frame's ego coordinate to world coordinate
-			# target_world = past_R @ target_in_past_frame + past_pos
-			target_world = past_R @ target_in_past_frame + past_pos
+			# Use past_R.T (ego to world) to transform the relative target point
+			target_world = past_R.T @ target_in_past_frame + past_pos
 			
 			# Transform from world coordinate to current frame's ego coordinate
-			# target_in_current_frame = current_R.T @ (target_world - current_pos)
-			target_in_current_frame = current_R.T @ (target_world - current_pos)
+			# Use current_R (world to ego) to transform to current frame
+			target_in_current_frame = current_R @ (target_world - current_pos)
 			
 			target_point_relative_list.append(torch.from_numpy(target_in_current_frame).float().to('cuda'))
 		
@@ -752,7 +840,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if self.step < 1:
 			control = carla.VehicleControl()
 			control.steer = 0.0
-			control.throttle = 0.0
+			control.throttle = 1.0
 			control.brake = 0.0
 			self.prev_control = control
 			return control
@@ -769,8 +857,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		speed = torch.FloatTensor([float(tick_data['speed'])]).view(1,1).to('cuda', dtype=torch.float32)
 		theta = torch.FloatTensor([float(tick_data['theta'])]).view(1,1).to('cuda', dtype=torch.float32)
 		lidar = tick_data['lidar_bev'].to('cuda', dtype=torch.float32)
-		rgb_front = tick_data['rgb_front'].to('cuda', dtype=torch.float32)
-		waypoint = tick_data['gps'].to('cuda', dtype=torch.float32)		
+		
+		# Convert rgb_front from numpy to tensor
+		rgb_front = torch.from_numpy(tick_data['rgb_front']).permute(2, 0, 1).float() / 255.0
+		rgb_front = rgb_front.to('cuda', dtype=torch.float32)
+		
+		# Convert gps from numpy to tensor
+		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
+		
 		tick_data['target_point'] = [torch.FloatTensor([tick_data['target_point'][0]]),
 										torch.FloatTensor([tick_data['target_point'][1]])]
 		target_point = torch.stack(tick_data['target_point'], dim=1).to('cuda', dtype=torch.float32)
@@ -785,23 +879,48 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.theta_history.append(theta)
 		self.waypoint_history.append(waypoint)
 		
+		# Append throttle and brake from previous step (or 0 for first step)
+		if self.step == 0:
+			# First step: initialize with 0
+			self.throttle_history.append(torch.tensor(0.0).view(1, 1).to('cuda'))
+			self.brake_history.append(torch.tensor(0.0).view(1, 1).to('cuda'))
+		else:
+			# Use control from previous step
+			prev_control = self.prev_control if self.prev_control is not None else carla.VehicleControl()
+			self.throttle_history.append(torch.tensor(prev_control.throttle).view(1, 1).to('cuda'))
+			self.brake_history.append(torch.tensor(prev_control.brake).view(1, 1).to('cuda'))
+		
 		# Only compute new action and control on even steps
-		if self.step % 2 == 0:
+		if (self.step+1) % 2 == 0:
 			# Build observation dictionaries from historical data
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
 				tick_data, lidar, rgb_front, speed, theta, target_point, 
 				cmd_one_hot, waypoint
 			)
-			# Get MoT reasoning
-			mot_obs_dict = {
-					'lidar_bev': lidar_stacked[:, -1, :, :, :],  # (1, C, H, W) - last frame
-					'rgb_hist_jpg': rgb_stacked,  # (1, 5, C, H, W)
-					'target_point': target_point,  # (1, 2)
-				}
-			prompt_cleaned , understanding_output, reasoning_output = build_cleaned_prompt_and_modes(mot_obs_dict['target_point'])
+			
+			# Convert tensors to PIL Images for MoT inferencer
+			# Following the format from visualize_mot_open_loop.py
+			# rgb_stacked shape: (1, 5, C, H, W)
+			rgb_pil_list = []
+			for i in range(rgb_stacked.shape[1]):  # Iterate over 5 frames
+				rgb_tensor = rgb_stacked[0, i]  # (C, H, W)
+				# Convert from tensor to PIL Image
+				rgb_np = (rgb_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+				rgb_pil = Image.fromarray(rgb_np, mode='RGB')
+				rgb_pil_list.append(rgb_pil)
+			
+			# Convert lidar_bev to PIL Image and put in a list (as expected by inferencer)
+			# lidar_stacked shape: (1, obs_horizon, C, H, W)
+			lidar_tensor = lidar_stacked[0, -1]  # (C, H, W) - last frame
+			lidar_np = (lidar_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+			lidar_pil = Image.fromarray(lidar_np, mode='RGB')
+			lidar_pil_list = [lidar_pil]  # Put in a list like visualize_mot_open_loop.py
+			
+			# Get MoT reasoning - matching visualize_mot_open_loop.py format
+			prompt_cleaned , understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point)
 			predicted_answer = self.inferencer(
-                image=mot_obs_dict["rgb_hist_jpg"],
-                lidar=mot_obs_dict["lidar_bev"],
+                image=rgb_pil_list,
+                lidar=lidar_pil_list,  # Pass as list
                 text=prompt_cleaned,
                 understanding_output=understanding_output,
                 reasoning_output=reasoning_output,
@@ -811,14 +930,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
             )
 
 			# Get diffusion policy action
+			# Convert all inputs to bfloat16 to match model dtype
+			print(ego_status_stacked)
 			dp_obs_dict = {
-	                'lidar_bev': lidar_stacked,  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
-	                'ego_status': ego_status_stacked,  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
-					'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to('cuda'),  
-                	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to('cuda'),  
+	                'lidar_bev': lidar_stacked.to(torch.bfloat16),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
+	                'ego_status': ego_status_stacked.to(torch.bfloat16),  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
+					'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
+                	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
 	            }
 			result = self.net.predict_action(dp_obs_dict)
 			pred = torch.from_numpy(result['action'])
+			print(pred)
 
 			# Control with PID controller
 			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(pred, gt_velocity, target_point)
@@ -861,8 +983,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		metric_info = self.get_metric_info()
 		self.metric_info[self.step] = metric_info
-		self.brake_history.append(control.brake)
-		self.throttle_history.append(control.throttle)
 		if SAVE_PATH is not None and self.step % 1 == 0:
 			self.save(tick_data)
 		return control
@@ -954,7 +1074,7 @@ if __name__ == "__main__":
 		os.environ['SAVE_PATH'] = '/tmp/mot_test'
 		
 		# Create a test config path
-		test_config_path = "/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml"
+		test_config_path = "/home/wang/Project/MoT-DP/config/pdm_local.yaml"
 		
 		print(f"\nTesting setup with config: {test_config_path}")
 		print("-"*60)

@@ -206,11 +206,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         try:
             device = next(self.parameters()).device
-            state = obs_dict['ego_status'].to(device=device, dtype=torch.float32)  # (B, 13)
+            # Get the dtype of the model parameters
+            model_dtype = next(self.parameters()).dtype
+            state = obs_dict['ego_status'].to(device=device, dtype=model_dtype)  # Use model dtype instead of float32
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
             if use_precomputed:
-                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=torch.float32)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=torch.float32)
+                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=model_dtype)
+                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=model_dtype)
                 
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
@@ -233,7 +235,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 if 'lidar_bev' not in obs_dict:
                     raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
                 
-                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=torch.float32)
+                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=model_dtype)  # Use model dtype instead of float32
                 if return_attention:
                     j_ctrl, attention_map = self.obs_encoder(
                         image=lidar_bev_img,
@@ -273,13 +275,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         }
         """
         device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype  # Get model dtype
         nobs = {}
         required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 'reasoning_query_tokens', 'gen_vit_tokens']
         
         for field in required_fields:
             if field in batch:
                 if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
-                    nobs[field] = batch[field].to(device=device, dtype=torch.float32)
+                    nobs[field] = batch[field].to(device=device, dtype=model_dtype)  # Use model dtype
                 else:
                     nobs[field] = batch[field].to(device)
 
@@ -293,7 +296,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond = None
         
         # Normalize trajectory for training
-        trajectory = nactions.float()
+        trajectory = nactions.to(dtype=model_dtype)  # Use model dtype instead of .float()
         if self.enable_action_normalization and self.action_stats is not None:
             trajectory = self.normalize_action(trajectory)
         if torch.isnan(trajectory).any() or torch.isinf(trajectory).any():
@@ -303,7 +306,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
         batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
         feature_dim = batch_features.shape[-1]
-        cond = batch_features.reshape(batch_size, To, feature_dim).float()  # (B, To, feature_dim)  
+        cond = batch_features.reshape(batch_size, To, feature_dim)  # Already in model_dtype, no need for .float()  
 
         condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)        # Sample noise that we'll add to the images
         noise = torch.randn(trajectory.shape, device=trajectory.device)
@@ -329,15 +332,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         reasoning_query_tokens = batch['reasoning_query_tokens']
         
         # Process gen_vit_tokens through feature_encoder
-        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)
+        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
         gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
         
         # Process reasoning_query_tokens through feature_encoder
-        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=torch.float32)
+        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
         reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
         
         # Use current ego_status instead of full history
         ego_status = nobs['ego_status']  # (B, 13)
+        # Ensure ego_status has the correct dtype
+        ego_status = ego_status.to(dtype=model_dtype)
         
         pred = self.model(noisy_trajectory, timesteps, cond, gen_vit_tokens=gen_vit_tokens, reasoning_query_tokens=reasoning_query_tokens, ego_status=ego_status)
 
@@ -428,6 +433,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype  # Get model dtype
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
@@ -447,7 +453,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
         shape = (B, T, Da)
        
-        cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
+        cond_data = torch.zeros(size=shape, device=device, dtype=model_dtype)  # Use model dtype
         cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
 
         # run sampling
@@ -455,16 +461,18 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         reasoning_query_tokens = nobs['reasoning_query_tokens']
         
         # Process gen_vit_tokens through feature_encoder
-        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=torch.float32)
+        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
         gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
         
         # Process reasoning_query_tokens through feature_encoder
-        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=torch.float32)
+        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
         reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
         
         
         # Use current ego_status instead of full history
         ego_status = nobs['ego_status']  # (B, 14)
+        # Ensure ego_status has the correct dtype
+        ego_status = ego_status.to(dtype=model_dtype)
         
         nsample = self.conditional_sample(
             cond_data, 

@@ -636,7 +636,9 @@ class CustomTransformerDecoder(nn.Module):
                 visible_obs_end = min(obs_start + t + 1, obs_end)
                 memory_mask_dynamic[t, obs_start:visible_obs_end] = True
         
-        memory_mask = memory_mask_dynamic.float().masked_fill(
+        # Use model dtype instead of hardcoded float() to support bfloat16
+        model_dtype = x.dtype
+        memory_mask = memory_mask_dynamic.to(dtype=model_dtype).masked_fill(
             memory_mask_dynamic == 0, float('-inf')
         ).masked_fill(memory_mask_dynamic == 1, float(0.0))
         
@@ -1113,6 +1115,17 @@ class TransformerForDiffusion(ModuleAttrMixin):
         sample = sample.contiguous()
         cond = cond.contiguous()
         
+        # Ensure all inputs match the model's dtype
+        model_dtype = next(self.parameters()).dtype
+        sample = sample.to(dtype=model_dtype)
+        cond = cond.to(dtype=model_dtype)
+        memory = memory.to(dtype=model_dtype)
+        vl_features = vl_features.to(dtype=model_dtype)
+        if reasoning_features is not None:
+            reasoning_features = reasoning_features.to(dtype=model_dtype)
+        if ego_status is not None:
+            ego_status = ego_status.to(dtype=model_dtype)
+        
         # 1. Prepare timesteps
         timesteps = timestep
         if not torch.is_tensor(timesteps):
@@ -1140,6 +1153,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         hist_global_embedding = self.history_encoder(hist_state)
         status_embedding = self.ego_status_proj(current_status)
         conditioning = time_embedding + status_embedding + hist_global_embedding
+        # Ensure conditioning matches model dtype (important for bfloat16 models)
+        conditioning = conditioning.to(dtype=model_dtype)
         
         # 3. Pre-decoder processing
         token_embeddings = self.input_emb(sample)
