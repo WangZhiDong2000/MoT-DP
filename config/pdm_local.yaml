@@ -169,8 +169,8 @@ controller:
   aim_dist: 4.0
   angle_thresh: 0.3
   dist_thresh: 10.0
-  brake_speed: 0.3         # Brake when desired speed drops below 0.3 m/s
-  brake_ratio: 1.3         # Brake when 30% overspeed (safer than 2.5x)
-  clip_delta: 0.4          # Moderate acceleration (balanced)
-  max_throttle: 0.75       # Reasonable max throttle
+  brake_speed: 0.05        # Extremely low - almost never brake for low desired speed
+  brake_ratio: 2.8         # Very high tolerance - allow even more recovery (180% overspeed before braking)
+  clip_delta: 1.0          # Maximum acceleration to help recover from stops quickly
+  max_throttle: 1.0        # Allow full throttle in PID
 

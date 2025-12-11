@@ -125,25 +125,32 @@ class WaypointPIDController:
 
 		speed = velocity[0].data.cpu().numpy()
 		
-		# Safer braking logic - brake more readily
-		should_brake = desired_speed < self.brake_speed or (speed / desired_speed) > self.brake_ratio
+		# Modified braking logic to help recovery from stops
+		# Only brake if significantly overspeeding OR desired speed is extremely low
+		should_brake = (desired_speed < self.brake_speed) or (speed / max(desired_speed, 0.5)) > self.brake_ratio
 		
 		# Calculate throttle based on speed difference
 		delta = np.clip(desired_speed - speed, 0.0, self.clip_delta)
 		throttle = self.speed_controller.step(delta)
 		throttle = np.clip(throttle, 0.0, self.max_throttle)
 		
-		# Braking logic with graduated response
+		# Smarter braking logic - avoid premature braking during recovery
 		if should_brake:
-			throttle = 0.0
-			# Progressive braking - stronger brake for more overspeed
-			if speed > desired_speed:
-				# More aggressive braking formula for safety
-				overspeed = speed - desired_speed
-				brake_intensity = min(1.0, overspeed / max(desired_speed * 0.3, 0.5))  # Brake harder, faster
-				brake = float(np.clip(brake_intensity, 0.3, 1.0))  # Minimum 0.3 brake when needed
+			# Only stop throttle if we're really overspeeding or need to stop
+			if speed > desired_speed * 1.5:  # Significant overspeed
+				throttle = 0.0
+			elif speed < 2.0:  # Low speed - keep some throttle to help recovery
+				throttle = max(throttle * 0.5, 0.1)  # Reduce but don't eliminate
 			else:
-				brake = 0.8  # Strong brake for very low desired speed
+				throttle = throttle * 0.3  # Reduce throttle moderately
+			
+			# Progressive braking
+			if speed > desired_speed:
+				overspeed = speed - desired_speed
+				brake_intensity = min(1.0, overspeed / max(desired_speed * 0.7, 1.5))
+				brake = float(np.clip(brake_intensity, 0.15, 1.0))
+			else:
+				brake = 0.3  # Light brake for very low desired speed
 		else:
 			brake = 0.0
 			throttle = throttle  # Use PID output directly

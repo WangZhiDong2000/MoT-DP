@@ -579,9 +579,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
 		rgb_list = rgb_list[::-1]  # Reverse to get chronological order (oldest to newest)
 		
-		# Debug: print list lengths (no padding needed - buffer is guaranteed to be full)
-		print(f"DEBUG: List lengths - lidar:{len(lidar_list)}, speed:{len(speed_list)}, theta:{len(theta_list)}, throttle:{len(throttle_list)}, brake:{len(brake_list)}, waypoint:{len(waypoint_list)}, rgb:{len(rgb_list)}")
-		
 		# Stack along time dimension
 		lidar_stacked = torch.stack(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
 		speed_stacked = torch.cat(speed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
@@ -605,13 +602,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Transform each historical waypoint to current frame
 		waypoint_relative_list = []
-		print(f"\n=== Waypoint Transformation Debug ===")
-		print(f"current_pos: {current_pos}, current_theta: {current_theta:.4f}")
 		for i in range(self.obs_horizon):
 			past_waypoint = waypoint_stacked[0, i].cpu().numpy()  # [x, y] in global coordinates
 			# Transform from world to ego frame: R @ (past - current)
 			relative_waypoint = current_R @ (past_waypoint - current_pos)
-			print(f"  [{i}] world: {past_waypoint}, relative: {relative_waypoint}")
 			waypoint_relative_list.append(torch.from_numpy(relative_waypoint).float().to('cuda'))
 		
 		# Stack the transformed waypoints
@@ -859,12 +853,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Buffer not full yet - use simple control to fill buffer
 			control = carla.VehicleControl()
 			control.steer = 0.0
-			control.throttle = 1.0
+			control.throttle = 0.75
 			control.brake = 0.0
 			self.prev_control = control
 			self.pid_metadata = {}
 			self.pid_metadata['agent'] = 'filling_buffer'
-			print(f"Filling buffer: {len(self.lidar_bev_history)}/{buffer_size_needed}")
 		elif (self.step+1) % 2 == 0:
 			# Buffer is full and it's time to update (even steps)
 			# Build observation dictionaries from historical data
@@ -906,7 +899,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 			# Get diffusion policy action
 			# Convert all inputs to bfloat16 to match model dtype
-			print(ego_status_stacked)
 			dp_obs_dict = {
 	                'lidar_bev': lidar_stacked.to(torch.bfloat16),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
 	                'ego_status': ego_status_stacked.to(torch.bfloat16),  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
@@ -939,29 +931,54 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['brake_traj'] = float(brake_traj)
 
 			# Safety speed limits based on steering angle
-			if abs(control.steer) > 0.3:  ## Sharp turn
-				speed_threshold = 3.5  ## ~12.6 km/h for sharp turns
-			elif abs(control.steer) > 0.15:  ## Medium turn
-				speed_threshold = 5.0  ## ~18 km/h for medium turns
-			else:  ## Straight or gentle turn
-				speed_threshold = 7.0  ## ~25.2 km/h for straight
-			
-			# Apply speed-based throttle limiting for safety
 			current_speed = float(tick_data['speed'])
-			if current_speed > speed_threshold:
-				# Reduce throttle proportionally to overspeed
-				overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
-				if overspeed_ratio > 0.5:  # Significantly over limit
-					max_throttle = 0.0  # Coast
-				elif overspeed_ratio > 0.2:  # Moderately over limit
-					max_throttle = 0.2  # Gentle throttle
-				else:  # Slightly over limit
-					max_throttle = 0.4  # Reduced throttle
-			else:
-				max_throttle = 0.75  # Normal throttle
+			abs_steer = abs(control.steer)
+			
+			# Balanced approach: moderate limits for turns, high trust for straight
+			if abs_steer > 0.3:  ## Sharp turn - strict control needed
+				speed_threshold = 4.5  ## ~16.2 km/h for sharp turns
+				if current_speed > speed_threshold:
+					overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
+					if overspeed_ratio > 0.5:
+						max_throttle = 0.1
+					elif overspeed_ratio > 0.3:
+						max_throttle = 0.3
+					elif overspeed_ratio > 0.1:
+						max_throttle = 0.5
+					else:
+						max_throttle = 0.7
+				else:
+					max_throttle = 0.7
+					
+			elif abs_steer > 0.15:  ## Medium turn - moderate control
+				speed_threshold = 7.0  ## ~25.2 km/h for medium turns
+				if current_speed > speed_threshold:
+					overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
+					if overspeed_ratio > 0.4:
+						max_throttle = 0.3
+					elif overspeed_ratio > 0.2:
+						max_throttle = 0.6
+					else:
+						max_throttle = 0.8
+				else:
+					max_throttle = 0.8
+					
+			else:  ## Straight or gentle turn - very high trust, minimal limits
+				speed_threshold = 15.0  ## ~54 km/h for straight (increased from 10.0 for more aggressive driving)
+				if current_speed > speed_threshold:
+					overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
+					# Extremely tolerant overspeed handling for straight driving
+					if overspeed_ratio > 1.0:  # 100%+ overspeed (>30m/s / 108km/h)
+						max_throttle = 0.6
+					elif overspeed_ratio > 0.6:  # 60-100% overspeed
+						max_throttle = 0.8
+					else:  # <60% overspeed (up to ~24m/s / 86km/h)
+						max_throttle = 1.0
+				else:
+					max_throttle = 1.0  # Full throttle when under limit
 			
 			control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
-
+			
 			self.pid_metadata['steer'] = control.steer
 			self.pid_metadata['throttle'] = control.throttle
 			self.pid_metadata['brake'] = control.brake
