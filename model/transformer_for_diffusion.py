@@ -257,9 +257,11 @@ class SinusoidalPosEmb(nn.Module):
 
     def forward(self, x):
         device = x.device
+        dtype = x.dtype  # Preserve input dtype for bfloat16 compatibility
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        # Ensure arange tensor matches input dtype to avoid precision loss with bfloat16
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
@@ -1171,9 +1173,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             x = torch.cat([hist_x, x], dim=1)
             
             if tgt_mask is not None:
+                # Use model dtype instead of float() to support bfloat16
                 total_len = x.shape[1]
                 mask = (torch.triu(torch.ones(total_len, total_len, device=x.device)) == 1).transpose(0, 1)
-                tgt_mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+                tgt_mask = mask.to(dtype=model_dtype).masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         
         # 4. Decoder with cached memory
         x = self.decoder(
@@ -1298,9 +1301,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             
             if tgt_mask is not None:
                 # Create causal mask for the extended sequence
+                # Use model dtype instead of float() to support bfloat16
+                model_dtype = x.dtype
                 total_len = x.shape[1]
                 mask = (torch.triu(torch.ones(total_len, total_len, device=x.device)) == 1).transpose(0, 1)
-                tgt_mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+                tgt_mask = mask.to(dtype=model_dtype).masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         
         # 6. Decoder with integrated memory mask handling and VL cross attention
         # Pass conditioning to decoder for AdaLN modulation

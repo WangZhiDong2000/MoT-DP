@@ -576,6 +576,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		waypoint_list = waypoint_list[::-1]
 		
 		# sample every 5 for rgb from the end
+		# Tick frequency: 20Hz (0.05s per tick)
+		# RGB sampling: every 5 ticks = 0.25s interval
+		# Indices: -1, -6, -11, -16, -21
+		# Times: 0s, -0.25s, -0.5s, -0.75s, -1.0s ✓
 		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
 		rgb_list = rgb_list[::-1]  # Reverse to get chronological order (oldest to newest)
 		
@@ -592,7 +596,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Transform historical waypoints and target_points to be relative to current position
 		# Current frame info for transformation
-		current_pos = tick_data['gps']  # numpy array [x, y]
+		current_pos = tick_data['gps']  # numpy array [x, y] in world coordinates
 		current_theta = tick_data['theta']  # theta = compass - np.pi/2
 		# Rotation matrix from world frame to ego frame (inverse rotation by current_theta)
 		current_R = np.array([
@@ -611,49 +615,56 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Stack the transformed waypoints
 		waypoint_relative_stacked = torch.stack(waypoint_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
-		# Transform each historical target_point to current frame
-		# target_point_list contains points that are relative to their respective historical frames
-		# We need to transform them to be relative to the current frame
-		target_point_relative_list = []
-		theta_history_list_np = [theta_list[i].cpu().numpy()[0, 0] for i in range(self.obs_horizon)]
-		waypoint_history_list_np = [waypoint_stacked[0, i].cpu().numpy() for i in range(self.obs_horizon)]
+		# CRITICAL FIX: Transform historical target_points to current frame coordinate system!
+		# This matches the training data preprocessing in preprocess_pdm_lite.py:get_history_target_points()
+		#
+		# Each historical target_point was stored relative to its own frame's ego coordinate.
+		# We need to:
+		# 1. Transform from past ego frame -> world frame (using past frame's position and theta)
+		# 2. Transform from world frame -> current ego frame (using current frame's position and theta)
+		#
+		# We have:
+		# - waypoint_list: historical world positions (gps) for each frame
+		# - theta_list: historical theta values for each frame
+		# - target_point_list: target points in each frame's ego coordinate
 		
+		target_point_transformed_list = []
 		for i in range(self.obs_horizon):
-			# Get target point in past frame's ego coordinate
-			target_in_past_frame = target_point_stacked[0, i].cpu().numpy()  # [x, y] relative to past frame
+			# Get past frame's world position and orientation
+			past_world_pos = waypoint_list[i].cpu().numpy()  # [x, y] in world coordinates
+			# theta_list[i] is a tensor of shape (1, 1), need to squeeze and get item
+			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame
 			
-			# Get past frame's position and rotation
-			past_pos = waypoint_history_list_np[i]  # [x, y] in global coordinates
-			past_theta = theta_history_list_np[i]
-			# Rotation matrix from world to ego for the past frame
-			past_R = np.array([
-				[np.cos(past_theta), np.sin(past_theta)],
-				[-np.sin(past_theta), np.cos(past_theta)]
+			# Get target point in past frame's ego coordinate
+			target_in_past_ego = target_point_list[i].squeeze().cpu().numpy()  # [x, y]
+			
+			# Rotation matrix from past ego frame to world frame
+			past_R_ego_to_world = np.array([
+				[np.cos(past_theta), -np.sin(past_theta)],
+				[np.sin(past_theta), np.cos(past_theta)]
 			])
 			
-			# Transform target point from past frame's ego coordinate to world coordinate
-			# Use past_R.T (ego to world) to transform the relative target point
-			target_world = past_R.T @ target_in_past_frame + past_pos
+			# Step 1: Transform target point from past ego frame to world frame
+			target_world = past_R_ego_to_world @ target_in_past_ego + past_world_pos
 			
-			# Transform from world coordinate to current frame's ego coordinate
-			# Use current_R (world to ego) to transform to current frame
-			target_in_current_frame = current_R @ (target_world - current_pos)
+			# Step 2: Transform from world frame to current ego frame
+			target_in_current_ego = current_R @ (target_world - current_pos)
 			
-			target_point_relative_list.append(torch.from_numpy(target_in_current_frame).float().to('cuda'))
+			target_point_transformed_list.append(torch.from_numpy(target_in_current_ego).float().to('cuda'))
 		
 		# Stack the transformed target points
-		target_point_relative_stacked = torch.stack(target_point_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		target_point_transformed_stacked = torch.stack(target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
-		# Concatenate all ego status features: speed + theta + throttle + brake + cmd + target_point_relative + waypoint_relative
+		# Concatenate all ego status features: speed + theta + throttle + brake + cmd + target_point + waypoint_relative
 		# ego_status_stacked: (1, obs_horizon, 1+1+1+1+6+2+2) = (1, obs_horizon, 14)
 		ego_status_stacked = torch.cat([
-			speed_stacked,                  # (1, obs_horizon, 1)
-			theta_stacked,                  # (1, obs_horizon, 1)
-			throttle_stacked,               # (1, obs_horizon, 1)
-			brake_stacked,                  # (1, obs_horizon, 1)
-			cmd_stacked,                    # (1, obs_horizon, 6)
-			target_point_relative_stacked,  # (1, obs_horizon, 2) - target points in current frame
-			waypoint_relative_stacked       # (1, obs_horizon, 2) - ego positions in current frame
+			speed_stacked,                        # (1, obs_horizon, 1)
+			theta_stacked,                        # (1, obs_horizon, 1)
+			throttle_stacked,                     # (1, obs_horizon, 1)
+			brake_stacked,                        # (1, obs_horizon, 1)
+			cmd_stacked,                          # (1, obs_horizon, 6)
+			target_point_transformed_stacked,     # (1, obs_horizon, 2) - target points transformed to current ego frame
+			waypoint_relative_stacked             # (1, obs_horizon, 2) - ego positions in current frame
 		], dim=-1)  # Concatenate along feature dimension
 		
 		return lidar_stacked, ego_status_stacked, rgb_stacked
@@ -789,7 +800,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		local_command_point = np.array([next_wp[0]-pos[0], next_wp[1]-pos[1]])
 		local_command_point = R.dot(local_command_point)
-		result['target_point'] = tuple(local_command_point)
+		
+		result['target_point'] = local_command_point  # numpy array (2,)
 		result['theta']=theta
 
 		return result
@@ -821,9 +833,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Convert gps from numpy to tensor
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
 		
-		tick_data['target_point'] = [torch.FloatTensor([tick_data['target_point'][0]]),
-										torch.FloatTensor([tick_data['target_point'][1]])]
-		target_point = torch.stack(tick_data['target_point'], dim=1).to('cuda', dtype=torch.float32)
+		# FIXED: Convert target_point from numpy array directly to tensor (1, 2)
+		# Matches sensor_agent.py format
+		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
 
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
@@ -858,8 +870,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.prev_control = control
 			self.pid_metadata = {}
 			self.pid_metadata['agent'] = 'filling_buffer'
-		elif (self.step+1) % 2 == 0:
+		elif self.step % 2 == 0:  # FIXED: Changed from (self.step+1) % 2 == 0 to self.step % 2 == 0
 			# Buffer is full and it's time to update (even steps)
+			if self.step % 10 == 0:
+				print(f"[DEBUG Step {self.step}] → Taking MODEL INFERENCE branch (even step)")
 			# Build observation dictionaries from historical data
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
 				tick_data, lidar, rgb_front, speed, theta, target_point, 
@@ -886,6 +900,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			# Get MoT reasoning - matching visualize_mot_open_loop.py format
 			prompt_cleaned , understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point)
+			
 			predicted_answer = self.inferencer(
                 image=rgb_pil_list,
                 lidar=lidar_pil_list,  # Pass as list
@@ -905,6 +920,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
                 	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
 	            }
+			
+			# Run prediction with bfloat16
 			result = self.net.predict_action(dp_obs_dict)
 			pred = torch.from_numpy(result['action'])
 			print(pred)
@@ -987,6 +1004,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.prev_control = control
 		else:
 			# On odd steps, use previous control
+			if self.step % 10 == 1:  # Print on steps 1, 11, 21, etc
+				print(f"[DEBUG Step {self.step}] → Taking REUSE_CONTROL branch (odd step)")
 			control = self.prev_control if self.prev_control is not None else carla.VehicleControl()
 			self.pid_metadata = {}
 			self.pid_metadata['agent'] = 'reused_control'
