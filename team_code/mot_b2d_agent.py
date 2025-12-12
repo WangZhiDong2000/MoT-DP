@@ -881,7 +881,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Buffer not full yet - use simple control to fill buffer
 			control = carla.VehicleControl()
 			control.steer = 0.0
-			control.throttle = 0.75
+			control.throttle = 0.3
 			control.brake = 0.0
 			self.prev_control = control
 			self.pid_metadata = {}
@@ -1013,14 +1013,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			else:
 				# Normal throttle control with turn-based limits
 				if abs_steer > 0.3:  # Sharp turn
-					speed_threshold = 4.5  # ~16.2 km/h
-					max_throttle = 0.65 if current_speed < speed_threshold else 0.4
+					speed_threshold = 4.0  # ~14.4 km/h (提高从3.5)
+					max_throttle = 0.6 if current_speed < speed_threshold else 0.35
 				elif abs_steer > 0.15:  # Medium turn
-					speed_threshold = 7.0  # ~25.2 km/h
-					max_throttle = 0.75 if current_speed < speed_threshold else 0.55
+					speed_threshold = 5.5  # ~19.8 km/h (提高从5.0)
+					max_throttle = 0.7 if current_speed < speed_threshold else 0.45
 				else:  # Straight or gentle turn
-					speed_threshold = 12.0  # ~43.2 km/h
-					max_throttle = 1.0 if current_speed < speed_threshold else 0.75
+					speed_threshold = 6.5  # ~23.4 km/h (提高从5.5，避免过度限速)
+					max_throttle = 0.75 if current_speed < speed_threshold else 0.55
 				
 				# Minimum throttle to prevent stalling (unless braking needed)
 				min_throttle = 0.2 if current_speed < 2.0 and base_brake < 0.3 else 0.0
@@ -1030,7 +1030,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				
 				# Anti-stop-start: If at very low speed and not braking, be more aggressive
 				if current_speed < 1.5 and control.brake < 0.1:
-					control.throttle = max(control.throttle, 0.35)
+					control.throttle = max(control.throttle, 0.4)
 			
 			self.pid_metadata['steer_raw'] = raw_steer
 			self.pid_metadata['steer_smoothed'] = float(control.steer)

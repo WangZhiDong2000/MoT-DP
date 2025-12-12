@@ -29,7 +29,7 @@ class PID(object):
 
 class PIDController(object):
     
-    def __init__(self, turn_KP=1.1, turn_KI=0.5, turn_KD=0.4, turn_n=40, speed_KP=5.5, speed_KI=0.5,speed_KD=1.0, speed_n = 40,max_throttle=0.75, brake_speed=0.02,brake_ratio=1.2, clip_delta=0.25, aim_dist=3.5, angle_thresh=0.3, dist_thresh=10):
+    def __init__(self, turn_KP=1.05, turn_KI=0.5, turn_KD=0.4, turn_n=40, speed_KP=5.2, speed_KI=0.5,speed_KD=1.0, speed_n = 40,max_throttle=0.75, brake_speed=0.02,brake_ratio=1.15, clip_delta=0.25, aim_dist=3.5, angle_thresh=0.3, dist_thresh=10):
         
         self.turn_controller = PID(K_P=turn_KP, K_I=turn_KI, K_D=turn_KD, n=turn_n)
         self.speed_controller = PID(K_P=speed_KP, K_I=speed_KI, K_D=speed_KD, n=speed_n)
