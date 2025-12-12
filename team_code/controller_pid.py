@@ -109,16 +109,55 @@ class WaypointPIDController:
 		angle_last = np.degrees(np.pi / 2 - np.arctan2(aim_last[1], aim_last[0])) / 90
 		angle_target = np.degrees(np.pi / 2 - np.arctan2(target[1], target[0])) / 90
 
-		# Choice of point to aim for steering, removing outlier predictions
-		# Use target point if it has a smaller angle or if error is large
-		# Predicted point otherwise
-		# (reduces noise in eg. straight roads, helps with sudden turn commands)
-		use_target_to_aim = np.abs(angle_target) < np.abs(angle)
-		use_target_to_aim = use_target_to_aim or (np.abs(angle_target - angle_last) > self.angle_thresh and target[1] < self.dist_thresh)
-		if use_target_to_aim:
-			angle_final = angle_target
-		else:
-			angle_final = angle
+		# ============ Balanced Steering Control ============
+		# Instead of binary choice, use weighted blend of model prediction and target point
+		# This prevents over-aggressive steering while maintaining responsiveness
+		
+		# Calculate confidence weights based on agreement between predictions
+		angle_diff = abs(angle - angle_target)
+		
+		# If model and target agree (small diff), trust model more
+		# If they disagree significantly, blend towards target for safety
+		if angle_diff < 0.1:  # Good agreement - trust model
+			model_weight = 0.7
+			target_weight = 0.3
+		elif angle_diff < 0.25:  # Moderate disagreement - balanced blend
+			model_weight = 0.5
+			target_weight = 0.5
+		elif angle_diff < 0.4:  # Significant disagreement - lean towards target
+			model_weight = 0.35
+			target_weight = 0.65
+		else:  # Large disagreement - mostly use target for safety
+			model_weight = 0.2
+			target_weight = 0.8
+		
+		# Additional safety: if angle_last (trajectory end direction) differs a lot from angle
+		# the trajectory might be unstable, reduce trust in model
+		if abs(angle_last - angle) > self.angle_thresh:
+			model_weight *= 0.7
+			target_weight = 1.0 - model_weight
+		
+		# Weighted blend
+		angle_blended = model_weight * angle + target_weight * angle_target
+		
+		# Further safety check: if blended angle is very different from target, 
+		# and target is within reasonable distance, constrain the angle
+		if target[1] < self.dist_thresh:  # Target is close enough to be relevant
+			# Limit how much we can deviate from target direction
+			max_deviation = 0.3  # Maximum allowed deviation from target angle
+			if abs(angle_blended - angle_target) > max_deviation:
+				# Clamp towards target
+				if angle_blended > angle_target:
+					angle_blended = angle_target + max_deviation
+				else:
+					angle_blended = angle_target - max_deviation
+		
+		# Use blended angle as final angle
+		angle_final = angle_blended
+		
+		# Rate limiting: prevent sudden large steering changes
+		# (This will be further smoothed in the agent's steer_history filter)
+		angle_final = np.clip(angle_final, -0.8, 0.8)  # Max ~72 degrees steering command
 
 		steer = self.turn_controller.step(angle_final)
 		steer = np.clip(steer, -1.0, 1.0)
@@ -170,7 +209,10 @@ class WaypointPIDController:
 			'angle': float(angle.astype(np.float64)),
 			'angle_last': float(angle_last.astype(np.float64)),
 			'angle_target': float(angle_target.astype(np.float64)),
+			'angle_blended': float(angle_blended.astype(np.float64)),
 			'angle_final': float(angle_final.astype(np.float64)),
+			'model_weight': float(model_weight),
+			'target_weight': float(target_weight),
 			'delta': float(delta.astype(np.float64)),
 		}
 

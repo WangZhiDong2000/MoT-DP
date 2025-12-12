@@ -33,7 +33,7 @@ sys.path = [str(p) for p in sys.path]
 from leaderboard.autoagents import autonomous_agent
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from team_code.planner import RoutePlanner
-from team_code.controller_pid import WaypointPIDController
+from team_code.orion.pid_controller import PIDController as OrionPIDController  # Use orion's PID controller
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 from scipy.optimize import fsolve
 # mot dependencies
@@ -462,14 +462,30 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
     	)
 		print("✓ MoT model loaded.")
 		
-		# Initialize PID controller
-		self.pid_controller = WaypointPIDController(self.config)
+		# Initialize PID controller (using orion's controller)
+		self.pid_controller = OrionPIDController()
 
 		self.save_path = None
 		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
 
 		# Store previous control for odd steps
 		self.prev_control = None
+		
+		# ============ Smooth Control Additions ============
+		# Steer smoothing buffer for low-pass filtering
+		self.steer_history = deque(maxlen=5)  # Keep last 5 steer values for smoothing
+		
+		# Stuck detection and recovery
+		self.stuck_detector = 0
+		self.stuck_threshold = 100  # ~5 seconds at 20Hz
+		self.force_move = 0
+		self.creep_duration = 40  # ~2 seconds at 20Hz  
+		self.creep_throttle = 0.4
+		
+		# Speed management
+		self.min_speed_threshold = 1.0  # m/s - below this, apply recovery throttle
+		self.target_cruise_speed = 6.0  # m/s - default target speed (~21.6 km/h)
+		# ============ End Smooth Control Additions ============
 
 		# self.lat_ref, self.lon_ref = 42.0, 2.0
 		if SAVE_PATH is not None:
@@ -926,76 +942,102 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			pred = torch.from_numpy(result['action'])
 			print(pred)
 
-			# Control with PID controller
-			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(pred, gt_velocity, target_point)
+			# Control with PID controller (orion style)
+			# orion's control_pid expects: (waypoints: np.array, speed: scalar, target: np.array)
+			# pred shape: (1, pred_horizon, 2) - need to extract and convert
+			waypoints_np = pred[0].cpu().numpy()  # (pred_horizon, 2) - [x, y] format
+			# orion expects waypoints in [x, y] format where y is forward, x is lateral
+			# Our model outputs [x, y] where x is lateral (right+), y is forward
+			# Need to swap to [y, x] for orion's coordinate convention
+			waypoints_np = waypoints_np[:, [1, 0]]  # Swap to [forward, lateral]
+			
+			speed_scalar = float(tick_data['speed'])
+			target_np = target_point.squeeze().cpu().numpy()  # (2,)
+			target_np = target_np[[1, 0]]  # Swap to [forward, lateral] for orion
+			
+			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(
+				waypoints_np, speed_scalar, target_np
+			)
 
 			control = carla.VehicleControl()
 
 			self.pid_metadata = metadata_traj
 			self.pid_metadata['agent'] = 'only_traj'
 			
-			# Use PID outputs with reasonable limits
-			control.steer = np.clip(float(steer_traj), -1, 1)
-			control.throttle = np.clip(float(throttle_traj), 0.0, 0.75)
-			control.brake = np.clip(float(brake_traj), 0, 1)
+			# ============ Smooth Steer Control ============
+			# Apply low-pass filter to steer for smoothness
+			raw_steer = float(steer_traj)
+			self.steer_history.append(raw_steer)
 			
-			# Reduce micro-braking noise
-			if control.brake < 0.05:
-				control.brake = 0.0
+			# Weighted moving average - more weight on recent values
+			if len(self.steer_history) >= 3:
+				weights = [0.1, 0.2, 0.7][-len(self.steer_history):]  # Last N weights
+				if len(self.steer_history) > len(weights):
+					weights = [0.05, 0.1, 0.15, 0.25, 0.45][-len(self.steer_history):]
+				smoothed_steer = sum(w * s for w, s in zip(weights, list(self.steer_history)[-len(weights):])) / sum(weights)
+			else:
+				smoothed_steer = raw_steer
 			
-			self.pid_metadata['steer_traj'] = float(steer_traj)
-			self.pid_metadata['throttle_traj'] = float(throttle_traj)
-			self.pid_metadata['brake_traj'] = float(brake_traj)
-
-			# Safety speed limits based on steering angle
+			control.steer = np.clip(smoothed_steer, -1, 1)
+			
+			# ============ Speed & Throttle Control ============
 			current_speed = float(tick_data['speed'])
 			abs_steer = abs(control.steer)
 			
-			# Balanced approach: moderate limits for turns, high trust for straight
-			if abs_steer > 0.3:  ## Sharp turn - strict control needed
-				speed_threshold = 4.5  ## ~16.2 km/h for sharp turns
-				if current_speed > speed_threshold:
-					overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
-					if overspeed_ratio > 0.5:
-						max_throttle = 0.1
-					elif overspeed_ratio > 0.3:
-						max_throttle = 0.3
-					elif overspeed_ratio > 0.1:
-						max_throttle = 0.5
-					else:
-						max_throttle = 0.7
-				else:
-					max_throttle = 0.7
-					
-			elif abs_steer > 0.15:  ## Medium turn - moderate control
-				speed_threshold = 7.0  ## ~25.2 km/h for medium turns
-				if current_speed > speed_threshold:
-					overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
-					if overspeed_ratio > 0.4:
-						max_throttle = 0.3
-					elif overspeed_ratio > 0.2:
-						max_throttle = 0.6
-					else:
-						max_throttle = 0.8
-				else:
-					max_throttle = 0.8
-					
-			else:  ## Straight or gentle turn - very high trust, minimal limits
-				speed_threshold = 15.0  ## ~54 km/h for straight (increased from 10.0 for more aggressive driving)
-				if current_speed > speed_threshold:
-					overspeed_ratio = (current_speed - speed_threshold) / speed_threshold
-					# Extremely tolerant overspeed handling for straight driving
-					if overspeed_ratio > 1.0:  # 100%+ overspeed (>30m/s / 108km/h)
-						max_throttle = 0.6
-					elif overspeed_ratio > 0.6:  # 60-100% overspeed
-						max_throttle = 0.8
-					else:  # <60% overspeed (up to ~24m/s / 86km/h)
-						max_throttle = 1.0
-				else:
-					max_throttle = 1.0  # Full throttle when under limit
+			# Base PID throttle/brake
+			base_throttle = np.clip(float(throttle_traj), 0.0, 0.75)
+			base_brake = np.clip(float(brake_traj), 0, 1)
 			
-			control.throttle = np.clip(control.throttle, a_min=0.0, a_max=max_throttle)
+			# Reduce micro-braking noise
+			if base_brake < 0.1:
+				base_brake = 0.0
 			
+			# ============ Stuck Detection & Recovery ============
+			# If speed is very low for extended period, force movement
+			if current_speed < self.min_speed_threshold and base_brake < 0.1:
+				self.stuck_detector += 1
+			else:
+				self.stuck_detector = max(0, self.stuck_detector - 2)  # Faster recovery
+			
+			# Activate force move if stuck too long
+			if self.stuck_detector > self.stuck_threshold:
+				self.force_move = self.creep_duration
+				self.stuck_detector = 0
+				print(f"[STUCK RECOVERY] Activating force move at step {self.step}")
+			
+			# Apply force move if active
+			if self.force_move > 0:
+				control.throttle = self.creep_throttle
+				control.brake = 0.0
+				self.force_move -= 1
+			else:
+				# Normal throttle control with turn-based limits
+				if abs_steer > 0.3:  # Sharp turn
+					speed_threshold = 4.5  # ~16.2 km/h
+					max_throttle = 0.65 if current_speed < speed_threshold else 0.4
+				elif abs_steer > 0.15:  # Medium turn
+					speed_threshold = 7.0  # ~25.2 km/h
+					max_throttle = 0.75 if current_speed < speed_threshold else 0.55
+				else:  # Straight or gentle turn
+					speed_threshold = 12.0  # ~43.2 km/h
+					max_throttle = 1.0 if current_speed < speed_threshold else 0.75
+				
+				# Minimum throttle to prevent stalling (unless braking needed)
+				min_throttle = 0.2 if current_speed < 2.0 and base_brake < 0.3 else 0.0
+				
+				control.throttle = np.clip(base_throttle, min_throttle, max_throttle)
+				control.brake = base_brake
+				
+				# Anti-stop-start: If at very low speed and not braking, be more aggressive
+				if current_speed < 1.5 and control.brake < 0.1:
+					control.throttle = max(control.throttle, 0.35)
+			
+			self.pid_metadata['steer_raw'] = raw_steer
+			self.pid_metadata['steer_smoothed'] = float(control.steer)
+			self.pid_metadata['throttle_traj'] = float(throttle_traj)
+			self.pid_metadata['brake_traj'] = float(brake_traj)
+			self.pid_metadata['stuck_counter'] = self.stuck_detector
+			self.pid_metadata['force_move'] = self.force_move
 			self.pid_metadata['steer'] = control.steer
 			self.pid_metadata['throttle'] = control.throttle
 			self.pid_metadata['brake'] = control.brake
