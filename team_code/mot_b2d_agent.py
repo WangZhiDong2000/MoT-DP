@@ -15,8 +15,9 @@ from PIL import Image
 from torchvision import transforms as T
 import imageio
 import random
+import sys
+import numpy as np
 
-# Add the project directories to the Python path
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
 leaderboard_root = str(os.path.join(project_root, 'leaderboard'))
 scenario_runner_root = str(os.path.join(project_root, 'scenario_runner'))
@@ -27,7 +28,6 @@ for path in [project_root, leaderboard_root, scenario_runner_root, mot_dp_root, 
     if os.path.exists(path) and path not in sys.path:
         sys.path.insert(0, path)
 
-# Clean sys.path to ensure all entries are strings (fix for torch.compile issue)
 sys.path = [str(p) for p in sys.path]
 
 from leaderboard.autoagents import autonomous_agent
@@ -39,13 +39,10 @@ from scipy.optimize import fsolve
 # mot dependencies
 project_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
-# Add MoT-DP paths
 mot_dp_path = str(os.path.join(os.path.dirname(os.path.dirname(project_root)), 'MoT-DP'))
 mot_path = str(os.path.join(mot_dp_path, 'mot'))
 sys.path.append(mot_dp_path)
 sys.path.append(mot_path)
-
-# Clean sys.path to ensure all entries are strings (fix for torch.compile issue)
 sys.path = [str(p) for p in sys.path]
 
 from transformers import HfArgumentParser
@@ -88,10 +85,6 @@ def create_carla_config(config_path=None):
 
 def load_best_model(checkpoint_path, config, device):
     print(f"Loading best model from: {checkpoint_path}")
-    
-    # Fix for numpy compatibility issue
-    import sys
-    import numpy as np
     if not hasattr(np, '_core'):
         sys.modules['numpy._core'] = np.core
         sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
@@ -257,14 +250,10 @@ def convert_model_dtype_with_exceptions(model, target_dtype, exclude_buffer_patt
     return model
 
 def load_model_mot(device):
-
-    # Parse arguments - use empty args to avoid conflicts with leaderboard args
     parser = HfArgumentParser((ModelArguments, InferenceArguments))
     model_args, inference_args = parser.parse_args_into_dataclasses(args=[])
 
     assert torch.cuda.is_available(), "CUDA is required"
-
-    # Set random seed
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
@@ -433,8 +422,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
 		print("✓ Diffusion policy loaded (bfloat16).")
 		
-		
-		# Clear cache after loading diffusion policy
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
 			import gc
@@ -444,9 +431,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Load MoT model
 		print("Loading MoT model...")
 		parser = HfArgumentParser((ModelArguments, InferenceArguments))
-		# Parse empty args to use defaults, avoiding conflicts with leaderboard args
 		model_args, inference_args = parser.parse_args_into_dataclasses(args=[])
-		self.inference_args = inference_args  # Store as instance variable
+		self.inference_args = inference_args  
 		self.AutoMoT = load_model_mot(device)
 		tokenizer = AutoTokenizer.from_pretrained(model_args.qwen3vl_path)
 		tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
@@ -461,37 +447,23 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
         max_num_tokens=inference_args.max_num_tokens,
     	)
 		print("✓ MoT model loaded.")
-		
-		# Initialize PID controller (using orion's controller)
+
 		self.pid_controller = OrionPIDController()
 
 		self.save_path = None
 		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
-
-		# Store previous control for odd steps
 		self.prev_control = None
-		
-		# ============ Smooth Control Additions ============
-		# Steer smoothing buffer for low-pass filtering
 		self.steer_history = deque(maxlen=5)  # Keep last 5 steer values for smoothing
-		
-		# Stuck detection and recovery
 		self.stuck_detector = 0
 		self.stuck_threshold = 100  # ~5 seconds at 20Hz
 		self.force_move = 0
 		self.creep_duration = 40  # ~2 seconds at 20Hz  
 		self.creep_throttle = 0.4
-		
-		# Speed management
-		self.min_speed_threshold = 1.0  # m/s - below this, apply recovery throttle
-		self.target_cruise_speed = 6.0  # m/s - default target speed (~21.6 km/h)
-		# ============ End Smooth Control Additions ============
+		self.min_speed_threshold = 1.0  
+		self.target_cruise_speed = 6.0  
 
-		# self.lat_ref, self.lon_ref = 42.0, 2.0
 		if SAVE_PATH is not None:
 			now = datetime.datetime.now()
-			# string = pathlib.Path(os.environ['ROUTES']).stem + '_'
-			# string += self.save_name
 			string = self.save_name
 			print (string)
 
@@ -509,10 +481,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_ego_transform = None
 		self.last_lidar = None
 		
-		# Initialize observation history buffers for accumulating historical observations
 		obs_horizon = self.config.get('obs_horizon', 4)   
 		self.obs_horizon = obs_horizon
-		self.lidar_bev_history = deque(maxlen=obs_horizon*10) # tick frequency 20hz -> 2hz
+		self.lidar_bev_history = deque(maxlen=obs_horizon*10) 
 		self.rgb_history = deque(maxlen=obs_horizon*10)
 		self.speed_history = deque(maxlen=obs_horizon*10)
 		self.theta_history = deque(maxlen=obs_horizon*10)
@@ -522,9 +493,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.waypoint_history = deque(maxlen=obs_horizon*10)
 		self.throttle_history = deque(maxlen=obs_horizon*10) 
 		self.brake_history = deque(maxlen=obs_horizon*10) 
-
-		
-		# Frame skip counter for 2Hz obs_dict construction (20Hz tick -> 2Hz obs_dict)
 		self.obs_accumulate_counter = 0
 
 	def _init(self):
@@ -544,7 +512,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(e, flush=True)
 			self.lat_ref, self.lon_ref = 0, 0
 		print(self.lat_ref, self.lon_ref, self.save_name)
-		#
+		
 		self._route_planner = RoutePlanner(4.0, 50.0, lat_ref=self.lat_ref, lon_ref=self.lon_ref)
 		self._route_planner.set_route(self._global_plan, True)
 		self.initialized = True
@@ -570,8 +538,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_history_list = list(self.rgb_history)
 		waypoint_history_list = list(self.waypoint_history)
 		
-		# Sample every 10th element from the end: -1, -11, -21, -31 (corresponding to 0s, -0.5s, -1s, -1.5s)
-		# Then reverse to get chronological order: oldest to newest
 		lidar_list = [lidar_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(lidar_history_list)]
 		speed_list = [speed_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(speed_history_list)]
 		target_point_list = [target_point_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(target_point_history_list)]
@@ -592,12 +558,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		waypoint_list = waypoint_list[::-1]
 		
 		# sample every 5 for rgb from the end
-		# Tick frequency: 20Hz (0.05s per tick)
-		# RGB sampling: every 5 ticks = 0.25s interval
-		# Indices: -1, -6, -11, -16, -21
-		# Times: 0s, -0.25s, -0.5s, -0.75s, -1.0s ✓
 		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
-		rgb_list = rgb_list[::-1]  # Reverse to get chronological order (oldest to newest)
+		rgb_list = rgb_list[::-1]  
 		
 		# Stack along time dimension
 		lidar_stacked = torch.stack(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
@@ -610,14 +572,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		waypoint_stacked = torch.stack(waypoint_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		rgb_stacked = torch.stack(rgb_list, dim=0).unsqueeze(0)  # (1, 5, C, H, W)
 		
-		# Transform historical waypoints and target_points to be relative to current position
-		# Current frame info for transformation
-		current_pos = tick_data['gps']  # numpy array [x, y] in world coordinates
-		current_theta = tick_data['theta']  # theta = compass - np.pi/2
-		# Rotation matrix from world frame to ego frame (inverse rotation by current_theta)
+
+		current_pos = tick_data['gps']  
+		current_theta = tick_data['theta']  
+		# For coordinate transformation, use theta - pi/2 (consistent with training data's ego_matrix)
+		current_theta_for_transform = current_theta - np.pi/2
 		current_R = np.array([
-			[np.cos(current_theta), np.sin(current_theta)],
-			[-np.sin(current_theta), np.cos(current_theta)]
+			[np.cos(current_theta_for_transform), np.sin(current_theta_for_transform)],
+			[-np.sin(current_theta_for_transform), np.cos(current_theta_for_transform)]
 		])
 		
 		# Transform each historical waypoint to current frame
@@ -628,36 +590,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			relative_waypoint = current_R @ (past_waypoint - current_pos)
 			waypoint_relative_list.append(torch.from_numpy(relative_waypoint).float().to('cuda'))
 		
-		# Stack the transformed waypoints
 		waypoint_relative_stacked = torch.stack(waypoint_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
-		# CRITICAL FIX: Transform historical target_points to current frame coordinate system!
-		# This matches the training data preprocessing in preprocess_pdm_lite.py:get_history_target_points()
-		#
-		# Each historical target_point was stored relative to its own frame's ego coordinate.
-		# We need to:
-		# 1. Transform from past ego frame -> world frame (using past frame's position and theta)
-		# 2. Transform from world frame -> current ego frame (using current frame's position and theta)
-		#
-		# We have:
-		# - waypoint_list: historical world positions (gps) for each frame
-		# - theta_list: historical theta values for each frame
-		# - target_point_list: target points in each frame's ego coordinate
 		
 		target_point_transformed_list = []
 		for i in range(self.obs_horizon):
-			# Get past frame's world position and orientation
 			past_world_pos = waypoint_list[i].cpu().numpy()  # [x, y] in world coordinates
-			# theta_list[i] is a tensor of shape (1, 1), need to squeeze and get item
-			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame
-			
-			# Get target point in past frame's ego coordinate
+			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame (raw compass)
+			# For coordinate transformation, use theta - pi/2 (consistent with training data's ego_matrix)
+			past_theta_for_transform = past_theta - np.pi/2
 			target_in_past_ego = target_point_list[i].squeeze().cpu().numpy()  # [x, y]
-			
-			# Rotation matrix from past ego frame to world frame
 			past_R_ego_to_world = np.array([
-				[np.cos(past_theta), -np.sin(past_theta)],
-				[np.sin(past_theta), np.cos(past_theta)]
+				[np.cos(past_theta_for_transform), -np.sin(past_theta_for_transform)],
+				[np.sin(past_theta_for_transform), np.cos(past_theta_for_transform)]
 			])
 			
 			# Step 1: Transform target point from past ego frame to world frame
@@ -668,7 +613,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			target_point_transformed_list.append(torch.from_numpy(target_in_current_ego).float().to('cuda'))
 		
-		# Stack the transformed target points
 		target_point_transformed_stacked = torch.stack(target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
 		# Concatenate all ego status features: speed + theta + throttle + brake + cmd + target_point + waypoint_relative
@@ -739,13 +683,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 	def tick(self, input_data):
 		self.step += 1
-		# Process camera
 		rgb_front =  cv2.cvtColor(input_data['CAM_FRONT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
-
-		# Process lidar - convert to ego coordinate and buffer two frames to get complete point cloud
 		lidar_ego = lidar_to_ego_coordinate(input_data['LIDAR'])
-		
-		# Get current pose information
 		gps = input_data['GPS'][1][:2]
 		compass = input_data['IMU'][1][-1]
 		
@@ -808,17 +747,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result['gps'] = pos
 		next_wp, next_cmd = self._route_planner.run_step(pos)
 		result['next_command'] = next_cmd.value
-		theta = compass - np.pi/2
+		# theta for target_point transformation (used locally in this function)
+		theta_for_transform = compass - np.pi/2
 		R = np.array([
-			[np.cos(theta), np.sin(theta)],
-			[-np.sin(theta),  np.cos(theta)]
+			[np.cos(theta_for_transform), np.sin(theta_for_transform)],
+			[-np.sin(theta_for_transform),  np.cos(theta_for_transform)]
 			])
 
 		local_command_point = np.array([next_wp[0]-pos[0], next_wp[1]-pos[1]])
 		local_command_point = R.dot(local_command_point)
 		
 		result['target_point'] = local_command_point  # numpy array (2,)
-		result['theta']=theta
+		# theta for model input should match training data format (raw compass value)
+		result['theta'] = compass
 
 		return result
 	
@@ -842,15 +783,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		theta = torch.FloatTensor([float(tick_data['theta'])]).view(1,1).to('cuda', dtype=torch.float32)
 		lidar = tick_data['lidar_bev'].to('cuda', dtype=torch.float32)
 		
-		# Convert rgb_front from numpy to tensor
 		rgb_front = torch.from_numpy(tick_data['rgb_front']).permute(2, 0, 1).float() / 255.0
 		rgb_front = rgb_front.to('cuda', dtype=torch.float32)
-		
-		# Convert gps from numpy to tensor
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
-		
-		# FIXED: Convert target_point from numpy array directly to tensor (1, 2)
-		# Matches sensor_agent.py format
 		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
 
 		# Accumulate observation history into buffers 
@@ -873,53 +808,43 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.throttle_history.append(torch.tensor(prev_control.throttle).view(1, 1).to('cuda'))
 			self.brake_history.append(torch.tensor(prev_control.brake).view(1, 1).to('cuda'))
 		
-		# Check if buffer is full (need at least 31 steps for sampling -1, -11, -21, -31)
-		buffer_size_needed = 31  # For obs_horizon=4, need at least 31 elements
+		# Check if buffer is full 
+		buffer_size_needed = 31  
 		buffer_is_full = len(self.lidar_bev_history) >= buffer_size_needed
 		
 		if not buffer_is_full:
-			# Buffer not full yet - use simple control to fill buffer
 			control = carla.VehicleControl()
 			control.steer = 0.0
-			control.throttle = 0.3
+			control.throttle = 0.5
 			control.brake = 0.0
 			self.prev_control = control
 			self.pid_metadata = {}
 			self.pid_metadata['agent'] = 'filling_buffer'
-		elif self.step % 2 == 0:  # FIXED: Changed from (self.step+1) % 2 == 0 to self.step % 2 == 0
-			# Buffer is full and it's time to update (even steps)
-			if self.step % 10 == 0:
-				print(f"[DEBUG Step {self.step}] → Taking MODEL INFERENCE branch (even step)")
-			# Build observation dictionaries from historical data
+		elif self.step % 2 == 0:  
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
 				tick_data, lidar, rgb_front, speed, theta, target_point, 
 				cmd_one_hot, waypoint
 			)
 			
-			# Convert tensors to PIL Images for MoT inferencer
-			# Following the format from visualize_mot_open_loop.py
-			# rgb_stacked shape: (1, 5, C, H, W)
 			rgb_pil_list = []
-			for i in range(rgb_stacked.shape[1]):  # Iterate over 5 frames
+			for i in range(rgb_stacked.shape[1]): 
 				rgb_tensor = rgb_stacked[0, i]  # (C, H, W)
-				# Convert from tensor to PIL Image
 				rgb_np = (rgb_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
 				rgb_pil = Image.fromarray(rgb_np, mode='RGB')
 				rgb_pil_list.append(rgb_pil)
 			
-			# Convert lidar_bev to PIL Image and put in a list (as expected by inferencer)
 			# lidar_stacked shape: (1, obs_horizon, C, H, W)
 			lidar_tensor = lidar_stacked[0, -1]  # (C, H, W) - last frame
 			lidar_np = (lidar_tensor.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
 			lidar_pil = Image.fromarray(lidar_np, mode='RGB')
-			lidar_pil_list = [lidar_pil]  # Put in a list like visualize_mot_open_loop.py
+			lidar_pil_list = [lidar_pil]  
 			
-			# Get MoT reasoning - matching visualize_mot_open_loop.py format
+
 			prompt_cleaned , understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point)
 			
 			predicted_answer = self.inferencer(
                 image=rgb_pil_list,
-                lidar=lidar_pil_list,  # Pass as list
+                lidar=lidar_pil_list,  
                 text=prompt_cleaned,
                 understanding_output=understanding_output,
                 reasoning_output=reasoning_output,
@@ -929,7 +854,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
             )
 
 			# Get diffusion policy action
-			# Convert all inputs to bfloat16 to match model dtype
 			dp_obs_dict = {
 	                'lidar_bev': lidar_stacked.to(torch.bfloat16),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
 	                'ego_status': ego_status_stacked.to(torch.bfloat16),  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
@@ -942,18 +866,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			pred = torch.from_numpy(result['action'])
 			print(pred)
 
-			# Control with PID controller (orion style)
-			# orion's control_pid expects: (waypoints: np.array, speed: scalar, target: np.array)
-			# pred shape: (1, pred_horizon, 2) - need to extract and convert
-			waypoints_np = pred[0].cpu().numpy()  # (pred_horizon, 2) - [x, y] format
-			# orion expects waypoints in [x, y] format where y is forward, x is lateral
-			# Our model outputs [x, y] where x is lateral (right+), y is forward
-			# Need to swap to [y, x] for orion's coordinate convention
-			waypoints_np = waypoints_np[:, [1, 0]]  # Swap to [forward, lateral]
+			waypoints_np = pred[0].cpu().numpy()  
+			waypoints_np = waypoints_np[:, [1, 0]]  
 			
 			speed_scalar = float(tick_data['speed'])
 			target_np = target_point.squeeze().cpu().numpy()  # (2,)
-			target_np = target_np[[1, 0]]  # Swap to [forward, lateral] for orion
+			target_np = target_np[[1, 0]]  
 			
 			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(
 				waypoints_np, speed_scalar, target_np
@@ -965,15 +883,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['agent'] = 'only_traj'
 			
 			# ============ Smooth Steer Control ============
-			# Apply low-pass filter to steer for smoothness
+			# Speed-adaptive smoothing: stronger smoothing at high speeds for stability
 			raw_steer = float(steer_traj)
 			self.steer_history.append(raw_steer)
+			current_speed = float(tick_data['speed'])
 			
-			# Weighted moving average - more weight on recent values
 			if len(self.steer_history) >= 3:
-				weights = [0.1, 0.2, 0.7][-len(self.steer_history):]  # Last N weights
-				if len(self.steer_history) > len(weights):
-					weights = [0.05, 0.1, 0.15, 0.25, 0.45][-len(self.steer_history):]
+				# Use stronger smoothing at high speeds to reduce oscillation
+				if current_speed > 8.0:  # High speed: strong smoothing
+					weights = [0.05, 0.10, 0.15, 0.25, 0.45][-len(self.steer_history):]
+				elif current_speed > 5.0:  # Medium speed: moderate smoothing
+					weights = [0.10, 0.20, 0.30, 0.40][-len(self.steer_history):]
+				else:  # Low speed: minimal smoothing for maximum responsiveness at intersections
+					weights = [0.20, 0.30, 0.50][-len(self.steer_history):]
+				
 				smoothed_steer = sum(w * s for w, s in zip(weights, list(self.steer_history)[-len(weights):])) / sum(weights)
 			else:
 				smoothed_steer = raw_steer
@@ -981,7 +904,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			control.steer = np.clip(smoothed_steer, -1, 1)
 			
 			# ============ Speed & Throttle Control ============
-			current_speed = float(tick_data['speed'])
 			abs_steer = abs(control.steer)
 			
 			# Base PID throttle/brake
@@ -993,7 +915,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				base_brake = 0.0
 			
 			# ============ Stuck Detection & Recovery ============
-			# If speed is very low for extended period, force movement
 			if current_speed < self.min_speed_threshold and base_brake < 0.1:
 				self.stuck_detector += 1
 			else:
@@ -1012,24 +933,32 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.force_move -= 1
 			else:
 				# Normal throttle control with turn-based limits
-				if abs_steer > 0.3:  # Sharp turn
-					speed_threshold = 4.0  # ~14.4 km/h (提高从3.5)
+				# Stricter limits during turns to prevent overshooting lanes
+				if abs_steer > 0.3:  # Sharp turn - very conservative speed
+					speed_threshold = 3.5  # ~12.6 km/h
+					max_throttle = 0.5 if current_speed < speed_threshold else 0.25
+				elif abs_steer > 0.15:  # Medium turn - moderate speed limit
+					speed_threshold = 5.0  # ~18 km/h
 					max_throttle = 0.6 if current_speed < speed_threshold else 0.35
-				elif abs_steer > 0.15:  # Medium turn
-					speed_threshold = 5.5  # ~19.8 km/h (提高从5.0)
-					max_throttle = 0.7 if current_speed < speed_threshold else 0.45
-				else:  # Straight or gentle turn
-					speed_threshold = 6.5  # ~23.4 km/h (提高从5.5，避免过度限速)
+				else:  # Straight or gentle turn - normal speed
+					speed_threshold = 6.5  # ~23.4 km/h
 					max_throttle = 0.75 if current_speed < speed_threshold else 0.55
 				
-				# Minimum throttle to prevent stalling (unless braking needed)
-				min_throttle = 0.2 if current_speed < 2.0 and base_brake < 0.3 else 0.0
+				# Check if model explicitly wants to stop (brake active or very low desired speed)
+				model_wants_stop = base_brake > 0.3 or (base_throttle < 0.1 and base_brake > 0.0)
+				
+				# Minimum throttle to prevent stalling (unless braking needed or model wants to stop)
+				if model_wants_stop:
+					min_throttle = 0.0  # No minimum throttle when model explicitly wants to stop
+				else:
+					min_throttle = 0.2 if current_speed < 2.0 and base_brake < 0.3 else 0.0
 				
 				control.throttle = np.clip(base_throttle, min_throttle, max_throttle)
 				control.brake = base_brake
 				
-				# Anti-stop-start: If at very low speed and not braking, be more aggressive
-				if current_speed < 1.5 and control.brake < 0.1:
+				# Anti-stop-start: If at very low speed and not braking and model doesn't want to stop, be more aggressive
+				# But only when not turning sharply (to avoid acceleration during tight turns)
+				if current_speed < 1.5 and control.brake < 0.1 and not model_wants_stop and abs_steer < 0.3:
 					control.throttle = max(control.throttle, 0.4)
 			
 			self.pid_metadata['steer_raw'] = raw_steer
@@ -1038,6 +967,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['brake_traj'] = float(brake_traj)
 			self.pid_metadata['stuck_counter'] = self.stuck_detector
 			self.pid_metadata['force_move'] = self.force_move
+			self.pid_metadata['model_wants_stop'] = bool(model_wants_stop)
 			self.pid_metadata['steer'] = control.steer
 			self.pid_metadata['throttle'] = control.throttle
 			self.pid_metadata['brake'] = control.brake
@@ -1045,9 +975,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Store control for next odd step
 			self.prev_control = control
 		else:
-			# On odd steps, use previous control
-			if self.step % 10 == 1:  # Print on steps 1, 11, 21, etc
-				print(f"[DEBUG Step {self.step}] → Taking REUSE_CONTROL branch (odd step)")
 			control = self.prev_control if self.prev_control is not None else carla.VehicleControl()
 			self.pid_metadata = {}
 			self.pid_metadata['agent'] = 'reused_control'
@@ -1129,54 +1056,3 @@ def algin_lidar(lidar, translation, yaw):
 	return aligned_lidar
 
 
-if __name__ == "__main__":
-	print("="*60)
-	print("Testing MOTAgent setup method")
-	print("="*60)
-	
-	# Test setup method
-	try:
-		# Create agent instance
-		agent = MOTAgent()
-		print("✓ MOTAgent instance created successfully")
-		
-		# Test with a mock config file path
-		# Set environment variable to avoid SAVE_PATH issues
-		os.environ['SAVE_PATH'] = '/tmp/mot_test'
-		
-		# Create a test config path
-		test_config_path = "/home/wang/Project/MoT-DP/config/pdm_local.yaml"
-		
-		print(f"\nTesting setup with config: {test_config_path}")
-		print("-"*60)
-		
-		# Call setup method
-		agent.setup(test_config_path)
-		
-		print("\n" + "="*60)
-		print("✓ Setup completed successfully!")
-		print("="*60)
-		
-		# Verify key attributes are initialized
-		print("\nVerifying initialized attributes:")
-		print(f"  - config loaded: {agent.config is not None}")
-		print(f"  - diffusion policy loaded: {agent.net is not None}")
-		print(f"  - MoT model loaded: {agent.AutoMoT is not None}")
-		print(f"  - inferencer initialized: {agent.inferencer is not None}")
-		print(f"  - PID controller initialized: {agent.pid_controller is not None}")
-		print(f"  - obs_horizon: {agent.obs_horizon}")
-		print(f"  - initialized flag: {agent.initialized}")
-		
-	except Exception as e:
-		print("\n" + "="*60)
-		print("✗ Setup failed with error:")
-		print("="*60)
-		import traceback
-		traceback.print_exc()
-		print("\nError details:")
-		print(f"  Type: {type(e).__name__}")
-		print(f"  Message: {str(e)}")
-	
-	print("\n" + "="*60)
-	print("Test completed")
-	print("="*60)

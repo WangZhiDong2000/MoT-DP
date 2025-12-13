@@ -29,7 +29,7 @@ class PID(object):
 
 class PIDController(object):
     
-    def __init__(self, turn_KP=1.05, turn_KI=0.5, turn_KD=0.4, turn_n=40, speed_KP=5.2, speed_KI=0.5,speed_KD=1.0, speed_n = 40,max_throttle=0.75, brake_speed=0.02,brake_ratio=1.15, clip_delta=0.25, aim_dist=3.5, angle_thresh=0.3, dist_thresh=10):
+    def __init__(self, turn_KP=1.45, turn_KI=0.5, turn_KD=0.4, turn_n=40, speed_KP=5.2, speed_KI=0.5,speed_KD=1.0, speed_n = 40,max_throttle=0.75, brake_speed=0.02,brake_ratio=1.15, clip_delta=0.25, aim_dist=3.2, angle_thresh=0.3, dist_thresh=10):
         
         self.turn_controller = PID(K_P=turn_KP, K_I=turn_KI, K_D=turn_KD, n=turn_n)
         self.speed_controller = PID(K_P=speed_KP, K_I=speed_KI, K_D=speed_KD, n=speed_n)
@@ -40,6 +40,12 @@ class PIDController(object):
         self.aim_dist = aim_dist
         self.angle_thresh = angle_thresh
         self.dist_thresh = dist_thresh
+        
+        # Speed-adaptive steering parameters
+        self.low_speed_threshold = 5.0   # Below this speed, use enhanced steering gain
+        self.high_speed_threshold = 12.0  # Above this speed, use minimum steering gain
+        self.min_steer_scale = 0.55      # Minimum steering scale at high speed
+        self.low_speed_boost = 1.15      # Boost factor for low-speed turns (especially for intersections)
 
     def control_pid(self, waypoints, speed, target):
         ''' Predicts vehicle control with a PID controller.
@@ -55,16 +61,35 @@ class PIDController(object):
         best_norm = 1e5
         desired_speed = 0
         aim = waypoints[0]
-        # desired_speed = np.linalg.norm(
-        #             waypoints[0]) * 2.0
-        desired_speed = 0.75*np.linalg.norm(
-                    waypoints[0]) *2 + 0.25*np.linalg.norm(
-                    waypoints[1] - waypoints[0])*2
+        
+        # ============ Improved Speed Calculation ============
+        # Use weights based on prediction L2 error: 1s: 0.37, 2s: 0.99, 3s: 1.88
+        # Lower error -> higher weight (inverse error weighting)
+        # Near-term segments are more reliable, far-term have more uncertainty
+        
+        # Calculate weighted speed based on all waypoint segments
+        segment_speeds = []
+        
         for i in range(num_pairs):
-            # magnitude of vectors, used for speed
-            # desired_speed += np.linalg.norm(
-            #         waypoints[i+1] - waypoints[i]) * 2.0 / num_pairs
-             # norm of vector points, used for steering
+            # Speed from segment distance
+            segment_dist = np.linalg.norm(waypoints[i+1] - waypoints[i])
+            segment_speeds.append(segment_dist * 2.0)  # Convert to m/s (assume 0.5s per step)
+        
+        # Inverse error weights: w_i = 1 / l2_error_i
+        # Assuming 6 waypoints at 0.5s intervals: 0.5s, 1s, 1.5s, 2s, 2.5s, 3s
+        # Interpolated L2 errors: ~0.2, ~0.37, ~0.68, ~0.99, ~1.44, ~1.88
+        l2_errors = [0.20, 0.37, 0.68, 0.99, 1.44, 1.88][:num_pairs]
+        weights = np.array([1.0 / err for err in l2_errors])
+        
+        # Normalize weights to sum to 1
+        weights = weights / np.sum(weights)
+        
+        # Weighted average speed
+        desired_speed = np.sum(np.array(segment_speeds) * weights)
+        
+        # ============ Steering Aim Point Selection ============
+        for i in range(num_pairs):
+            # norm of vector points, used for steering
             norm = np.linalg.norm((waypoints[i]))
             if abs(self.aim_dist-best_norm) > abs(self.aim_dist-norm):
                 aim = waypoints[i]
@@ -105,6 +130,21 @@ class PIDController(object):
             speed_scalar = float(speed.astype(np.float64))
         else:
             speed_scalar = float(speed)
+        
+        # ============ Speed-adaptive steering scaling ============
+        # At low speeds (intersections), boost steering for tighter turns
+        # At high speeds, reduce steering sensitivity to prevent oscillations
+        if speed_scalar <= self.low_speed_threshold:
+            # Apply boost at low speeds to handle tight intersection turns
+            steer_scale = self.low_speed_boost
+        elif speed_scalar >= self.high_speed_threshold:
+            steer_scale = self.min_steer_scale
+        else:
+            # Linear interpolation between low_speed_boost and min_steer_scale
+            t = (speed_scalar - self.low_speed_threshold) / (self.high_speed_threshold - self.low_speed_threshold)
+            steer_scale = self.low_speed_boost - t * (self.low_speed_boost - self.min_steer_scale)
+        
+        steer = steer * steer_scale
 
         brake = desired_speed < self.brake_speed or (speed_scalar / desired_speed) > self.brake_ratio
 
@@ -116,6 +156,7 @@ class PIDController(object):
         metadata = {
             'speed': float(speed_scalar),
             'steer': float(steer),
+            'steer_scale': float(steer_scale),
             'throttle': float(throttle),
             'brake': float(brake),
             'wp_4': tuple(waypoints[3].astype(np.float64)),
