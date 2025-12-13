@@ -29,7 +29,7 @@ class PID(object):
 
 class PIDController(object):
     
-    def __init__(self, turn_KP=1.45, turn_KI=0.5, turn_KD=0.4, turn_n=40, speed_KP=5.2, speed_KI=0.5,speed_KD=1.0, speed_n = 40,max_throttle=0.75, brake_speed=0.02,brake_ratio=1.15, clip_delta=0.25, aim_dist=3.2, angle_thresh=0.3, dist_thresh=10):
+    def __init__(self, turn_KP=1.45, turn_KI=0.5, turn_KD=0.4, turn_n=40, speed_KP=3.8, speed_KI=0.4,speed_KD=0.8, speed_n = 40,max_throttle=0.75, brake_speed=0.02,brake_ratio=1.15, clip_delta=0.20, aim_dist=3.2, angle_thresh=0.3, dist_thresh=10):
         
         self.turn_controller = PID(K_P=turn_KP, K_I=turn_KI, K_D=turn_KD, n=turn_n)
         self.speed_controller = PID(K_P=speed_KP, K_I=speed_KI, K_D=speed_KD, n=speed_n)
@@ -75,11 +75,19 @@ class PIDController(object):
             segment_dist = np.linalg.norm(waypoints[i+1] - waypoints[i])
             segment_speeds.append(segment_dist * 2.0)  # Convert to m/s (assume 0.5s per step)
         
-        # Inverse error weights: w_i = 1 / l2_error_i
+        # Inverse error weights with moderate, distributed trust across waypoints
         # Assuming 6 waypoints at 0.5s intervals: 0.5s, 1s, 1.5s, 2s, 2.5s, 3s
-        # Interpolated L2 errors: ~0.2, ~0.37, ~0.68, ~0.99, ~1.44, ~1.88
+        # L2 errors: 1s: 0.37, 2s: 0.99, 3s: 1.88 (from known data)
+        # Interpolated: ~0.2, ~0.37, ~0.68, ~0.99, ~1.44, ~1.88
         l2_errors = [0.20, 0.37, 0.68, 0.99, 1.44, 1.88][:num_pairs]
-        weights = np.array([1.0 / err for err in l2_errors])
+        
+        # Apply moderate, smoothly increasing penalty to distribute trust more evenly
+        # Gradual decay: 1.0, 1.15, 1.25, 1.35, 1.45, 1.6
+        trust_decay = [1.0, 1.15, 1.25, 1.35, 1.45, 1.6][:num_pairs]
+        adjusted_errors = [err * decay for err, decay in zip(l2_errors, trust_decay)]
+        
+        # Inverse error weights
+        weights = np.array([1.0 / err for err in adjusted_errors])
         
         # Normalize weights to sum to 1
         weights = weights / np.sum(weights)
@@ -110,17 +118,54 @@ class PIDController(object):
         angle_last = np.degrees(np.pi / 2 - np.arctan2(aim_last[1], aim_last[0])) / 90
         angle_target = np.degrees(np.pi / 2 - np.arctan2(target[1], target[0])) / 90
 
-        # choice of point to aim for steering, removing outlier predictions
-        # use target point if it has a smaller angle or if error is large
-        # predicted point otherwise
-        # (reduces noise in eg. straight roads, helps with sudden turn commands)
-        # use_target_to_aim = np.abs(angle_target) < np.abs(angle)
-        # use_target_to_aim = use_target_to_aim or (np.abs(angle_target-angle_last) > self.angle_thresh and target[1] < self.dist_thresh)
-        use_target_to_aim = False
-        if use_target_to_aim:
-            angle_final = angle_target
-        else:
-            angle_final = angle
+        # ============ Balanced Steering Control ============
+        # Blend model prediction with target point to prevent:
+        # 1. Oscillation during straight driving (model noise)
+        # 2. Overshooting at end of turns (late correction)
+        
+        angle_diff = abs(angle - angle_target)
+        
+        # Check if we're in straight driving scenario (small steering angles)
+        is_straight = abs(angle) < 0.08 and abs(angle_target) < 0.08
+        
+        # Determine weights based on agreement and situation
+        if is_straight:
+            # During straight driving, heavily favor target point to reduce oscillation
+            model_weight = 0.55
+            target_weight = 0.45
+        elif angle_diff < 0.08:  # Good agreement - mostly trust model but add target stability
+            model_weight = 0.75
+            target_weight = 0.25
+        elif angle_diff < 0.2:  # Moderate disagreement - balanced blend
+            model_weight = 0.55
+            target_weight = 0.45
+        elif angle_diff < 0.35:  # Significant disagreement - lean towards target
+            model_weight = 0.4
+            target_weight = 0.6
+        else:  # Large disagreement - mostly use target for safety
+            model_weight = 0.25
+            target_weight = 0.75
+        
+        # Additional check: if trajectory end direction differs from aim, reduce model trust
+        # This helps with turn completion - when angle_last is returning towards straight
+        if abs(angle_last - angle) > self.angle_thresh:
+            model_weight *= 0.8
+            target_weight = 1.0 - model_weight
+        
+        # Weighted blend
+        angle_blended = model_weight * angle + target_weight * angle_target
+        
+        # Safety constraint: limit deviation from target when target is close
+        if target[1] < self.dist_thresh and target[1] > 0.5:
+            max_deviation = 0.25  # Maximum allowed deviation from target angle
+            if abs(angle_blended - angle_target) > max_deviation:
+                if angle_blended > angle_target:
+                    angle_blended = angle_target + max_deviation
+                else:
+                    angle_blended = angle_target - max_deviation
+        
+        # Use blended angle
+        angle_final = np.clip(angle_blended, -0.8, 0.8)
 
         steer = self.turn_controller.step(angle_final)
         steer = np.clip(steer, -1.0, 1.0)
@@ -169,7 +214,11 @@ class PIDController(object):
             'angle': float(angle.astype(np.float64)),
             'angle_last': float(angle_last.astype(np.float64)),
             'angle_target': float(angle_target.astype(np.float64)),
-            'angle_final': float(angle_final.astype(np.float64)),
+            'angle_blended': float(angle_blended),
+            'angle_final': float(angle_final),
+            'model_weight': float(model_weight),
+            'target_weight': float(target_weight),
+            'is_straight': bool(is_straight),
             'delta': float(delta.astype(np.float64)),
         }
 

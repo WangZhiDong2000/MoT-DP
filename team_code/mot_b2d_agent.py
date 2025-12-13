@@ -454,13 +454,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
 		self.prev_control = None
 		self.steer_history = deque(maxlen=5)  # Keep last 5 steer values for smoothing
+		
+		# Stuck detection and recovery parameters
 		self.stuck_detector = 0
-		self.stuck_threshold = 100  # ~5 seconds at 20Hz
+		self.stuck_threshold = 60  # ~3 seconds at 20Hz (reduced from 100 for faster response)
 		self.force_move = 0
-		self.creep_duration = 40  # ~2 seconds at 20Hz  
-		self.creep_throttle = 0.4
+		self.creep_duration = 50  # ~2.5 seconds at 20Hz (increased from 40)
+		self.creep_throttle = 0.5  # Increased from 0.4 for more aggressive recovery
 		self.min_speed_threshold = 1.0  
-		self.target_cruise_speed = 6.0  
+		self.target_cruise_speed = 6.0
+		
+		# Multi-stage stuck recovery
+		self.consecutive_stuck_count = 0  # Track repeated stuck situations
+		self.backward_recovery_active = False
+		self.backward_recovery_counter = 0  
 
 		if SAVE_PATH is not None:
 			now = datetime.datetime.now()
@@ -788,6 +795,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
 		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
 
+		# ============ STAGED INITIALIZATION STRATEGY ============
+		# Training data starts from frame 10+ with stable driving history
+		# We need to match this distribution by:
+		# 1. Phase 1 (0-20): Initial acceleration to build up speed
+		# 2. Phase 2 (20-51): PID fills buffer with STABLE driving history  
+		# 3. Phase 3 (51-61): Final warmup period
+		# 4. Phase 4 (61+): Model takes over
+		
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
 		self.rgb_history.append(rgb_front)
@@ -808,18 +823,51 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.throttle_history.append(torch.tensor(prev_control.throttle).view(1, 1).to('cuda'))
 			self.brake_history.append(torch.tensor(prev_control.brake).view(1, 1).to('cuda'))
 		
-		# Check if buffer is full 
-		buffer_size_needed = 31  
-		buffer_is_full = len(self.lidar_bev_history) >= buffer_size_needed
+		# Multi-stage startup to match training distribution
+		# Training data: scen_start_frame_offset = max((obs_horizon-1)*10, 4) = 10 for obs_horizon=2
+		# This means training samples ALWAYS have stable history, NEVER see rest→motion transition
+		
+		# Buffer size = 31 frames (for obs_horizon with 10x sampling)
+		ACCEL_PHASE = 10      # Phase 1: Quick initial acceleration
+		BUFFER_PHASE = 31     # Phase 2: Fill buffer to minimum required size
+		
+		if self.step < BUFFER_PHASE:
+			buffer_is_full = False  # Still filling
+		else:
+			buffer_is_full = True   # Ready for model (step 31+)
 		
 		if not buffer_is_full:
+			# Minimal warmup: only fill buffer to minimum required size (31 frames)
 			control = carla.VehicleControl()
-			control.steer = 0.0
-			control.throttle = 0.5
-			control.brake = 0.0
+			
+			if self.step < ACCEL_PHASE:
+				# Phase 1: Quick initial acceleration (0-10 steps, ~0.5s)
+				control.steer = 0.0
+				control.throttle = 0.4  # Moderate start
+				control.brake = 0.0
+				phase_name = 'phase1_quick_accel'
+			else:
+				# Phase 2: Continue driving to fill buffer (10-31 steps, ~1s)
+				current_speed = float(tick_data['speed'])
+				target_gps = tick_data['target_point']
+				
+				# Simple control to maintain speed while filling buffer
+				speed_error = 4.5 - current_speed  # Target ~16 km/h
+				control.throttle = np.clip(0.35 + 0.08 * speed_error, 0.25, 0.55)
+				control.brake = 0.0
+				
+				# Minimal steering towards target
+				if abs(target_gps[0]) > 0.8:
+					control.steer = np.clip(target_gps[0] * 0.25, -0.25, 0.25)
+				else:
+					control.steer = 0.0
+				
+				phase_name = 'phase2_buffer_fill'
+			
 			self.prev_control = control
 			self.pid_metadata = {}
-			self.pid_metadata['agent'] = 'filling_buffer'
+			self.pid_metadata['agent'] = phase_name
+			self.pid_metadata['step'] = self.step
 		elif self.step % 2 == 0:  
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
 				tick_data, lidar, rgb_front, speed, theta, target_point, 
@@ -910,11 +958,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			base_throttle = np.clip(float(throttle_traj), 0.0, 0.75)
 			base_brake = np.clip(float(brake_traj), 0, 1)
 			
+			# Default value for model_wants_stop (will be updated in normal control path)
+			model_wants_stop = base_brake > 0.3 or (base_throttle < 0.1 and base_brake > 0.0)
+			
 			# Reduce micro-braking noise
 			if base_brake < 0.1:
 				base_brake = 0.0
 			
-			# ============ Stuck Detection & Recovery ============
+			# ============ Stuck Detection & Recovery (Multi-Stage) ============
+			# Reset backward recovery if moving
+			if current_speed > 2.0:
+				self.backward_recovery_active = False
+				self.backward_recovery_counter = 0
+				self.consecutive_stuck_count = 0
+			
 			if current_speed < self.min_speed_threshold and base_brake < 0.1:
 				self.stuck_detector += 1
 			else:
@@ -922,12 +979,31 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			# Activate force move if stuck too long
 			if self.stuck_detector > self.stuck_threshold:
+				self.consecutive_stuck_count += 1
 				self.force_move = self.creep_duration
 				self.stuck_detector = 0
-				print(f"[STUCK RECOVERY] Activating force move at step {self.step}")
+				
+				# If stuck multiple times consecutively, try backward recovery
+				if self.consecutive_stuck_count >= 3 and not self.backward_recovery_active:
+					self.backward_recovery_active = True
+					self.backward_recovery_counter = 30  # ~1.5 seconds backward
+					print(f"[STUCK RECOVERY] Activating BACKWARD recovery at step {self.step} (consecutive: {self.consecutive_stuck_count})")
+				else:
+					print(f"[STUCK RECOVERY] Activating forward force move at step {self.step}")
 			
-			# Apply force move if active
-			if self.force_move > 0:
+			# Apply backward recovery if active
+			if self.backward_recovery_active and self.backward_recovery_counter > 0:
+				control.throttle = 0.0
+				control.brake = 0.0
+				control.reverse = True
+				control.steer = 0.0  # Go straight backward
+				self.backward_recovery_counter -= 1
+				if self.backward_recovery_counter == 0:
+					self.backward_recovery_active = False
+					self.consecutive_stuck_count = 0  # Reset after backward attempt
+					self.force_move = self.creep_duration  # Follow with forward push
+			# Apply forward force move if active
+			elif self.force_move > 0:
 				control.throttle = self.creep_throttle
 				control.brake = 0.0
 				self.force_move -= 1
@@ -944,22 +1020,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					speed_threshold = 6.5  # ~23.4 km/h
 					max_throttle = 0.75 if current_speed < speed_threshold else 0.55
 				
-				# Check if model explicitly wants to stop (brake active or very low desired speed)
-				model_wants_stop = base_brake > 0.3 or (base_throttle < 0.1 and base_brake > 0.0)
-				
 				# Minimum throttle to prevent stalling (unless braking needed or model wants to stop)
 				if model_wants_stop:
 					min_throttle = 0.0  # No minimum throttle when model explicitly wants to stop
 				else:
-					min_throttle = 0.2 if current_speed < 2.0 and base_brake < 0.3 else 0.0
+					min_throttle = 0.15 if current_speed < 2.0 and base_brake < 0.3 else 0.0  # Reduced from 0.2 to 0.15
 				
 				control.throttle = np.clip(base_throttle, min_throttle, max_throttle)
 				control.brake = base_brake
 				
-				# Anti-stop-start: If at very low speed and not braking and model doesn't want to stop, be more aggressive
+				# Anti-stop-start: If at very low speed and not braking and model doesn't want to stop, apply gentle boost
 				# But only when not turning sharply (to avoid acceleration during tight turns)
 				if current_speed < 1.5 and control.brake < 0.1 and not model_wants_stop and abs_steer < 0.3:
-					control.throttle = max(control.throttle, 0.4)
+					control.throttle = max(control.throttle, 0.3)  # Reduced from 0.4 to 0.3 for less aggressive acceleration
 			
 			self.pid_metadata['steer_raw'] = raw_steer
 			self.pid_metadata['steer_smoothed'] = float(control.steer)
@@ -967,6 +1040,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['brake_traj'] = float(brake_traj)
 			self.pid_metadata['stuck_counter'] = self.stuck_detector
 			self.pid_metadata['force_move'] = self.force_move
+			self.pid_metadata['consecutive_stuck'] = self.consecutive_stuck_count
+			self.pid_metadata['backward_recovery'] = self.backward_recovery_active
 			self.pid_metadata['model_wants_stop'] = bool(model_wants_stop)
 			self.pid_metadata['steer'] = control.steer
 			self.pid_metadata['throttle'] = control.throttle
