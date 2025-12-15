@@ -763,6 +763,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		local_command_point = np.array([next_wp[0]-pos[0], next_wp[1]-pos[1]])
 		local_command_point = R.dot(local_command_point)
+		# local_command_point[0]=5.0
 		
 		result['target_point'] = local_command_point  # numpy array (2,)
 		# theta for model input should match training data format (raw compass value)
@@ -775,7 +776,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if not self.initialized:
 			self._init()
 		tick_data = self.tick(input_data)
-		
+		import pdb; pdb.set_trace()
+
 		# Prepare current observations
 		gt_velocity = torch.FloatTensor([tick_data['speed']]).to('cuda', dtype=torch.float32)
 		command = tick_data['next_command']

@@ -136,15 +136,15 @@ class PIDController(object):
         elif angle_diff < 0.08:  # Good agreement - mostly trust model but add target stability
             model_weight = 0.75
             target_weight = 0.25
-        elif angle_diff < 0.2:  # Moderate disagreement - balanced blend
-            model_weight = 0.55
-            target_weight = 0.45
-        elif angle_diff < 0.35:  # Significant disagreement - lean towards target
-            model_weight = 0.4
-            target_weight = 0.6
-        else:  # Large disagreement - mostly use target for safety
-            model_weight = 0.25
-            target_weight = 0.75
+        elif angle_diff < 0.2:  # Moderate disagreement - balanced blend (slightly reduced target weight during turning)
+            model_weight = 0.60
+            target_weight = 0.40
+        elif angle_diff < 0.35:  # Significant disagreement - lean towards target (slightly reduced target weight during turning)
+            model_weight = 0.45
+            target_weight = 0.55
+        else:  # Large disagreement - mostly use target for safety (slightly reduced target weight)
+            model_weight = 0.30
+            target_weight = 0.70
         
         # Additional check: if trajectory end direction differs from aim, reduce model trust
         # This helps with turn completion - when angle_last is returning towards straight
