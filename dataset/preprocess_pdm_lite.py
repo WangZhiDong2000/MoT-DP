@@ -250,49 +250,6 @@ def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmenta
 
     return waypoints_aug
 
-def is_sparse_numbering(folder_path):
-    """
-    Check if pt files in dp_vl_feature folder are sparsely numbered (multiples of 5).
-    
-    Args:
-        folder_path: Path to the scene folder
-        
-    Returns:
-        True if files are in multiples of 5 (sparse), False if consecutive or if folder doesn't exist
-    """
-    dp_vl_feature_dir = join(folder_path, 'dp_vl_feature')
-    
-    if not os.path.exists(dp_vl_feature_dir):
-        return False
-    
-    try:
-        pt_files = [f for f in os.listdir(dp_vl_feature_dir) if f.endswith('.pt')]
-        
-        if not pt_files:
-            return False
-        
-        # Extract frame numbers from filenames
-        frame_numbers = []
-        for f in pt_files:
-            try:
-                frame_num = int(f.split('.')[0])
-                frame_numbers.append(frame_num)
-            except (ValueError, IndexError):
-                continue
-        
-        if len(frame_numbers) < 2:
-            return False
-        
-        # Sort frame numbers
-        frame_numbers.sort()
-        
-        # Check if all frame numbers are multiples of 5
-        all_multiples_of_5 = all(num % 5 == 0 for num in frame_numbers)
-        
-        return all_multiples_of_5
-    except Exception as e:
-        return False
-
 def preprocess(folder_list, idx, tmp_dir, data_root, out_dir, 
                obs_horizon, action_horizon, sample_interval, hz_interval, save_mode):
     """
@@ -341,13 +298,6 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
     for folder_name in folders:
         folder_path = join(data_root, folder_name)
         
-        # Check if pt files in dp_vl_feature are sparsely numbered (multiples of 5)
-        # If so, skip this entire scenario
-        if is_sparse_numbering(folder_path):
-            if idx == 0:
-                print(f"\nSkipping scenario {folder_name}: pt files are in multiples of 5 (sparse numbering)")
-            continue
-        
         # Check if measurements directory exists
         measurements_dir = join(folder_path, 'measurements')
         if not os.path.exists(measurements_dir):
@@ -363,12 +313,9 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
         last_frame_idx = num_seq - last_valid_future_frame_offset - 1
 
         scene_data = []
-        STORE_BYTES = False # Whether to store image bytes or image paths
-        rgb_dir = join(folder_path, 'rgb')
         
-        # Start processing from a frame that allows for a full observation history and VQA features
-        # VQA features start from frame 0004, so we skip the first 3 frames
-        scen_start_frame_offset = max((obs_horizon - 1) * hz_interval, 4)
+        # Start processing from a frame that allows for a full observation history
+        scen_start_frame_offset = (obs_horizon - 1) * hz_interval
         
         for ii in range(scen_start_frame_offset, last_frame_idx, sample_interval):
             # --- Load all measurements needed for this sample ---
@@ -509,76 +456,29 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             frame_data['target_point_hist'] = np.array(target_points_hist)
             assert frame_data['target_point_hist'].shape == (obs_horizon, 2)
 
-            # --- Image History ---
-            rgb_hist = []
-            obs_start_idx = ii - (obs_horizon - 1) * hz_interval
-            for j in range(obs_start_idx, ii + 1, hz_interval):
-                if j < 0: continue
-                img_path = join(rgb_dir, f"{j:04d}.jpg")
-                if STORE_BYTES:
-                    try:
-                        with open(img_path, 'rb') as f:
-                            rgb_hist.append(f.read())
-                    except FileNotFoundError:
-                        rgb_hist.append(b"") # Placeholder for missing image
-                else:
-                    # Store relative path
-                    rgb_hist.append(join(folder_name, 'rgb', f"{j:04d}.jpg"))
-            
-            # Skip this sample if we don't have enough history frames (no padding allowed)
-            if len(rgb_hist) < obs_horizon:
+            # --- RGB Image (current frame only, aligned with Transfuser img_seq_len=1) ---
+            # Store relative path to RGB image
+            rgb_path = join(folder_name, 'rgb', f"{ii:04d}.jpg")
+            if not os.path.exists(join(folder_path, 'rgb', f"{ii:04d}.jpg")):
+                # Skip if RGB image doesn't exist
                 continue
-                    
-            frame_data['rgb_hist_jpg'] = rgb_hist
+            frame_data['rgb'] = rgb_path
             
-            # --- Lidar BEV History ---
-            lidar_bev_dir = join(folder_path, 'lidar_bev')
-            lidar_bev_hist = []
-            if os.path.exists(lidar_bev_dir):
-                for j in range(obs_start_idx, ii + 1, hz_interval):
-                    if j < 0: continue
-                    bev_path = join(lidar_bev_dir, f"{j:04d}.png")
-                    if STORE_BYTES:
-                        try:
-                            with open(bev_path, 'rb') as f:
-                                lidar_bev_hist.append(f.read())
-                        except FileNotFoundError:
-                            lidar_bev_hist.append(b"")
-                    else:
-                        if os.path.exists(bev_path):
-                            lidar_bev_hist.append(join(folder_name, 'lidar_bev', f"{j:04d}.png"))
-                        else:
-                            lidar_bev_hist.append(None) # Mark missing BEV image
-                
-                # Skip this sample if we don't have enough history frames (no padding allowed)
-                if len(lidar_bev_hist) < obs_horizon:
-                    continue
-            else:
-                # If lidar_bev directory doesn't exist, fill with None
-                lidar_bev_hist = [None] * obs_horizon
-                
-            frame_data['lidar_bev_hist'] = lidar_bev_hist
-
-            # --- VQA Features (dp_vl_feature) ---
-            # Load only the current frame's corresponding .pt file (no history)
-            # VQA features start from frame 0004
-            dp_vl_feature_dir = join(folder_path, 'dp_vl_feature')
-            vqa_path = None
-            
-            if ii >= 4 and os.path.exists(dp_vl_feature_dir):
-                # Load the exact frame index for current frame
-                vqa_file = join(dp_vl_feature_dir, f"{ii:04d}.pt")
-                
-                if os.path.exists(vqa_file):
-                    vqa_path = join(folder_name, 'dp_vl_feature', f"{ii:04d}.pt")
-                else:
-                    # Skip this sample if VQA feature is missing (no padding allowed)
-                    continue
-            elif ii >= 4:
-                print(f"Warning: VQA feature directory not found in {folder_name}, skipping frame {ii}...")
+            # --- LiDAR Point Cloud (current frame only, aligned with Transfuser lidar_seq_len=1) ---
+            # LiDAR data is stored as .laz files (point cloud), not BEV images
+            lidar_dir = join(folder_path, 'lidar')
+            if not os.path.exists(lidar_dir):
+                # Skip if lidar directory doesn't exist
+                if idx == 0:
+                    print(f"\nWarning: lidar directory not found in {folder_path}, skipping frame {ii}...")
                 continue
             
-            frame_data['vqa'] = vqa_path
+            # Store current frame lidar path
+            lidar_path = join(folder_name, 'lidar', f"{ii:04d}.laz")
+            if not os.path.exists(join(folder_path, 'lidar', f"{ii:04d}.laz")):
+                # Skip if lidar file doesn't exist
+                continue
+            frame_data['lidar'] = lidar_path
 
             scene_data.append(frame_data)
             
@@ -669,8 +569,8 @@ def split_train_val(in_dir, out_dir, val_ratio=0.1):
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
-    argparser.add_argument('--data-root', type=str, default='/share-data/pdm_lite_mini/' , help='Root directory of raw PDM Lite data')
-    argparser.add_argument('--out-dir', type=str, default='/share-data/pdm_lite_mini/tmp_data', help='Output directory for processed data')
+    argparser.add_argument('--data-root', type=str, default='/home/wang/Project/carla_garage/data' , help='Root directory of raw PDM Lite data')
+    argparser.add_argument('--out-dir', type=str, default='/home/wang/Project/carla_garage/data/tmp_data', help='Output directory for processed data')
     argparser.add_argument('--obs-horizon', type=int, default=4, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=6, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
     argparser.add_argument('--sample-interval', type=int, default=1, help='Interval between training samples (e.g., 10 frames)')

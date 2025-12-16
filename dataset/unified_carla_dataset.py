@@ -12,38 +12,37 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
-import textwrap
 
 
 class CARLAImageDataset(torch.utils.data.Dataset):
-    
+    """
+    Dataset for CARLA data aligned with Transfuser format.
+    Loads:
+      - rgb: current frame RGB image path (.jpg)
+      - lidar: current frame LiDAR point cloud path (.laz)
+      - Low-dimensional states (speed_hist, theta_hist, command_hist, etc.)
+    """
     
     def __init__(self,
                  dataset_path: str,
-                 image_data_root: str,
-                 mode: str = 'train'        # train or val
+                 data_root: str,
                  ):
-
-        self.image_data_root = image_data_root
+        """
+        Args:
+            dataset_path: Path to preprocessed pkl files
+            data_root: Root path where raw data (rgb, lidar) is stored
+        """
+        self.data_root = data_root
         self.dataset_path = dataset_path
-        self.mode = mode
 
-        self.image_transform = transforms.Compose([
-            transforms.Resize((256, 928)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
-        self.lidar_bev_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+        # Image transform aligned with Transfuser:
+        # - Original: 1024x512 (W x H)
+        # - Crop to: 1024x384 (crop top 384 pixels, keep full width)
+        # - Convert to tensor: (C, H, W) = (3, 384, 1024)
+        # - Keep values in [0, 255] range (Transfuser normalizes inside model)
+        # Note: Transfuser uses cv2 to load and np.transpose, we use PIL + custom transform
+        self.crop_height = 384
+        self.crop_width = 1024
     
         if not os.path.isdir(dataset_path):
             raise FileNotFoundError(f"Processed data directory not found: {dataset_path}")
@@ -72,122 +71,40 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         with open(sample_path, 'rb') as f:
             sample = pickle.load(f)
 
-        # load image data for visualization 
-        if self.mode == 'val':
-            image_paths = sample.get('rgb_hist_jpg', [])
-            images_tensor = self.load_image(image_paths, sample_path)
-
-
-        # Load LiDAR BEV features
-        lidar_bev_paths = sample.get('lidar_bev_hist', [])
-        if self.mode == 'val':
-            lidar_bev_tensor = self.load_lidar_bev(lidar_bev_paths, sample_path)
-        
-        lidar_tokens = []
-        lidar_tokens_global = []
-        for bev_path in lidar_bev_paths:
-            if bev_path is None:
-                continue
-            
-            # Infer feature paths from BEV image paths
-            # Example: Town01/data/Route_0/lidar_bev/0000.png 
-            #       -> Town01/data/Route_0/lidar_bev_features/0000_token.pt
-            bev_dir = os.path.dirname(bev_path)
-            frame_id = os.path.splitext(os.path.basename(bev_path))[0]
-            feature_dir = bev_dir.replace('lidar_bev', 'lidar_bev_features')
-                
-            token_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token.pt')
-            token_global_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token_global.pt')
-
-            lidar_token = torch.load(token_path, weights_only=True)
-            lidar_token_global = torch.load(token_global_path, weights_only=True)
-            lidar_tokens.append(lidar_token)
-            lidar_tokens_global.append(lidar_token_global)
-        
-
-        lidar_token_tensor = torch.stack(lidar_tokens)  # (obs_horizon, seq_len, 512)
-        lidar_token_global_tensor = torch.stack(lidar_tokens_global)  # (obs_horizon, 1, 512)
-        lidar_tokens.clear()  # Clear list to release references
-        lidar_tokens_global.clear()  # Clear list to release references
-        
-        # Load VQA feature from pt file
-        vqa_path = sample.get('vqa', None)
-        vqa_feature = {}
-        full_vqa_path = os.path.join(self.image_data_root, vqa_path)
-        vqa_feature = torch.load(full_vqa_path, weights_only=True)
-  
-        
         # Convert sample data
         final_sample = dict()
+        
         for key, value in sample.items():
-            if key == 'rgb_hist_jpg' and self.mode == 'val':
-                final_sample['rgb_hist_jpg'] = image_paths  
-                final_sample['image'] = images_tensor
-            elif key == 'lidar_bev_hist':
-                if self.mode == 'val':
-                    final_sample['lidar_bev'] = lidar_bev_tensor
-                    final_sample['lidar_bev_hist'] = lidar_bev_paths
-                if lidar_token_tensor is not None:
-                    final_sample['lidar_token'] = lidar_token_tensor
-                    final_sample['lidar_token_global'] = lidar_token_global_tensor
+            if key == 'rgb':
+                # Store RGB image path (relative path)
+                final_sample['rgb_path'] = value
+                # Load and transform RGB image
+                full_rgb_path = os.path.join(self.data_root, value)
+                rgb_tensor = self.load_image(full_rgb_path)
+                final_sample['rgb'] = rgb_tensor
+                
+            elif key == 'lidar':
+                # Store LiDAR path (relative path to .laz file)
+                final_sample['lidar_path'] = value
+                # Note: LiDAR point cloud loading is handled separately
+                # as it requires laspy and special processing
+                
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
                 final_sample['speed'] = torch.from_numpy(speed_data).float()
-            elif key == 'ego_waypoints':
-                final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
-            elif key == 'vqa':
-                if 'gen_vit_tokens' in vqa_feature:
-                    final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
                 
-                # Use answer_token_indexes to filter valid reasoning_query_tokens
-                if 'reasoning_query_tokens' in vqa_feature and 'answer_token_indexes' in vqa_feature:
-                    reasoning_query_tokens = vqa_feature['reasoning_query_tokens']
-                    answer_token_indexes = vqa_feature['answer_token_indexes']
-                    
-                    # Filter reasoning_query_tokens using answer_token_indexes
-                    # answer_token_indexes contains valid indices into reasoning_query_tokens
-                    valid_tokens = reasoning_query_tokens[answer_token_indexes]
-                    
-                    # Pad to fixed length of 7
-                    max_answer_tokens = 7
-                    token_dim = valid_tokens.shape[-1] if valid_tokens.dim() > 1 else 1
-                    
-                    # Pad reasoning_query_tokens to length 7
-                    if valid_tokens.shape[0] < max_answer_tokens:
-                        # Pad with zeros
-                        padding_size = max_answer_tokens - valid_tokens.shape[0]
-                        if valid_tokens.dim() == 1:
-                            padding = torch.zeros(padding_size, dtype=valid_tokens.dtype)
-                        else:
-                            padding = torch.zeros((padding_size, token_dim), dtype=valid_tokens.dtype)
-                        padded_tokens = torch.cat([valid_tokens, padding], dim=0)
-                    elif valid_tokens.shape[0] > max_answer_tokens:
-                        padded_tokens = valid_tokens[:max_answer_tokens]
-                    else:
-                        padded_tokens = valid_tokens
-                    
-                    final_sample['reasoning_query_tokens'] = padded_tokens
-                    
-                    # Pad answer_token_indexes to fixed length of 7
-                    if answer_token_indexes.shape[0] < max_answer_tokens:
-                        # Pad with -1 (invalid index)
-                        padding = torch.full((max_answer_tokens - answer_token_indexes.shape[0],), -1, dtype=answer_token_indexes.dtype)
-                        final_sample['answer_token_indexes'] = torch.cat([answer_token_indexes, padding])
-                    elif answer_token_indexes.shape[0] > max_answer_tokens:
-                        # Truncate if longer than max
-                        final_sample['answer_token_indexes'] = answer_token_indexes[:max_answer_tokens]
-                    else:
-                        final_sample['answer_token_indexes'] = answer_token_indexes
-                elif 'reasoning_query_tokens' in vqa_feature:
-                    final_sample['reasoning_query_tokens'] = vqa_feature['reasoning_query_tokens']
-
+            elif key == 'ego_waypoints':
+                # agent_pos excludes the current position (index 0)
+                final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
+                final_sample['ego_waypoints'] = torch.from_numpy(sample['ego_waypoints']).float()
+                
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
                 final_sample[key] = value
 
         # Build ego_status: concatenate historical low-dimensional states
-        # Order: speed_hist, theta_hist, throttle_hist, brake_hist, command_hist, waypoints_hist
+        # Order: speed_hist, theta_hist, command_hist, target_point_hist, waypoints_hist
         ego_status_components = []
         
         # 1. speed_hist
@@ -198,72 +115,61 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         theta_data = final_sample['theta_hist']
         ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
         
-        throttle_data = final_sample['throttle_hist']
-        ego_status_components.append(throttle_data.unsqueeze(-1))  # (obs_horizon, 1)
-
-        brake_data = final_sample['brake_hist']
-        ego_status_components.append(brake_data.unsqueeze(-1))  # (obs_horizon, 1)
-        
-        # 5. command_hist (one-hot, shape: (obs_horizon, 6))
+        # 3. command_hist (one-hot, shape: (obs_horizon, 6))
         command_data = final_sample['command_hist']
         ego_status_components.append(command_data)  # (obs_horizon, 6)
 
-        # 6. target point
+        # 4. target_point_hist
         target_point_data = final_sample['target_point_hist']
         ego_status_components.append(target_point_data)  # (obs_horizon, 2)
         
-        # 6. waypoints_hist (shape: (obs_horizon, 2))
+        # 5. waypoints_hist (shape: (obs_horizon, 2))
         waypoints_data = final_sample['waypoints_hist']
         ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
         
         # Concatenate all components along the feature dimension
-        final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
+        final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, 12)
 
         return final_sample
 
-
-
-    def load_image(self, image_paths, sample_path):
-        images = []
-        for img_path in image_paths:
-            full_img_path = os.path.join(self.image_data_root, img_path)
-            try:
-                img = Image.open(full_img_path)
-                img_tensor = self.image_transform(img)
-                images.append(img_tensor)
-                img.close()  # Close image object to prevent file handle leak
-            except Exception as e:
-                print(f"Error loading image {full_img_path}: {e}")
-                images.append(torch.zeros(3, 256, 928))
+    def load_image(self, image_path):
+        """
+        Load and transform a single RGB image (aligned with Transfuser data.py).
+        - Original: 1024x512 (W x H)
+        - Crop to: 1024x384 (top 384 pixels)
+        - Output: (3, 384, 1024) tensor with values in [0, 255]
         
-        if len(images) > 0:
-            images_tensor = torch.stack(images)
-        else:
-            images_tensor = torch.zeros(2, 3, 256, 928)  # 默认obs_horizon=2
-        
-        images.clear()  # Clear list to release references
-
-        return images_tensor
-
-    def load_lidar_bev(self, bev_paths, sample_path):
-        images = []
-        for bev_path in bev_paths:
-            full_bev_path = os.path.join(self.image_data_root, bev_path)
-            bev_image = Image.open(full_bev_path)
-            bev_tensor = self.lidar_bev_transform(bev_image)
-            images.append(bev_tensor)
-            bev_image.close()  # Close image object to prevent file handle leak
-
-        images_tensor = torch.stack(images)
-        images.clear()  # Clear list to release references
-
-        return images_tensor
+        Note: Transfuser normalizes images inside the model (normalize_imagenet),
+        so we keep values in [0, 255] range here.
+        """
+        try:
+            # Load image using PIL (RGB format)
+            img = Image.open(image_path).convert('RGB')
+            
+            # Crop top 384 pixels (same as Transfuser's crop_array)
+            # PIL crop: (left, upper, right, lower)
+            img_cropped = img.crop((0, 0, self.crop_width, self.crop_height))
+            
+            # Convert to numpy array (H, W, C) with values [0, 255]
+            img_np = np.array(img_cropped, dtype=np.float32)
+            
+            # Transpose to (C, H, W) format (same as Transfuser's np.transpose)
+            img_np = np.transpose(img_np, (2, 0, 1))
+            
+            # Convert to tensor
+            img_tensor = torch.from_numpy(img_np)
+            
+            img.close()
+            return img_tensor
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}!!!!!")
+            return torch.zeros(3, self.crop_height, self.crop_width)  # (C, H, W)
 
 # ============================================================================
 # Visualization Functions
 # ============================================================================
 
-def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projects/code/MoT-DP-1/image'):
+def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
 
     agent_pos = sample.get('agent_pos')
     waypoints_hist = sample.get('waypoints_hist')
@@ -367,88 +273,103 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
     print(f"✓ 保存轨迹可视化到: {save_path}")
 
 
-def visualize_observation_images(sample, obs_horizon, rand_idx, save_dir='/root/z_projects/code/MoT-DP-1/image'):
-
-    images = sample['image']  # shape: (obs_horizon, C, H, W)
+def visualize_observation_images(sample, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
+    """Visualize the RGB image from a sample."""
+    rgb = sample.get('rgb')  # shape: (C, H, W) = (3, 384, 1024)
     
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    if rgb is None:
+        print("No RGB image found in sample")
+        return
+    
+    print(f"RGB tensor shape: {rgb.shape if isinstance(rgb, torch.Tensor) else 'not a tensor'}")
     
     os.makedirs(save_dir, exist_ok=True)
     
-    for t, img_tensor in enumerate(images):
-        if isinstance(img_tensor, torch.Tensor):
-            img_tensor = img_tensor * std + mean
-            img_tensor = torch.clamp(img_tensor, 0, 1)
-            img_arr = img_tensor.numpy()
-        else:
-            img_arr = img_tensor
-            
-        if img_arr.shape[0] == 3:
-            img_vis = np.moveaxis(img_arr, 0, -1)
-            img_vis = (img_vis * 255).astype(np.uint8)
-        else:
-            img_vis = img_arr.astype(np.uint8)
+    if isinstance(rgb, torch.Tensor):
+        img_arr = rgb.numpy()
+    else:
+        img_arr = rgb
+    
+    print(f"Image array shape: {img_arr.shape}, dtype: {img_arr.dtype}")
+    print(f"Image array range: [{img_arr.min():.3f}, {img_arr.max():.3f}]")
         
-        plt.figure(figsize=(20, 5))
-        plt.imshow(img_vis)
-        plt.title(f'Random Sample {rand_idx} - Obs Image t={t}', fontsize=12)
-        plt.axis('off')
-        plt.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.05)
+    if img_arr.ndim == 3 and img_arr.shape[0] == 3:
+        # Convert from (C, H, W) to (H, W, C)
+        img_vis = np.moveaxis(img_arr, 0, -1)
+    else:
+        img_vis = img_arr
 
-        save_path = os.path.join(save_dir, f'sample_{rand_idx}_obs_image_t{t}.png')
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"保存观测图像到: {save_path}")
+    # Ensure uint8
+    if img_vis.dtype != np.uint8:
+        img_vis = np.clip(img_vis, 0, 255).astype(np.uint8)
+    
+    print(f"Visualization shape: {img_vis.shape}, dtype: {img_vis.dtype}")
+    print(f"Visualization range: [{img_vis.min()}, {img_vis.max()}]")
+    
+    # Save using PIL directly
+    from PIL import Image
+    img_pil = Image.fromarray(img_vis)
+    save_path = os.path.join(save_dir, f'sample_{rand_idx}_rgb.png')
+    img_pil.save(save_path)
+    print(f"✓ 保存RGB图像到: {save_path}")
 
 
 
 
 def print_sample_details(sample, dataset, rand_idx, obs_horizon, 
                         save_dir='/home/wang/Project/MoT-DP/image'):
+    """Print detailed information about a sample."""
     print(f"\n样本 {rand_idx} 的详细信息:")
+    
+    # RGB and LiDAR paths
+    rgb_path = sample.get('rgb_path')
+    lidar_path = sample.get('lidar_path')
+    if rgb_path:
+        print(f"RGB路径: {rgb_path}")
+    if lidar_path:
+        print(f"LiDAR路径: {lidar_path}")
     
     agent_pos = sample.get('agent_pos')
     if agent_pos is not None:
-        obs_agent_pos = agent_pos[:obs_horizon]
-        pred_agent_pos = agent_pos[obs_horizon:]
-        print(f"观测位置: {obs_agent_pos}")
-        print(f"预测位置: {pred_agent_pos}")
+        print(f"\n未来轨迹点 (agent_pos): shape={agent_pos.shape}")
+        print(f"  {agent_pos}")
 
     target_point = sample.get('target_point')
     if target_point is not None:
         if target_point.ndim == 2:
             target_point = target_point[0]
-        print(f"目标点 (相对): {target_point}")
-        if agent_pos is not None and len(agent_pos) > obs_horizon - 1:
-            last_obs = agent_pos[obs_horizon - 1]
-            distance_to_target = np.linalg.norm(target_point - last_obs)
-            print(f"目标点距离最后观测点的距离: {distance_to_target:.3f}")
+        print(f"\n当前目标点 (target_point): {target_point}")
 
     target_point_hist = sample.get('target_point_hist')
     if target_point_hist is not None:
-        print(f"\n历史目标点 (target_point_hist):")
-        print(f"  形状: {target_point_hist.shape}")
+        print(f"\n历史目标点 (target_point_hist): shape={target_point_hist.shape}")
         for i, tp in enumerate(target_point_hist):
             frame_idx = len(target_point_hist) - 1 - i
             print(f"  t-{frame_idx}: {tp}")
 
-    print(f"\nDataset length: {len(dataset)}")
-    first_sample = dataset[0]
-    print("Sample keys:", first_sample.keys())
-    if 'image' in first_sample:
-        print("Image shape:", first_sample['image'].shape)
-    if 'agent_pos' in first_sample:
-        print("Agent pos shape:", first_sample['agent_pos'].shape)
+    # ego_status info
+    ego_status = sample.get('ego_status')
+    if ego_status is not None:
+        print(f"\nego_status: shape={ego_status.shape}")
+        print(f"  (包含: speed, theta, command_one_hot, target_point_hist, waypoints_hist)")
 
+    print(f"\n========== Dataset Info ==========")
+    print(f"Dataset length: {len(dataset)}")
+    first_sample = dataset[0]
+    print("Sample keys:", list(first_sample.keys()))
+    
     print("\nKey fields:")
-    for key in ['town_name', 'speed', 'command', 'next_command', 'target_point', 
-                'target_point_hist', 'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed', 'gen_vit_tokens']:
+    for key in ['rgb', 'lidar_path', 'speed', 'command', 'next_command', 'target_point', 
+                'target_point_hist', 'ego_waypoints', 'agent_pos', 'ego_status',
+                'waypoints_hist', 'speed_hist', 'theta_hist', 'command_hist']:
         if key in first_sample:
             value = first_sample[key]
-            print(f"  {key}: shape={getattr(value, 'shape', 'N/A')}, type={type(value)}")
-            if hasattr(value, '__len__') and not isinstance(value, str):
-                print(f"    Length: {len(value)}")
+            if isinstance(value, torch.Tensor):
+                print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
+            elif isinstance(value, np.ndarray):
+                print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
+            else:
+                print(f"  {key}: type={type(value).__name__}")
 
 
 # ============================================================================
@@ -456,25 +377,18 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon,
 # ============================================================================
 
 def test_pdm():
-    """Test with PDM Lite dataset."""
+    """Test with PDM Lite dataset (aligned with Transfuser format)."""
     import random
     
-    dataset_path = '/share-data/pdm_lite_mini/tmp_data/val'
+    # Update these paths according to your setup
+    dataset_path = '/home/wang/Project/carla_garage/data/tmp_data/val'
+    data_root = '/home/wang/Project/carla_garage/data'
     obs_horizon = 4
-    """
-    Prints detailed information about a sample and the dataset.
     
-    Args:
-        sample (dict): Data sample
-        dataset (CARLAImageDataset): Dataset object
-        rand_idx (int): Sample index
-        obs_horizon (int): Number of observation frames
-        save_dir (str): Directory for saving visualizations
-    """
-    print("\n========== Testing PDM Lite Dataset ==========")
+    print("\n========== Testing PDM Lite Dataset (Transfuser Format) ==========")
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        image_data_root='/share-data/pdm_lite_mini/'
+        data_root=data_root
     )
     
     print(f"\n总样本数: {len(dataset)}")
@@ -486,138 +400,26 @@ def test_pdm():
     rand_sample = dataset[rand_idx]
     print(f"\n随机选择的样本索引: {rand_idx}")
 
-    print("\nSample keys:", rand_sample.keys())
+    print("\n========== Sample Keys ==========")
     for key, value in rand_sample.items():
         if isinstance(value, torch.Tensor):
             print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
+        elif isinstance(value, str):
+            print(f"  {key}: {value}")
         else:
-            print(f"  {key}: type={type(value)}")
+            print(f"  {key}: type={type(value).__name__}")
 
-    # visualize_trajectory(rand_sample, obs_horizon, rand_idx)
+    # Print detailed sample info
     print_sample_details(rand_sample, dataset, rand_idx, obs_horizon)
-
-
-def check_missing_gen_vit_tokens(dataset_path, image_data_root, batch_size=32, num_workers=4):
-    """
-    使用 CARLAImageDataset 和 DataLoader batch 方式检查缺失的 gen_vit_tokens
     
-    Args:
-        dataset_path (str): 数据集路径
-        image_data_root (str): 图像数据根目录
-        batch_size (int): 批处理大小
-        num_workers (int): 数据加载的工作进程数
-    """
-    print("\n========== Checking for Missing gen_vit_tokens (using CARLAImageDataset) ==========")
+    # Visualize trajectory
+    visualize_trajectory(rand_sample, obs_horizon, rand_idx)
     
-    try:
-        # Create dataset
-        dataset = CARLAImageDataset(
-            dataset_path=dataset_path,
-            image_data_root=image_data_root
-        )
-        
-        print(f"\n总样本数: {len(dataset)}")
-        
-        if len(dataset) == 0:
-            print("数据为空，无法进行检查。")
-            return
-        
-        # Custom collate function to handle mixed types
-        def custom_collate_fn(batch):
-            return batch
-        
-        # Create DataLoader
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues with custom collate
-            pin_memory=False,
-            collate_fn=custom_collate_fn,
-            drop_last=False
-        )
-        
-        missing_gen_vit_tokens = []
-        samples_with_gen_vit_tokens = 0
-        stats_by_key = {}
-        
-        # Iterate through batches
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Checking samples")):
-            # Each item in batch is a sample dict
-            for sample_idx_in_batch, sample in enumerate(batch):
-                # Check for gen_vit_tokens
-                if 'gen_vit_tokens' not in sample:
-                    global_idx = batch_idx * batch_size + sample_idx_in_batch
-                    sample_file = dataset.sample_files[global_idx] if global_idx < len(dataset.sample_files) else "unknown"
-                    missing_gen_vit_tokens.append({
-                        'sample_idx': global_idx,
-                        'sample_file': sample_file,
-                        'available_keys': list(sample.keys())
-                    })
-                else:
-                    samples_with_gen_vit_tokens += 1
-                    # Record statistics about keys
-                    for key in sample.keys():
-                        if key not in stats_by_key:
-                            stats_by_key[key] = 0
-                        stats_by_key[key] += 1
-        
-        # Print summary
-        print("\n" + "="*80)
-        print("SUMMARY:")
-        print("="*80)
-        print(f"✓ Samples with gen_vit_tokens: {samples_with_gen_vit_tokens}")
-        print(f"✗ Samples missing gen_vit_tokens: {len(missing_gen_vit_tokens)}")
-        print(f"Total samples checked: {len(dataset)}")
-        
-        print("\n" + "-"*80)
-        print("样本中包含的键统计:")
-        print("-"*80)
-        for key, count in sorted(stats_by_key.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count * 100) // (len(dataset) if len(dataset) > 0 else 1)
-            print(f"  {key}: {count}/{len(dataset)} ({percentage}%)")
-        
-        if missing_gen_vit_tokens:
-            print("\n" + "-"*80)
-            print("Samples MISSING gen_vit_tokens:")
-            print("-"*80)
-            for item in missing_gen_vit_tokens[:10]:  # Show first 10
-                print(f"\n  Sample Index: {item['sample_idx']}")
-                print(f"  Sample File: {os.path.basename(item['sample_file'])}")
-                print(f"  Available keys: {item['available_keys']}")
-            
-            if len(missing_gen_vit_tokens) > 10:
-                print(f"\n  ... and {len(missing_gen_vit_tokens) - 10} more samples missing gen_vit_tokens")
-        
-        return {
-            'total_samples': len(dataset),
-            'samples_with_gen_vit_tokens': samples_with_gen_vit_tokens,
-            'missing_gen_vit_tokens': missing_gen_vit_tokens,
-            'stats_by_key': stats_by_key
-        }
-    
-    except Exception as e:
-        print(f"✗ Error during checking: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    # Visualize RGB image
+    visualize_observation_images(rand_sample, rand_idx)
 
     
 if __name__ == "__main__":
-    # test_pdm()
-    
-    # Check for missing gen_vit_tokens - train dataset
-    print("\n" + "="*80)
-    print("CHECKING TRAIN DATASET")
-    print("="*80)
-    dataset_path_train = '/share-data/pdm_lite_mini/tmp_data/train'
-    image_data_root = '/share-data/pdm_lite_mini/'
-    result_train = check_missing_gen_vit_tokens(dataset_path_train, image_data_root)
-    
-    # Check for missing gen_vit_tokens - val dataset
-    print("\n" + "="*80)
-    print("CHECKING VAL DATASET")
-    print("="*80)
-    dataset_path_val = '/share-data/pdm_lite_mini/tmp_data/val'
-    result_val = check_missing_gen_vit_tokens(dataset_path_val, image_data_root)
+    test_pdm()
+
 
