@@ -12,15 +12,27 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
+import cv2
+import laspy
 
 
 class CARLAImageDataset(torch.utils.data.Dataset):
     """
-    Dataset for CARLA data aligned with Transfuser format.
-    Loads:
-      - rgb: current frame RGB image path (.jpg)
-      - lidar: current frame LiDAR point cloud path (.laz)
-      - Low-dimensional states (speed_hist, theta_hist, command_hist, etc.)
+    Dataset for CARLA data strictly aligned with Transfuser format.
+    
+    RGB Processing (same as Transfuser data.py):
+      1. cv2.imread -> BGR format
+      2. cv2.cvtColor BGR->RGB
+      3. crop_array: crop to (384, 1024) from top
+      4. np.transpose to (C, H, W) = (3, 384, 1024)
+      5. Values in [0, 255] range (normalization happens inside model)
+    
+    LiDAR Processing (same as Transfuser data.py):
+      1. laspy.read -> xyz point cloud (N, 3)
+      2. lidar_to_histogram_features -> (2, 256, 256) BEV histogram
+         - Split by height (below/above lidar_split_height)
+         - Voxelize to 256x256 grid with pixels_per_meter=4.0
+         - Range: x=[-32,32], y=[-32,32]
     """
     
     def __init__(self,
@@ -35,14 +47,24 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self.data_root = data_root
         self.dataset_path = dataset_path
 
-        # Image transform aligned with Transfuser:
-        # - Original: 1024x512 (W x H)
-        # - Crop to: 1024x384 (crop top 384 pixels, keep full width)
-        # - Convert to tensor: (C, H, W) = (3, 384, 1024)
-        # - Keep values in [0, 255] range (Transfuser normalizes inside model)
-        # Note: Transfuser uses cv2 to load and np.transpose, we use PIL + custom transform
-        self.crop_height = 384
-        self.crop_width = 1024
+        # ========== Transfuser Config Parameters ==========
+        # Image cropping (from config.py)
+        self.crop_image = True
+        self.cropped_height = 384  # crops off the bottom part
+        self.cropped_width = 1024  # crops off both sides symmetrically
+        
+        # LiDAR BEV parameters (from config.py)
+        self.pixels_per_meter = 4.0
+        self.hist_max_per_pixel = 5
+        self.lidar_split_height = 0.2  # Height to split LiDAR into 2 channels
+        self.use_ground_plane = False  # Whether to use ground plane channel
+        self.min_x = -32
+        self.max_x = 32
+        self.min_y = -32
+        self.max_y = 32
+        self.max_height_lidar = 100.0  # Remove points above this height
+        self.lidar_resolution_width = 256
+        self.lidar_resolution_height = 256
     
         if not os.path.isdir(dataset_path):
             raise FileNotFoundError(f"Processed data directory not found: {dataset_path}")
@@ -78,7 +100,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             if key == 'rgb':
                 # Store RGB image path (relative path)
                 final_sample['rgb_path'] = value
-                # Load and transform RGB image
+                # Load and transform RGB image (strictly following Transfuser)
                 full_rgb_path = os.path.join(self.data_root, value)
                 rgb_tensor = self.load_image(full_rgb_path)
                 final_sample['rgb'] = rgb_tensor
@@ -86,8 +108,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             elif key == 'lidar':
                 # Store LiDAR path (relative path to .laz file)
                 final_sample['lidar_path'] = value
-                # Note: LiDAR point cloud loading is handled separately
-                # as it requires laspy and special processing
+                # Load and transform LiDAR point cloud (strictly following Transfuser)
+                full_lidar_path = os.path.join(self.data_root, value)
+                lidar_bev = self.load_lidar(full_lidar_path)
+                final_sample['lidar_bev'] = lidar_bev
                 
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
@@ -132,38 +156,140 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 
         return final_sample
 
+    def crop_array(self, images_i):
+        """
+        Crop RGB images to the desired height and width.
+        Strictly follows Transfuser's transfuser_utils.crop_array().
+        
+        Args:
+            images_i: numpy array with shape (H, W, C) or (H, W)
+        Returns:
+            Cropped array with shape (cropped_height, cropped_width, C) or (cropped_height, cropped_width)
+        """
+        if self.crop_image:
+            # crops rgb/depth/semantics from the bottom to cropped_height 
+            # and symmetrically from both sides to cropped_width
+            assert self.cropped_height <= images_i.shape[0]
+            assert self.cropped_width <= images_i.shape[1]
+            side_crop_amount = (images_i.shape[1] - self.cropped_width) // 2
+            if len(images_i.shape) > 2:  # for rgb, we have 3 channels
+                return images_i[0:self.cropped_height, side_crop_amount:images_i.shape[1] - side_crop_amount, :]
+            else:  # for depth and semantics, there is no channel dimension
+                return images_i[0:self.cropped_height, side_crop_amount:images_i.shape[1] - side_crop_amount]
+        else:
+            return images_i
+
     def load_image(self, image_path):
         """
-        Load and transform a single RGB image (aligned with Transfuser data.py).
-        - Original: 1024x512 (W x H)
-        - Crop to: 1024x384 (top 384 pixels)
-        - Output: (3, 384, 1024) tensor with values in [0, 255]
+        Load and transform a single RGB image.
+        Strictly follows Transfuser data.py:
+          1. cv2.imread (BGR)
+          2. cv2.cvtColor BGR->RGB  
+          3. crop_array
+          4. np.transpose to (C, H, W)
         
-        Note: Transfuser normalizes images inside the model (normalize_imagenet),
-        so we keep values in [0, 255] range here.
+        Output: (3, 384, 1024) tensor with values in [0, 255] float32
         """
         try:
-            # Load image using PIL (RGB format)
-            img = Image.open(image_path).convert('RGB')
+            # Step 1: Load image using cv2 (BGR format) - same as Transfuser
+            images_i = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if images_i is None:
+                raise FileNotFoundError(f"cv2.imread returned None for {image_path}")
             
-            # Crop top 384 pixels (same as Transfuser's crop_array)
-            # PIL crop: (left, upper, right, lower)
-            img_cropped = img.crop((0, 0, self.crop_width, self.crop_height))
+            # Step 2: Convert BGR to RGB - same as Transfuser
+            images_i = cv2.cvtColor(images_i, cv2.COLOR_BGR2RGB)
             
-            # Convert to numpy array (H, W, C) with values [0, 255]
-            img_np = np.array(img_cropped, dtype=np.float32)
+            # Step 3: Crop to (384, 1024) - same as Transfuser's crop_array
+            images_i = self.crop_array(images_i)
             
-            # Transpose to (C, H, W) format (same as Transfuser's np.transpose)
-            img_np = np.transpose(img_np, (2, 0, 1))
+            # Step 4: Transpose to (C, H, W) format - same as Transfuser
+            # data['rgb'] = np.transpose(processed_image, (2, 0, 1))
+            images_i = np.transpose(images_i, (2, 0, 1)).astype(np.float32)
             
             # Convert to tensor
-            img_tensor = torch.from_numpy(img_np)
+            img_tensor = torch.from_numpy(images_i)
             
-            img.close()
             return img_tensor
         except Exception as e:
-            print(f"Error loading image {image_path}: {e}!!!!!")
-            return torch.zeros(3, self.crop_height, self.crop_width)  # (C, H, W)
+            print(f"Error loading image {image_path}: {e}")
+            return torch.zeros(3, self.cropped_height, self.cropped_width, dtype=torch.float32)
+
+    def load_lidar(self, lidar_path):
+        """
+        Load and transform LiDAR point cloud to BEV histogram.
+        Strictly follows Transfuser data.py:
+          1. laspy.read -> xyz point cloud
+          2. lidar_to_histogram_features -> (C, 256, 256) BEV
+        
+        Output: (1 or 2, 256, 256) tensor depending on use_ground_plane
+        """
+        try:
+            # Step 1: Load LiDAR using laspy - same as Transfuser
+            las_object = laspy.read(lidar_path)
+            lidar = las_object.xyz  # (N, 3) numpy array
+            
+            # Step 2: Convert to histogram features - same as Transfuser
+            lidar_bev = self.lidar_to_histogram_features(lidar)
+            
+            # Convert to tensor
+            lidar_tensor = torch.from_numpy(lidar_bev)
+            
+            return lidar_tensor
+        except Exception as e:
+            print(f"Error loading LiDAR {lidar_path}: {e}")
+            # Return zeros with correct shape based on use_ground_plane
+            num_channels = 2 if self.use_ground_plane else 1
+            return torch.zeros(num_channels, self.lidar_resolution_height, self.lidar_resolution_width, 
+                             dtype=torch.float32)
+
+    def lidar_to_histogram_features(self, lidar):
+        """
+        Convert LiDAR point cloud into 2-bin histogram over a fixed size grid.
+        Strictly follows Transfuser data.py lidar_to_histogram_features().
+        
+        Args:
+            lidar: (N, 3) numpy array, LiDAR point cloud in ego coordinates
+        Returns:
+            (C, H, W) numpy array, LiDAR as sparse BEV image
+            C = 2 if use_ground_plane else 1
+        """
+        def splat_points(point_cloud):
+            """Voxelize points to 256x256 grid."""
+            # 256 x 256 grid
+            xbins = np.linspace(
+                self.min_x, self.max_x,
+                (self.max_x - self.min_x) * int(self.pixels_per_meter) + 1
+            )
+            ybins = np.linspace(
+                self.min_y, self.max_y,
+                (self.max_y - self.min_y) * int(self.pixels_per_meter) + 1
+            )
+            hist = np.histogramdd(point_cloud[:, :2], bins=(xbins, ybins))[0]
+            hist[hist > self.hist_max_per_pixel] = self.hist_max_per_pixel
+            overhead_splat = hist / self.hist_max_per_pixel
+            # The transpose here is an efficient axis swap.
+            # Comes from the fact that carla is x front, y right, whereas the image is y front, x right
+            # (x height channel, y width channel)
+            return overhead_splat.T
+
+        # Remove points above the vehicle
+        lidar = lidar[lidar[..., 2] < self.max_height_lidar]
+        
+        # Split by height
+        below = lidar[lidar[..., 2] <= self.lidar_split_height]
+        above = lidar[lidar[..., 2] > self.lidar_split_height]
+        
+        below_features = splat_points(below)
+        above_features = splat_points(above)
+        
+        if self.use_ground_plane:
+            features = np.stack([below_features, above_features], axis=-1)
+        else:
+            features = np.stack([above_features], axis=-1)
+        
+        # Transpose to (C, H, W) format
+        features = np.transpose(features, (2, 0, 1)).astype(np.float32)
+        return features
 
 # ============================================================================
 # Visualization Functions
@@ -314,6 +440,49 @@ def visualize_observation_images(sample, rand_idx, save_dir='/home/wang/Project/
     print(f"✓ 保存RGB图像到: {save_path}")
 
 
+def visualize_lidar_bev(sample, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
+    """Visualize the LiDAR BEV histogram from a sample."""
+    lidar_bev = sample.get('lidar_bev')  # shape: (C, H, W) = (1 or 2, 256, 256)
+    
+    if lidar_bev is None:
+        print("No LiDAR BEV found in sample")
+        return
+    
+    print(f"LiDAR BEV tensor shape: {lidar_bev.shape if isinstance(lidar_bev, torch.Tensor) else 'not a tensor'}")
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    if isinstance(lidar_bev, torch.Tensor):
+        lidar_arr = lidar_bev.numpy()
+    else:
+        lidar_arr = lidar_bev
+    
+    print(f"LiDAR array shape: {lidar_arr.shape}, dtype: {lidar_arr.dtype}")
+    print(f"LiDAR array range: [{lidar_arr.min():.3f}, {lidar_arr.max():.3f}]")
+    
+    # Create visualization
+    num_channels = lidar_arr.shape[0]
+    fig, axes = plt.subplots(1, num_channels, figsize=(6 * num_channels, 6))
+    if num_channels == 1:
+        axes = [axes]
+    
+    channel_names = ['Above Split Height', 'Below Split Height'] if num_channels == 2 else ['Above Split Height']
+    
+    for i, (ax, name) in enumerate(zip(axes, channel_names)):
+        im = ax.imshow(lidar_arr[i], cmap='hot', vmin=0, vmax=1)
+        ax.set_title(f'{name}\nChannel {i}', fontsize=12)
+        ax.set_xlabel('Y (pixels)')
+        ax.set_ylabel('X (pixels)')
+        plt.colorbar(im, ax=ax, label='Normalized hits')
+    
+    plt.suptitle(f'Sample {rand_idx} - LiDAR BEV (256x256)', fontsize=14, fontweight='bold')
+    
+    save_path = os.path.join(save_dir, f'sample_{rand_idx}_lidar_bev.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+    print(f"✓ 保存LiDAR BEV到: {save_path}")
+
+
 
 
 def print_sample_details(sample, dataset, rand_idx, obs_horizon, 
@@ -359,7 +528,7 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon,
     print("Sample keys:", list(first_sample.keys()))
     
     print("\nKey fields:")
-    for key in ['rgb', 'lidar_path', 'speed', 'command', 'next_command', 'target_point', 
+    for key in ['rgb', 'lidar_bev', 'lidar_path', 'speed', 'command', 'next_command', 'target_point', 
                 'target_point_hist', 'ego_waypoints', 'agent_pos', 'ego_status',
                 'waypoints_hist', 'speed_hist', 'theta_hist', 'command_hist']:
         if key in first_sample:
@@ -417,6 +586,9 @@ def test_pdm():
     
     # Visualize RGB image
     visualize_observation_images(rand_sample, rand_idx)
+    
+    # Visualize LiDAR BEV
+    visualize_lidar_bev(rand_sample, rand_idx)
 
     
 if __name__ == "__main__":
