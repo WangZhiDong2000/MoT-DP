@@ -121,6 +121,7 @@ dependencies:
       - jinja2==3.1.6
       - kiwisolver==1.4.9
       - laspy==2.6.1
+      - lazrs==0.8.0
       - markdown-it-py==4.0.0
       - markupsafe==3.0.3
       - matplotlib==3.7.0
