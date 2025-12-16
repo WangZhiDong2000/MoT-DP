@@ -47,24 +47,47 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         self.data_root = data_root
         self.dataset_path = dataset_path
 
-        # ========== Transfuser Config Parameters ==========
-        # Image cropping (from config.py)
+        # ========== Transfuser Config Parameters (from config.py) ==========
+        # All parameters must match exactly with Transfuser to use pretrained backbone
+        
+        # Camera and Image cropping (lines 360-366)
+        self.camera_width = 1024
+        self.camera_height = 512
+        self.camera_fov = 110
         self.crop_image = True
         self.cropped_height = 384  # crops off the bottom part
         self.cropped_width = 1024  # crops off both sides symmetrically
         
-        # LiDAR BEV parameters (from config.py)
+        # Dataloader parameters (lines 370-382)
+        self.carla_fps = 20
+        self.seq_len = 1
+        self.img_seq_len = 1
+        self.lidar_seq_len = 1
+        self.lidar_resolution_width = 256
+        self.lidar_resolution_height = 256
+        self.crop_bev = False
+        self.crop_bev_height_only_from_behind = False
+        
+        # LiDAR voxelization parameters (lines 392-410)
         self.pixels_per_meter = 4.0
+        self.pixels_per_meter_collection = 2.0
         self.hist_max_per_pixel = 5
-        self.lidar_split_height = 0.2  # Height to split LiDAR into 2 channels
+        self.lidar_split_height = 0.2  # Height to split LiDAR into 2 channels (relative to lidar_pos[2])
+        self.realign_lidar = True
         self.use_ground_plane = False  # Whether to use ground plane channel
+        
+        # LiDAR range for voxelization (lines 401-410)
         self.min_x = -32
         self.max_x = 32
         self.min_y = -32
         self.max_y = 32
-        self.max_height_lidar = 100.0  # Remove points above this height
-        self.lidar_resolution_width = 256
-        self.lidar_resolution_height = 256
+        self.min_z = -4
+        self.max_z = 4
+        self.min_z_projection = -10
+        self.max_z_projection = 14
+        
+        # LiDAR height filter (line 763)
+        self.max_height_lidar = 100.0  # Points from LiDAR higher than this are discarded
     
         if not os.path.isdir(dataset_path):
             raise FileNotFoundError(f"Processed data directory not found: {dataset_path}")
@@ -461,21 +484,42 @@ def visualize_lidar_bev(sample, rand_idx, save_dir='/home/wang/Project/MoT-DP/im
     print(f"LiDAR array range: [{lidar_arr.min():.3f}, {lidar_arr.max():.3f}]")
     
     # Create visualization
+    # After Transfuser's transpose: shape is (C, H, W) where H=Y direction, W=X direction
+    # - Y axis (height): left (-32m) to right (+32m)  
+    # - X axis (width): back (-32m) to front (+32m)
     num_channels = lidar_arr.shape[0]
-    fig, axes = plt.subplots(1, num_channels, figsize=(6 * num_channels, 6))
+    fig, axes = plt.subplots(1, num_channels, figsize=(8 * num_channels, 7))
     if num_channels == 1:
         axes = [axes]
     
     channel_names = ['Above Split Height', 'Below Split Height'] if num_channels == 2 else ['Above Split Height']
     
-    for i, (ax, name) in enumerate(zip(axes, channel_names)):
-        im = ax.imshow(lidar_arr[i], cmap='hot', vmin=0, vmax=1)
-        ax.set_title(f'{name}\nChannel {i}', fontsize=12)
-        ax.set_xlabel('Y (pixels)')
-        ax.set_ylabel('X (pixels)')
-        plt.colorbar(im, ax=ax, label='Normalized hits')
+    # Coordinate ranges after Transfuser transpose
+    min_x, max_x = -32, 32  # X: longitudinal (front-back), displayed as image width
+    min_y, max_y = -32, 32  # Y: lateral (left-right), displayed as image height
     
-    plt.suptitle(f'Sample {rand_idx} - LiDAR BEV (256x256)', fontsize=14, fontweight='bold')
+    for i, (ax, name) in enumerate(zip(axes, channel_names)):
+        # Use origin='lower' and extent to show proper coordinates
+        # extent=[left, right, bottom, top] for image coordinates
+        # After transpose: axis 0 (rows) = Y, axis 1 (cols) = X
+        im = ax.imshow(lidar_arr[i], cmap='hot', vmin=0, vmax=1, 
+                      origin='lower', extent=[min_x, max_x, min_y, max_y])
+        ax.set_title(f'{name}\nChannel {i}', fontsize=12, fontweight='bold')
+        ax.set_xlabel('X (Longitudinal: Back <- 0 -> Front) [m]', fontsize=10)
+        ax.set_ylabel('Y (Lateral: Left <- 0 -> Right) [m]', fontsize=10)
+        
+        # Mark vehicle position at origin
+        ax.plot(0, 0, 'c*', markersize=15, markeredgewidth=2, 
+               markeredgecolor='white', label='Vehicle (0,0)')
+        ax.axhline(y=0, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
+        ax.axvline(x=0, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        plt.colorbar(im, ax=ax, label='Normalized LiDAR hits [0-1]')
+    
+    plt.suptitle(f'Sample {rand_idx} - LiDAR BEV (256x256)\nAfter Transfuser Transpose', 
+                fontsize=14, fontweight='bold')
     
     save_path = os.path.join(save_dir, f'sample_{rand_idx}_lidar_bev.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
