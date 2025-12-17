@@ -20,6 +20,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     """
     Dataset for CARLA data strictly aligned with Transfuser format.
     
+    Supports two modes:
+      - 'raw': Load raw RGB images and LiDAR point clouds, process them on-the-fly
+      - 'feature': Load pre-extracted Transfuser features (paths only, not values)
+    
     RGB Processing (same as Transfuser data.py):
       1. cv2.imread -> BGR format
       2. cv2.cvtColor BGR->RGB
@@ -38,12 +42,17 @@ class CARLAImageDataset(torch.utils.data.Dataset):
     def __init__(self,
                  dataset_path: str,
                  data_root: str,
+                 mode: str = 'raw',
                  ):
         """
         Args:
             dataset_path: Path to preprocessed pkl files
             data_root: Root path where raw data (rgb, lidar) is stored
+            mode: 'raw' to load and process raw RGB/LiDAR, 
+                  'feature' to load pre-extracted feature paths
         """
+        assert mode in ['raw', 'feature'], f"mode must be 'raw' or 'feature', got '{mode}'"
+        self.mode = mode
         self.data_root = data_root
         self.dataset_path = dataset_path
 
@@ -123,18 +132,36 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             if key == 'rgb':
                 # Store RGB image path (relative path)
                 final_sample['rgb_path'] = value
-                # Load and transform RGB image (strictly following Transfuser)
-                full_rgb_path = os.path.join(self.data_root, value)
-                rgb_tensor = self.load_image(full_rgb_path)
-                final_sample['rgb'] = rgb_tensor
+                
+                if self.mode == 'raw':
+                    # Load and transform RGB image (strictly following Transfuser)
+                    full_rgb_path = os.path.join(self.data_root, value)
+                    rgb_tensor = self.load_image(full_rgb_path)
+                    final_sample['rgb'] = rgb_tensor
+                # In 'feature' mode, features are loaded from transfuser_features/transfuser_fused_features keys
                 
             elif key == 'lidar':
                 # Store LiDAR path (relative path to .laz file)
                 final_sample['lidar_path'] = value
-                # Load and transform LiDAR point cloud (strictly following Transfuser)
-                full_lidar_path = os.path.join(self.data_root, value)
-                lidar_bev = self.load_lidar(full_lidar_path)
-                final_sample['lidar_bev'] = lidar_bev
+                
+                if self.mode == 'raw':
+                    # Load and transform LiDAR point cloud (strictly following Transfuser)
+                    full_lidar_path = os.path.join(self.data_root, value)
+                    lidar_bev = self.load_lidar(full_lidar_path)
+                    final_sample['lidar_bev'] = lidar_bev
+                # In 'feature' mode, lidar_bev is not needed (features already contain fused info)
+            
+            elif key == 'transfuser_features':
+                # Pre-extracted Transfuser features path (only used in 'feature' mode)
+                if self.mode == 'feature':
+                    # Store full path (not loading values to save memory)
+                    final_sample['features'] = os.path.join(self.data_root, value)
+                    
+            elif key == 'transfuser_fused_features':
+                # Pre-extracted Transfuser fused features path (only used in 'feature' mode)
+                if self.mode == 'feature':
+                    # Store full path (not loading values to save memory)
+                    final_sample['fused_features'] = os.path.join(self.data_root, value)
                 
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
@@ -149,6 +176,19 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
                 final_sample[key] = value
+        
+        # Fallback: if in 'feature' mode but features not in pkl, derive from rgb path
+        if self.mode == 'feature' and 'features' not in final_sample and 'rgb_path' in final_sample:
+            rgb_path = final_sample['rgb_path']
+            rgb_dir = os.path.dirname(rgb_path)  # "route_xxx/rgb"
+            scene_dir = os.path.dirname(rgb_dir)  # "route_xxx"
+            frame_id = os.path.splitext(os.path.basename(rgb_path))[0]  # "00000"
+            
+            features_rel_path = os.path.join(scene_dir, 'transfuser_features', f'{frame_id}_features.pt')
+            fused_features_rel_path = os.path.join(scene_dir, 'transfuser_features', f'{frame_id}_fused_features.pt')
+            
+            final_sample['features'] = os.path.join(self.data_root, features_rel_path)
+            final_sample['fused_features'] = os.path.join(self.data_root, fused_features_rel_path)
 
         # Build ego_status: concatenate historical low-dimensional states
         # Order: speed_hist, theta_hist, command_hist, target_point_hist, waypoints_hist
@@ -594,14 +634,15 @@ def test_pdm():
     import random
     
     # Update these paths according to your setup
-    dataset_path = '/home/wang/Project/carla_garage/data/tmp_data/val'
-    data_root = '/home/wang/Project/carla_garage/data'
+    dataset_path = '/home/wang/Project/carla_garage/data_mini/tmp_data/val'
+    data_root = '/home/wang/Project/carla_garage/data_mini'
     obs_horizon = 4
     
     print("\n========== Testing PDM Lite Dataset (Transfuser Format) ==========")
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        data_root=data_root
+        data_root=data_root,
+        mode='feature'  # Change to 'feature' to test feature loading
     )
     
     print(f"\n总样本数: {len(dataset)}")
@@ -628,11 +669,11 @@ def test_pdm():
     # Visualize trajectory
     visualize_trajectory(rand_sample, obs_horizon, rand_idx)
     
-    # Visualize RGB image
-    visualize_observation_images(rand_sample, rand_idx)
+    # # Visualize RGB image
+    # visualize_observation_images(rand_sample, rand_idx)
     
-    # Visualize LiDAR BEV
-    visualize_lidar_bev(rand_sample, rand_idx)
+    # # Visualize LiDAR BEV
+    # visualize_lidar_bev(rand_sample, rand_idx)
 
     
 if __name__ == "__main__":
