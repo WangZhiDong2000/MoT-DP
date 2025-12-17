@@ -328,7 +328,7 @@ def load_transfuser_model(checkpoint_dir, config, device='cuda'):
 # ============================================================================
 # Feature Extraction
 # ============================================================================
-def extract_features(model, image, lidar_bev, config, device='cuda'):
+def extract_features(model, image, lidar_bev, config, device='cuda', verbose=False):
     """
     Extract features from image and LiDAR using Transfuser backbone.
     
@@ -343,30 +343,50 @@ def extract_features(model, image, lidar_bev, config, device='cuda'):
         lidar_bev: (C, H, W) numpy array, LiDAR BEV
         config: Config object
         device: Device
+        verbose: Print timing information
     Returns:
         features: numpy array, BEV features
         fused_features: numpy array, fused global features
+        forward_time: Time taken for forward pass (in milliseconds)
     """
+    import time
+    
     # Convert to tensors and add batch dimension
     image_tensor = torch.from_numpy(image).unsqueeze(0).to(device)  # (1, 3, 384, 1024)
     lidar_tensor = torch.from_numpy(lidar_bev).unsqueeze(0).to(device)  # (1, C, 256, 256)
     
     with torch.no_grad():
+        # Warm up (optional)
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        
+        # Record time
+        start_time = time.time()
+        
         # Forward pass
         features, fused_features, image_feature_grid = model(image_tensor, lidar_tensor)
+        
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        end_time = time.time()
+    
+    forward_time = (end_time - start_time) * 1000  # Convert to milliseconds
+    
+    if verbose:
+        print(f"  Forward pass: {forward_time:.2f} ms")
     
     # Convert to numpy
     if features is not None:
         features = features.cpu().numpy()
     fused_features = fused_features.cpu().numpy()
     
-    return features, fused_features
+    return features, fused_features, forward_time
 
 
 # ============================================================================
 # Main Processing
 # ============================================================================
-def process_scene(scene_path, model, config, device='cuda', overwrite=False):
+def process_scene(scene_path, model, config, device='cuda', overwrite=False, verbose=False):
     """
     Process all frames in a scene and save features.
     
@@ -376,15 +396,19 @@ def process_scene(scene_path, model, config, device='cuda', overwrite=False):
         config: Config object
         device: Device
         overwrite: Whether to overwrite existing features
+        verbose: Print timing information for each frame
     Returns:
         num_processed: Number of frames processed
+        avg_forward_time: Average forward pass time (in milliseconds)
     """
+    import time as time_module
+    
     rgb_dir = os.path.join(scene_path, 'rgb')
     lidar_dir = os.path.join(scene_path, 'lidar')
     output_dir = os.path.join(scene_path, 'transfuser_features')
     
     if not os.path.exists(rgb_dir) or not os.path.exists(lidar_dir):
-        return 0
+        return 0, 0
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -394,6 +418,8 @@ def process_scene(scene_path, model, config, device='cuda', overwrite=False):
         rgb_files = sorted(glob.glob(os.path.join(rgb_dir, '*.png')))
     
     num_processed = 0
+    forward_times = []
+    
     for rgb_path in rgb_files:
         frame_id = os.path.splitext(os.path.basename(rgb_path))[0]
         
@@ -414,8 +440,11 @@ def process_scene(scene_path, model, config, device='cuda', overwrite=False):
             image = load_image(rgb_path, config)
             lidar_bev = load_lidar(lidar_path, config)
             
-            # Extract features
-            features, fused_features = extract_features(model, image, lidar_bev, config, device)
+            # Extract features (with timing)
+            features, fused_features, forward_time = extract_features(
+                model, image, lidar_bev, config, device, verbose=verbose
+            )
+            forward_times.append(forward_time)
             
             # Save features as .pt files (PyTorch format)
             if features is not None:
@@ -428,7 +457,10 @@ def process_scene(scene_path, model, config, device='cuda', overwrite=False):
             print(f"Error processing {rgb_path}: {e}")
             continue
     
-    return num_processed
+    # Calculate average forward time
+    avg_forward_time = sum(forward_times) / len(forward_times) if forward_times else 0
+    
+    return num_processed, avg_forward_time
 
 
 def find_all_scenes(data_root):
@@ -484,12 +516,30 @@ def main():
     
     # Process each scene
     total_processed = 0
-    for scene_path in tqdm(scene_paths, desc='Processing scenes'):
-        num_processed = process_scene(scene_path, model, config, device, args.overwrite)
-        total_processed += num_processed
+    all_forward_times = []
     
-    print(f"\n✓ Processed {total_processed} frames in {len(scene_paths)} scenes")
-    print(f"  Features saved to: <scene_path>/transfuser_features/")
+    for scene_path in tqdm(scene_paths, desc='Processing scenes'):
+        num_processed, avg_forward_time = process_scene(
+            scene_path, model, config, device, args.overwrite, verbose=False
+        )
+        total_processed += num_processed
+        all_forward_times.append(avg_forward_time)
+    
+    # Calculate overall statistics
+    overall_avg_time = sum(all_forward_times) / len([t for t in all_forward_times if t > 0]) if any(all_forward_times) else 0
+    
+    print(f"\n{'='*60}")
+    print(f"✓ Processing Complete")
+    print(f"{'='*60}")
+    print(f"Total frames processed: {total_processed}")
+    print(f"Scenes processed: {len(scene_paths)}")
+    print(f"\nTiming Statistics:")
+    print(f"  Average forward pass time: {overall_avg_time:.2f} ms/frame")
+    if overall_avg_time > 0:
+        fps = 1000 / overall_avg_time
+        print(f"  Equivalent throughput: {fps:.1f} fps")
+    print(f"\nFeatures saved to: <scene_path>/transfuser_features/")
+    print(f"{'='*60}")
 
 
 if __name__ == '__main__':
