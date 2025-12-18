@@ -762,8 +762,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		local_command_point = np.array([next_wp[0]-pos[0], next_wp[1]-pos[1]])
 		local_command_point = R.dot(local_command_point)
-		local_command_point[0]=local_command_point[0]/3.0
-		local_command_point[1]=local_command_point[1]
 		
 		result['target_point'] = local_command_point  # numpy array (2,)
 		# theta for model input should match training data format (raw compass value)
