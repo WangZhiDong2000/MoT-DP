@@ -54,11 +54,10 @@ class PIDController(object):
         best_norm = 1e5
         desired_speed = 0
         aim = waypoints[0]
-        # desired_speed = np.linalg.norm(
-        #             waypoints[0]) * 2.0
-        desired_speed = 0.75*np.linalg.norm(
-                    waypoints[0]) *2 + 0.25*np.linalg.norm(
-                    waypoints[1] - waypoints[0])*2
+        # Calculate desired_speed using waypoints[1] (2nd point) and waypoints[3] (4th point)
+        # waypoints[1]: closer point for immediate speed reference
+        # waypoints[3]: farther point for anticipating future trajectory
+        desired_speed = 0.75 * np.linalg.norm(waypoints[0]) * 2 + 0.25 * np.linalg.norm(waypoints[2]) * 2 / 2
         for i in range(num_pairs):
             # magnitude of vectors, used for speed
             # desired_speed += np.linalg.norm(

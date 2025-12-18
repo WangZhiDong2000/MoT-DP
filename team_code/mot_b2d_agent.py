@@ -461,7 +461,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.lat_ref, self.lon_ref = 42.0, 2.0
 		control = carla.VehicleControl()
 		control.steer = 0.0
-		control.throttle = 0.0
+		control.throttle = 0.4
 		control.brake = 0.0	
 		self.prev_control = control
 
@@ -497,6 +497,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.throttle_history = deque(maxlen=obs_horizon*10) 
 		self.brake_history = deque(maxlen=obs_horizon*10) 
 		self.obs_accumulate_counter = 0
+		
+		# Store predicted trajectory for BEV visualization
+		self.last_pred_traj = None  # Store the last predicted trajectory (in ego frame)
 
 	def _init(self):
 		try:
@@ -858,6 +861,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 			pred_traj = predicted_answer['traj']  # Shape: (1, 6, 2)
 			print(f"pred_traj: {pred_traj}")
+			
+			# Store predicted trajectory for BEV visualization (in original [x, y] format)
+			self.last_pred_traj = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2) in [x, y] format
 		
 			# Convert to numpy and remove batch dimension: (1, 6, 2) -> (6, 2)
 			# Convert to float32 first since numpy doesn't support BFloat16
@@ -909,7 +915,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 	def save(self, tick_data):
 		frame = self.step 
 		Image.fromarray(tick_data['rgb_front']).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
-		Image.fromarray(tick_data['bev']).save(self.save_path / 'bev' / ('%04d.png' % frame))
+		
+		# Draw trajectory on BEV image if available
+		bev_img = tick_data['bev'].copy()
+		if self.last_pred_traj is not None:
+			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj)
+		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		
 		if 'lidar_bev' in tick_data:
 			lidar_bev_tensor = tick_data['lidar_bev']
@@ -926,6 +937,74 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		outfile = open(self.save_path / 'metric_info.json', 'w')
 		json.dump(self.metric_info, outfile, indent=4)
 		outfile.close()
+
+	def _draw_trajectory_on_bev(self, bev_img, traj):
+		"""
+		Draw predicted trajectory on BEV image.
+		
+		BEV camera parameters:
+		- Position: x=0, y=0, z=50 (50m height, looking down)
+		- FOV: 50 degrees
+		- Image size: 512x512
+		
+		Trajectory is in ego frame: [x, y] where x is forward, y is left
+		BEV image: center is ego position, up is forward (negative x in image coords)
+		
+		Args:
+			bev_img: numpy array (512, 512, 3) RGB image
+			traj: numpy array (6, 2) trajectory points in ego frame [x, y]
+		
+		Returns:
+			bev_img: numpy array with trajectory drawn
+		"""
+		img_h, img_w = bev_img.shape[:2]  # 512, 512
+		
+		# BEV camera: z=50m, FOV=50 degrees
+		# Calculate meters per pixel
+		# FOV = 50 deg means the camera sees 50 degrees width/height
+		# At z=50m, the ground coverage is: 2 * z * tan(FOV/2)
+		fov_rad = np.deg2rad(50.0)
+		ground_size = 2 * 50.0 * np.tan(fov_rad / 2)  # meters covered by the image
+		meters_per_pixel = ground_size / img_w  # ~0.093 m/pixel
+		
+		# Image center is ego position
+		cx, cy = img_w // 2, img_h // 2
+		
+		# Convert trajectory points to pixel coordinates
+		# Ego frame: x is forward, y is left
+		# BEV image: center is ego, up (-row) is forward, right (+col) is right
+		# So: pixel_col = cx - y / meters_per_pixel (y left -> -col)
+		#     pixel_row = cy - x / meters_per_pixel (x forward -> -row, i.e., up)
+		
+		pixels = []
+		for i in range(len(traj)):
+			x, y = traj[i]  # x: forward, y: left
+			pixel_col = int(cx - y / meters_per_pixel)
+			pixel_row = int(cy - x / meters_per_pixel)
+			pixels.append((pixel_col, pixel_row))
+		
+		# Draw trajectory using cv2
+		# Draw lines connecting waypoints
+		for i in range(len(pixels) - 1):
+			pt1 = pixels[i]
+			pt2 = pixels[i + 1]
+			# Check if points are within image bounds
+			if (0 <= pt1[0] < img_w and 0 <= pt1[1] < img_h and
+				0 <= pt2[0] < img_w and 0 <= pt2[1] < img_h):
+				cv2.line(bev_img, pt1, pt2, (0, 255, 0), 2)  # Green line
+		
+		# Draw waypoints as circles
+		for i, (col, row) in enumerate(pixels):
+			if 0 <= col < img_w and 0 <= row < img_h:
+				# Color gradient: start (red) -> end (blue)
+				color_r = int(255 * (1 - i / (len(pixels) - 1)))
+				color_b = int(255 * (i / (len(pixels) - 1)))
+				cv2.circle(bev_img, (col, row), 5, (color_r, 0, color_b), -1)
+		
+		# Draw ego position (center)
+		cv2.circle(bev_img, (cx, cy), 8, (255, 255, 0), -1)  # Yellow circle for ego
+		
+		return bev_img
 
 	def destroy(self):
 		del self.net
