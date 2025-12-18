@@ -33,7 +33,7 @@ sys.path = [str(p) for p in sys.path]
 from leaderboard.autoagents import autonomous_agent
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from team_code.planner import RoutePlanner
-from team_code.orion.pid_controller import PIDController as OrionPIDController  # Use orion's PID controller
+from team_code.orion.pid_controller import PIDController  # Use orion's PID controller
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 from scipy.optimize import fsolve
 # mot dependencies
@@ -446,26 +446,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
     	)
 		print("✓ MoT model loaded.")
 
-		self.pid_controller = OrionPIDController()
+		self.pidcontroller = PIDController()
 
+		self.steer_step = 0
+		self.last_moving_status = 0
+		self.last_moving_step = -1
+		self.last_steers = 0
+		
+		self.takeover = False
+		self.stop_time = 0
+		self.takeover_time = 0
 		self.save_path = None
 		self._im_transform = T.Compose([T.ToTensor(), T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])
-		self.prev_control = None
-		self.steer_history = deque(maxlen=5)  # Keep last 5 steer values for smoothing
-		
-		# Stuck detection and recovery parameters
-		self.stuck_detector = 0
-		self.stuck_threshold = 60  # ~3 seconds at 20Hz (reduced from 100 for faster response)
-		self.force_move = 0
-		self.creep_duration = 50  # ~2.5 seconds at 20Hz (increased from 40)
-		self.creep_throttle = 0.5  # Increased from 0.4 for more aggressive recovery
-		self.min_speed_threshold = 1.0  
-		self.target_cruise_speed = 6.0
-		
-		# Multi-stage stuck recovery
-		self.consecutive_stuck_count = 0  # Track repeated stuck situations
-		self.backward_recovery_active = False
-		self.backward_recovery_counter = 0  
+		self.lat_ref, self.lon_ref = 42.0, 2.0
+		control = carla.VehicleControl()
+		control.steer = 0.0
+		control.throttle = 0.0
+		control.brake = 0.0	
+		self.prev_control = control
 
 		if SAVE_PATH is not None:
 			now = datetime.datetime.now()
@@ -816,47 +814,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.brake_history.append(torch.tensor(prev_control.brake).view(1, 1).to('cuda'))
 		
 		# Buffer size = 31 frames (for obs_horizon with 10x sampling)
-		ACCEL_PHASE = 10      # Phase 1: Quick initial acceleration
-		BUFFER_PHASE = 31     # Phase 2: Fill buffer to minimum required size
+		BUFFER_PHASE = 31     # Fill buffer to minimum required size
 		
 		if self.step < BUFFER_PHASE:
-			buffer_is_full = False  # Still filling
-		else:
-			buffer_is_full = True   # Ready for model (step 31+)
-		
-		if not buffer_is_full:
-			# Minimal warmup: only fill buffer to minimum required size (31 frames)
-			control = carla.VehicleControl()
-			
-			if self.step < ACCEL_PHASE:
-				# Phase 1: Quick initial acceleration (0-10 steps, ~0.5s)
-				control.steer = 0.0
-				control.throttle = 0.4  # Moderate start
-				control.brake = 0.0
-				phase_name = 'phase1_quick_accel'
-			else:
-				# Phase 2: Continue driving to fill buffer (10-31 steps, ~1s)
-				current_speed = float(tick_data['speed'])
-				target_gps = tick_data['target_point']
-				
-				# Simple control to maintain speed while filling buffer
-				speed_error = 4.5 - current_speed  # Target ~16 km/h
-				control.throttle = np.clip(0.35 + 0.08 * speed_error, 0.25, 0.55)
-				control.brake = 0.0
-				
-				# Minimal steering towards target
-				if abs(target_gps[0]) > 0.8:
-					control.steer = np.clip(target_gps[0] * 0.25, -0.25, 0.25)
-				else:
-					control.steer = 0.0
-				
-				phase_name = 'phase2_buffer_fill'
-			
-			self.prev_control = control
+			# Warmup phase: use previous control or default
+			control = self.prev_control
 			self.pid_metadata = {}
-			self.pid_metadata['agent'] = phase_name
+			self.pid_metadata['agent'] = 'warmup_phase'
 			self.pid_metadata['step'] = self.step
-		elif self.step % 2 == 0:  
+		else:
+			# Build observation dict
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
 				tick_data, lidar, rgb_front, speed, theta, target_point, 
 				cmd_one_hot, waypoint
@@ -875,187 +842,72 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			lidar_pil = Image.fromarray(lidar_np, mode='RGB')
 			lidar_pil_list = [lidar_pil]  
 			
-
-			prompt_cleaned , understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point)
+			prompt_cleaned, understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point)
 
 			predicted_answer = self.inferencer(
-                image=rgb_pil_list,  
+				image=rgb_pil_list,  
 				front=[rgb_pil_list[-1]],  
-                lidar=lidar_pil_list,  
-                text=prompt_cleaned,
-                understanding_output=understanding_output,
-                reasoning_output=reasoning_output,
-                max_think_token_n=self.inference_args.max_num_tokens,
-                do_sample=False,
-                text_temperature=0.0,
-            )
+				lidar=lidar_pil_list,  
+				text=prompt_cleaned,
+				understanding_output=understanding_output,
+				reasoning_output=reasoning_output,
+				max_think_token_n=self.inference_args.max_num_tokens,
+				do_sample=False,
+				text_temperature=0.0,
+			)
 
-			# # Get diffusion policy action
-			# dp_obs_dict = {
-	        #         'lidar_bev': lidar_stacked.to(torch.bfloat16),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
-	        #         'ego_status': ego_status_stacked.to(torch.bfloat16),  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
-			# 		'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
-            #     	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
-	        #     }
-			
-			# # Run prediction with bfloat16
-			# result = self.net.predict_action(dp_obs_dict)
-			# pred = torch.from_numpy(result['action'])
 			pred_traj = predicted_answer['traj']  # Shape: (1, 6, 2)
 			print(f"pred_traj: {pred_traj}")
 		
-		    # Convert to numpy and remove batch dimension: (1, 6, 2) -> (6, 2)
+			# Convert to numpy and remove batch dimension: (1, 6, 2) -> (6, 2)
 			# Convert to float32 first since numpy doesn't support BFloat16
-			waypoints_np = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2)			# Swap x,y to y,x for PID controller (PID expects [y, x] format)
+			waypoints_np = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2)
+			# Swap x,y to y,x for PID controller (PID expects [y, x] format)
 			waypoints_np = waypoints_np[:, [1, 0]]  # (6, 2) with columns swapped  
 			
-			speed_scalar = float(tick_data['speed'])
+			# PID controller expects speed as numpy scalar (for .astype() call in metadata)
+			speed_np = np.float32(tick_data['speed'])
 			target_np = target_point.squeeze().cpu().numpy()  # (2,)
 			target_np = target_np[[1, 0]]  
 			
-			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pid_controller.control_pid(
-				waypoints_np, speed_scalar, target_np
+			# Use orion's PID controller for control
+			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(
+				waypoints_np, speed_np, target_np
 			)
-
+			
+			# Apply orion's simple post-processing
+			if brake_traj < 0.05: 
+				brake_traj = 0.0
+			if throttle_traj > brake_traj: 
+				brake_traj = 0.0
+			if tick_data['speed'] > 5:
+				throttle_traj = 0
+			
 			control = carla.VehicleControl()
-
 			self.pid_metadata = metadata_traj
 			self.pid_metadata['agent'] = 'only_traj'
-			
-			# ============ Smooth Steer Control ============
-			# Speed-adaptive smoothing: stronger smoothing at high speeds for stability
-			raw_steer = float(steer_traj)
-			self.steer_history.append(raw_steer)
-			current_speed = float(tick_data['speed'])
-			
-			if len(self.steer_history) >= 3:
-				# Use stronger smoothing at high speeds to reduce oscillation
-				if current_speed > 8.0:  # High speed: strong smoothing
-					weights = [0.05, 0.10, 0.15, 0.25, 0.45][-len(self.steer_history):]
-				elif current_speed > 5.0:  # Medium speed: moderate smoothing
-					weights = [0.10, 0.20, 0.30, 0.40][-len(self.steer_history):]
-				else:  # Low speed: minimal smoothing for maximum responsiveness at intersections
-					weights = [0.20, 0.30, 0.50][-len(self.steer_history):]
-				
-				smoothed_steer = sum(w * s for w, s in zip(weights, list(self.steer_history)[-len(weights):])) / sum(weights)
-			else:
-				smoothed_steer = raw_steer
-			
-			control.steer = np.clip(smoothed_steer, -1, 1)
-			
-			# ============ Speed & Throttle Control ============
-			abs_steer = abs(control.steer)
-			
-			# Base PID throttle/brake
-			base_throttle = np.clip(float(throttle_traj), 0.0, 0.75)
-			base_brake = np.clip(float(brake_traj), 0, 1)
-			
-			# Default value for model_wants_stop (will be updated in normal control path)
-			model_wants_stop = base_brake > 0.3 or (base_throttle < 0.1 and base_brake > 0.0)
-			
-			# Reduce micro-braking noise
-			if base_brake < 0.1:
-				base_brake = 0.0
-			
-			# ============ Stuck Detection & Recovery (Multi-Stage) ============
-			# Reset backward recovery if moving
-			if current_speed > 2.0:
-				self.backward_recovery_active = False
-				self.backward_recovery_counter = 0
-				self.consecutive_stuck_count = 0
-			
-			if current_speed < self.min_speed_threshold and base_brake < 0.1:
-				self.stuck_detector += 1
-			else:
-				self.stuck_detector = max(0, self.stuck_detector - 2)  # Faster recovery
-			
-			# Activate force move if stuck too long
-			if self.stuck_detector > self.stuck_threshold:
-				self.consecutive_stuck_count += 1
-				self.force_move = self.creep_duration
-				self.stuck_detector = 0
-				
-				# If stuck multiple times consecutively, try backward recovery
-				if self.consecutive_stuck_count >= 3 and not self.backward_recovery_active:
-					self.backward_recovery_active = True
-					self.backward_recovery_counter = 30  # ~1.5 seconds backward
-					print(f"[STUCK RECOVERY] Activating BACKWARD recovery at step {self.step} (consecutive: {self.consecutive_stuck_count})")
-				else:
-					print(f"[STUCK RECOVERY] Activating forward force move at step {self.step}")
-			
-			# Apply backward recovery if active
-			if self.backward_recovery_active and self.backward_recovery_counter > 0:
-				control.throttle = 0.0
-				control.brake = 0.0
-				control.reverse = True
-				control.steer = 0.0  # Go straight backward
-				self.backward_recovery_counter -= 1
-				if self.backward_recovery_counter == 0:
-					self.backward_recovery_active = False
-					self.consecutive_stuck_count = 0  # Reset after backward attempt
-					self.force_move = self.creep_duration  # Follow with forward push
-			# Apply forward force move if active
-			elif self.force_move > 0:
-				control.throttle = self.creep_throttle
-				control.brake = 0.0
-				self.force_move -= 1
-			else:
-				# Normal throttle control with turn-based limits
-				# Stricter limits during turns to prevent overshooting lanes
-				if abs_steer > 0.3:  # Sharp turn - very conservative speed
-					speed_threshold = 3.5  # ~12.6 km/h
-					max_throttle = 0.5 if current_speed < speed_threshold else 0.25
-				elif abs_steer > 0.15:  # Medium turn - moderate speed limit
-					speed_threshold = 5.0  # ~18 km/h
-					max_throttle = 0.6 if current_speed < speed_threshold else 0.35
-				else:  # Straight or gentle turn - normal speed
-					speed_threshold = 6.5  # ~23.4 km/h
-					max_throttle = 0.75 if current_speed < speed_threshold else 0.55
-				
-				# Minimum throttle to prevent stalling (unless braking needed or model wants to stop)
-				if model_wants_stop:
-					min_throttle = 0.0  # No minimum throttle when model explicitly wants to stop
-				else:
-					min_throttle = 0.15 if current_speed < 2.0 and base_brake < 0.3 else 0.0  # Reduced from 0.2 to 0.15
-				
-				control.throttle = np.clip(base_throttle, min_throttle, max_throttle)
-				control.brake = base_brake
-				
-				# Anti-stop-start: If at very low speed and not braking and model doesn't want to stop, apply gentle boost
-				# But only when not turning sharply (to avoid acceleration during tight turns)
-				if current_speed < 1.5 and control.brake < 0.1 and not model_wants_stop and abs_steer < 0.3:
-					control.throttle = max(control.throttle, 0.3)  # Reduced from 0.4 to 0.3 for less aggressive acceleration
-			
-			self.pid_metadata['steer_raw'] = raw_steer
-			self.pid_metadata['steer_smoothed'] = float(control.steer)
-			self.pid_metadata['throttle_traj'] = float(throttle_traj)
-			self.pid_metadata['brake_traj'] = float(brake_traj)
-			self.pid_metadata['stuck_counter'] = self.stuck_detector
-			self.pid_metadata['force_move'] = self.force_move
-			self.pid_metadata['consecutive_stuck'] = self.consecutive_stuck_count
-			self.pid_metadata['backward_recovery'] = self.backward_recovery_active
-			self.pid_metadata['model_wants_stop'] = bool(model_wants_stop)
+			control.steer = np.clip(float(steer_traj), -1, 1)
+			control.throttle = np.clip(float(throttle_traj), 0, 0.75)
+			control.brake = np.clip(float(brake_traj), 0, 1)
 			self.pid_metadata['steer'] = control.steer
 			self.pid_metadata['throttle'] = control.throttle
 			self.pid_metadata['brake'] = control.brake
-			
-
-			# Store control for next odd step
-			self.prev_control = control
-		else:
-			control = self.prev_control if self.prev_control is not None else carla.VehicleControl()
-			self.pid_metadata = {}
-			self.pid_metadata['agent'] = 'reused_control'
+			self.pid_metadata['steer_traj'] = float(steer_traj)
+			self.pid_metadata['throttle_traj'] = float(throttle_traj)
+			self.pid_metadata['brake_traj'] = float(brake_traj)
+			self.pid_metadata['plan'] = waypoints_np.tolist()
+			self.pid_metadata['command'] = command
 		
+		self.prev_control = control
 		metric_info = self.get_metric_info()
 		self.metric_info[self.step] = metric_info
-		if SAVE_PATH is not None and self.step % 1 == 0:
+		if SAVE_PATH is not None:
 			self.save(tick_data)
 		
 		return control
 
 	def save(self, tick_data):
-		frame = self.step
+		frame = self.step 
 		Image.fromarray(tick_data['rgb_front']).save(self.save_path / 'rgb_front' / ('%04d.png' % frame))
 		Image.fromarray(tick_data['bev']).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		
