@@ -89,6 +89,24 @@ noise_scheduler:
   beta_schedule: squaredcos_cap_v2
   clip_sample: false
   prediction_type: epsilon
+
+# Truncated Diffusion Configuration (DiffusionDriveV2 style)
+# When enabled, uses anchor trajectory with minimal noise instead of pure Gaussian noise
+truncated_diffusion:
+  enabled: true                    # Enable truncated diffusion with anchor trajectory
+  num_train_timesteps: 1000        # Total timesteps for diffusion scheduler
+  trunc_timesteps: 8               # Truncated timestep for adding noise during INFERENCE (small value = minimal noise)
+  train_trunc_timesteps: 50        # Max timestep during TRAINING (DiffusionDrive uses 50)
+  num_diffusion_steps: 2           # Number of denoising steps during inference
+  eta: 0.0                         # 0.0 for DDIM (deterministic), 1.0 for DDPM (stochastic)
+  # Normalization: 2*(x + offset)/range - 1, mapping data to [-1, 1]
+  # Based on action_stats: x: [-0.07, 74.05], y: [-17.53, 32.74]
+  # Expanded range with margin: x: [-2, 78], y: [-20, 36]
+  norm_x_offset: 2.0               # x_min with margin (shifted to make x_min = -2)
+  norm_x_range: 80.0               # x_max - x_min = 78 - (-2) = 80
+  norm_y_offset: 20.0              # y_min with margin (shifted to make y_min = -20)
+  norm_y_range: 56.0               # y_max - y_min = 36 - (-20) = 56
+  
 training:
   num_epochs: 1000
   max_grad_norm: 1.0

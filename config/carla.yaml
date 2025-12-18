@@ -128,7 +128,18 @@ noise_scheduler:
   beta_end: 0.02
   beta_schedule: "squaredcos_cap_v2"  
   clip_sample: false
-  prediction_type: "epsilon" # 预测目标为噪声/目标动作
+  prediction_type: "epsilon" # 预测目标为噪声/目标动作（用于legacy模式）
+
+# Truncated Diffusion Configuration (DiffusionDriveV2 style)
+# When enabled, uses anchor trajectory with minimal noise instead of pure noise
+truncated_diffusion:
+  enabled: true                     # 启用截断扩散
+  num_train_timesteps: 1000         # DDIM训练时间步数
+  trunc_timesteps: 8                # 截断时间步（anchor加噪程度）
+  num_diffusion_steps: 2            # 去噪步数（推理时）
+  eta: 0.0                          # DDIM eta参数（0.0=DDIM，1.0=DDPM）
+  norm_scale_x: 50.0                # x方向归一化因子
+  norm_scale_y: 20.0                # y方向归一化因子
 
 # Training settings 
 training:

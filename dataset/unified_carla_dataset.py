@@ -134,7 +134,25 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 speed_data = sample['speed_hist']
                 final_sample['speed'] = torch.from_numpy(speed_data).float()
             elif key == 'ego_waypoints':
-                final_sample['agent_pos'] = torch.from_numpy(sample['ego_waypoints'][1:]).float()
+                ego_waypoints = torch.from_numpy(sample['ego_waypoints'][1:]).float()
+                final_sample['agent_pos'] = ego_waypoints
+            elif key == 'anchor':
+                # Load anchor waypoints from numpy file, or use GT trajectory as fallback
+                anchor_path = sample.get('anchor', None)
+                if anchor_path is not None:
+                    full_anchor_path = os.path.join(self.image_data_root, anchor_path)
+                    if os.path.exists(full_anchor_path):
+                        anchor_data = np.load(full_anchor_path)
+                        final_sample['anchor'] = torch.from_numpy(anchor_data).float()
+                    else:
+                        # Fallback to GT trajectory if anchor file not found
+                        if 'agent_pos' in final_sample:
+                            final_sample['anchor'] = final_sample['agent_pos'].clone()
+                else:
+                    # No anchor path provided, use GT trajectory as anchor
+                    if 'agent_pos' in final_sample:
+                        final_sample['anchor'] = final_sample['agent_pos'].clone()
+
             elif key == 'vqa':
                 if 'gen_vit_tokens' in vqa_feature:
                     final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
@@ -219,6 +237,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Concatenate all components along the feature dimension
         final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
 
+        # Ensure anchor exists (use GT trajectory as fallback for truncated diffusion)
+        if 'anchor' not in final_sample and 'agent_pos' in final_sample:
+            final_sample['anchor'] = final_sample['agent_pos'].clone()
+
         return final_sample
 
 
@@ -269,6 +291,7 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
     waypoints_hist = sample.get('waypoints_hist')
     target_point = sample.get('target_point')
     target_point_hist = sample.get('target_point_hist')
+    anchor = sample.get('anchor')
     
     if isinstance(agent_pos, torch.Tensor):
         agent_pos = agent_pos.numpy()
@@ -278,6 +301,8 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
         target_point = target_point.numpy()
     if isinstance(target_point_hist, torch.Tensor):
         target_point_hist = target_point_hist.numpy()
+    if isinstance(anchor, torch.Tensor):
+        anchor = anchor.numpy()
     
     plt.figure(figsize=(12, 12))
     
@@ -319,6 +344,21 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
         for i, waypoint in enumerate(agent_pos, 1):
             plt.plot(waypoint[1], waypoint[0], 'r^', markersize=10, 
                     markeredgecolor='darkred', markeredgewidth=1, zorder=4)
+    
+    # ========== Plot Anchor Waypoints ==========
+    if anchor is not None and len(anchor) > 0:
+        # Plot line connecting anchor points (in cyan/magenta color)
+        # Ensure anchor has shape (N, 2)
+        if anchor.ndim == 1:
+            anchor = anchor.reshape(-1, 2)
+        anchor_waypoints = np.vstack([[0, 0], anchor])
+        plt.plot(anchor_waypoints[:, 1], anchor_waypoints[:, 0], 'm-', 
+                linewidth=2.5, alpha=0.7, label='Anchor trajectory', zorder=3)
+        
+        # Plot each anchor waypoint as discrete point
+        for i, waypoint in enumerate(anchor, 1):
+            plt.plot(waypoint[1], waypoint[0], 'ms', markersize=8, 
+                    markeredgecolor='darkmagenta', markeredgewidth=1.5, zorder=4)
     
     # ========== Plot Current Target Point ==========
     if target_point is not None:
@@ -451,9 +491,6 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon,
                 print(f"    Length: {len(value)}")
 
 
-# ============================================================================
-# Test Function
-# ============================================================================
 
 def test_pdm():
     """Test with PDM Lite dataset."""
@@ -493,131 +530,12 @@ def test_pdm():
         else:
             print(f"  {key}: type={type(value)}")
 
-    # visualize_trajectory(rand_sample, obs_horizon, rand_idx)
+    visualize_trajectory(rand_sample, obs_horizon, rand_idx)
     print_sample_details(rand_sample, dataset, rand_idx, obs_horizon)
-
-
-def check_missing_gen_vit_tokens(dataset_path, image_data_root, batch_size=32, num_workers=4):
-    """
-    使用 CARLAImageDataset 和 DataLoader batch 方式检查缺失的 gen_vit_tokens
-    
-    Args:
-        dataset_path (str): 数据集路径
-        image_data_root (str): 图像数据根目录
-        batch_size (int): 批处理大小
-        num_workers (int): 数据加载的工作进程数
-    """
-    print("\n========== Checking for Missing gen_vit_tokens (using CARLAImageDataset) ==========")
-    
-    try:
-        # Create dataset
-        dataset = CARLAImageDataset(
-            dataset_path=dataset_path,
-            image_data_root=image_data_root
-        )
-        
-        print(f"\n总样本数: {len(dataset)}")
-        
-        if len(dataset) == 0:
-            print("数据为空，无法进行检查。")
-            return
-        
-        # Custom collate function to handle mixed types
-        def custom_collate_fn(batch):
-            return batch
-        
-        # Create DataLoader
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues with custom collate
-            pin_memory=False,
-            collate_fn=custom_collate_fn,
-            drop_last=False
-        )
-        
-        missing_gen_vit_tokens = []
-        samples_with_gen_vit_tokens = 0
-        stats_by_key = {}
-        
-        # Iterate through batches
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Checking samples")):
-            # Each item in batch is a sample dict
-            for sample_idx_in_batch, sample in enumerate(batch):
-                # Check for gen_vit_tokens
-                if 'gen_vit_tokens' not in sample:
-                    global_idx = batch_idx * batch_size + sample_idx_in_batch
-                    sample_file = dataset.sample_files[global_idx] if global_idx < len(dataset.sample_files) else "unknown"
-                    missing_gen_vit_tokens.append({
-                        'sample_idx': global_idx,
-                        'sample_file': sample_file,
-                        'available_keys': list(sample.keys())
-                    })
-                else:
-                    samples_with_gen_vit_tokens += 1
-                    # Record statistics about keys
-                    for key in sample.keys():
-                        if key not in stats_by_key:
-                            stats_by_key[key] = 0
-                        stats_by_key[key] += 1
-        
-        # Print summary
-        print("\n" + "="*80)
-        print("SUMMARY:")
-        print("="*80)
-        print(f"✓ Samples with gen_vit_tokens: {samples_with_gen_vit_tokens}")
-        print(f"✗ Samples missing gen_vit_tokens: {len(missing_gen_vit_tokens)}")
-        print(f"Total samples checked: {len(dataset)}")
-        
-        print("\n" + "-"*80)
-        print("样本中包含的键统计:")
-        print("-"*80)
-        for key, count in sorted(stats_by_key.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count * 100) // (len(dataset) if len(dataset) > 0 else 1)
-            print(f"  {key}: {count}/{len(dataset)} ({percentage}%)")
-        
-        if missing_gen_vit_tokens:
-            print("\n" + "-"*80)
-            print("Samples MISSING gen_vit_tokens:")
-            print("-"*80)
-            for item in missing_gen_vit_tokens[:10]:  # Show first 10
-                print(f"\n  Sample Index: {item['sample_idx']}")
-                print(f"  Sample File: {os.path.basename(item['sample_file'])}")
-                print(f"  Available keys: {item['available_keys']}")
-            
-            if len(missing_gen_vit_tokens) > 10:
-                print(f"\n  ... and {len(missing_gen_vit_tokens) - 10} more samples missing gen_vit_tokens")
-        
-        return {
-            'total_samples': len(dataset),
-            'samples_with_gen_vit_tokens': samples_with_gen_vit_tokens,
-            'missing_gen_vit_tokens': missing_gen_vit_tokens,
-            'stats_by_key': stats_by_key
-        }
-    
-    except Exception as e:
-        print(f"✗ Error during checking: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
 
     
 if __name__ == "__main__":
-    # test_pdm()
+    test_pdm()
     
-    # Check for missing gen_vit_tokens - train dataset
-    print("\n" + "="*80)
-    print("CHECKING TRAIN DATASET")
-    print("="*80)
-    dataset_path_train = '/share-data/pdm_lite_mini/tmp_data/train'
-    image_data_root = '/share-data/pdm_lite_mini/'
-    result_train = check_missing_gen_vit_tokens(dataset_path_train, image_data_root)
-    
-    # Check for missing gen_vit_tokens - val dataset
-    print("\n" + "="*80)
-    print("CHECKING VAL DATASET")
-    print("="*80)
-    dataset_path_val = '/share-data/pdm_lite_mini/tmp_data/val'
-    result_val = check_missing_gen_vit_tokens(dataset_path_val, image_data_root)
+
 
