@@ -412,12 +412,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
 		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
-		
-		# Load diffusion policy in bfloat16 to save memory
 		self.net = load_best_model(checkpoint_path, self.config, device)
-		# Convert to bfloat16 to reduce memory usage (ensure all submodules are converted)
 		self.net = self.net.to(torch.bfloat16)
-		# Explicitly convert obs_encoder to bfloat16 to ensure compatibility
 		if hasattr(self.net, 'obs_encoder'):
 			self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
 		print("✓ Diffusion policy loaded (bfloat16).")
@@ -445,6 +441,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
         vit_transform=None,  # Not used for Qwen3VL, handled internally by model
         new_token_ids=new_token_ids,
         max_num_tokens=inference_args.max_num_tokens,
+        visual_gen=True,  # Enable visual generation to initialize query tokens
+        visual_und=True,  # Enable visual understanding
     	)
 		print("✓ MoT model loaded.")
 
@@ -564,8 +562,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		brake_list = brake_list[::-1]
 		waypoint_list = waypoint_list[::-1]
 		
-		# sample every 5 for rgb from the end
-		rgb_list = [rgb_history_list[-1 - i*5] for i in range(5) if -1 - i*5 >= -len(rgb_history_list)]
+		# sample every 5 for rgb from the end (t0, t-5, t-10, t-15)
+		rgb_list = [rgb_history_list[-1 - i*5] for i in range(4) if -1 - i*5 >= -len(rgb_history_list)]
 		rgb_list = rgb_list[::-1]  
 		
 		# Stack along time dimension
@@ -763,7 +761,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		local_command_point = np.array([next_wp[0]-pos[0], next_wp[1]-pos[1]])
 		local_command_point = R.dot(local_command_point)
-		# local_command_point[0]=5.0
+		local_command_point[0]=local_command_point[0]/3.0
+		local_command_point[1]=local_command_point[1]
 		
 		result['target_point'] = local_command_point  # numpy array (2,)
 		# theta for model input should match training data format (raw compass value)
@@ -776,7 +775,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		if not self.initialized:
 			self._init()
 		tick_data = self.tick(input_data)
-		import pdb; pdb.set_trace()
 
 		# Prepare current observations
 		gt_velocity = torch.FloatTensor([tick_data['speed']]).to('cuda', dtype=torch.float32)
@@ -796,14 +794,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_front = rgb_front.to('cuda', dtype=torch.float32)
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
 		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
-
-		# ============ STAGED INITIALIZATION STRATEGY ============
-		# Training data starts from frame 10+ with stable driving history
-		# We need to match this distribution by:
-		# 1. Phase 1 (0-20): Initial acceleration to build up speed
-		# 2. Phase 2 (20-51): PID fills buffer with STABLE driving history  
-		# 3. Phase 3 (51-61): Final warmup period
-		# 4. Phase 4 (61+): Model takes over
 		
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
@@ -824,10 +814,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			prev_control = self.prev_control if self.prev_control is not None else carla.VehicleControl()
 			self.throttle_history.append(torch.tensor(prev_control.throttle).view(1, 1).to('cuda'))
 			self.brake_history.append(torch.tensor(prev_control.brake).view(1, 1).to('cuda'))
-		
-		# Multi-stage startup to match training distribution
-		# Training data: scen_start_frame_offset = max((obs_horizon-1)*10, 4) = 10 for obs_horizon=2
-		# This means training samples ALWAYS have stable history, NEVER see rest→motion transition
 		
 		# Buffer size = 31 frames (for obs_horizon with 10x sampling)
 		ACCEL_PHASE = 10      # Phase 1: Quick initial acceleration
@@ -891,9 +877,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 
 			prompt_cleaned , understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point)
-			
+
 			predicted_answer = self.inferencer(
-                image=rgb_pil_list,
+                image=rgb_pil_list,  
+				front=[rgb_pil_list[-1]],  
                 lidar=lidar_pil_list,  
                 text=prompt_cleaned,
                 understanding_output=understanding_output,
@@ -903,21 +890,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
                 text_temperature=0.0,
             )
 
-			# Get diffusion policy action
-			dp_obs_dict = {
-	                'lidar_bev': lidar_stacked.to(torch.bfloat16),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
-	                'ego_status': ego_status_stacked.to(torch.bfloat16),  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
-					'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
-                	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
-	            }
+			# # Get diffusion policy action
+			# dp_obs_dict = {
+	        #         'lidar_bev': lidar_stacked.to(torch.bfloat16),  # (B, obs_horizon, C, H, W) = (1, obs_horizon, 3, 448, 448)
+	        #         'ego_status': ego_status_stacked.to(torch.bfloat16),  # (B, obs_horizon, 14) = (1, obs_horizon, 1+1+1+1+6+2+2)
+			# 		'gen_vit_tokens': predicted_answer["gen_vit_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
+            #     	'reasoning_query_tokens': predicted_answer["reasoning_query_tokens"].unsqueeze(0).to('cuda', dtype=torch.bfloat16),  
+	        #     }
 			
-			# Run prediction with bfloat16
-			result = self.net.predict_action(dp_obs_dict)
-			pred = torch.from_numpy(result['action'])
-			print(pred)
-
-			waypoints_np = pred[0].cpu().numpy()  
-			waypoints_np = waypoints_np[:, [1, 0]]  
+			# # Run prediction with bfloat16
+			# result = self.net.predict_action(dp_obs_dict)
+			# pred = torch.from_numpy(result['action'])
+			pred_traj = predicted_answer['traj']  # Shape: (1, 6, 2)
+			print(f"pred_traj: {pred_traj}")
+		
+		    # Convert to numpy and remove batch dimension: (1, 6, 2) -> (6, 2)
+			# Convert to float32 first since numpy doesn't support BFloat16
+			waypoints_np = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2)			# Swap x,y to y,x for PID controller (PID expects [y, x] format)
+			waypoints_np = waypoints_np[:, [1, 0]]  # (6, 2) with columns swapped  
 			
 			speed_scalar = float(tick_data['speed'])
 			target_np = target_point.squeeze().cpu().numpy()  # (2,)
@@ -1049,6 +1039,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['throttle'] = control.throttle
 			self.pid_metadata['brake'] = control.brake
 			
+
 			# Store control for next odd step
 			self.prev_control = control
 		else:
@@ -1060,6 +1051,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.metric_info[self.step] = metric_info
 		if SAVE_PATH is not None and self.step % 1 == 0:
 			self.save(tick_data)
+		
 		return control
 
 	def save(self, tick_data):
