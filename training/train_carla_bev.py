@@ -189,7 +189,8 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
                 'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
                 'gen_vit_tokens': batch['gen_vit_tokens'],
-                'reasoning_query_tokens': batch['reasoning_query_tokens']
+                'reasoning_query_tokens': batch['reasoning_query_tokens'],
+                'anchor': batch['anchor']  # Pass anchor for truncated diffusion
             }
             target_actions = batch['agent_pos']  
             

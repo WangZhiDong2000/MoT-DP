@@ -4,164 +4,12 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, Callable, Union
 from collections import defaultdict
 import numpy as np
-import math
 from einops import rearrange, reduce
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from diffusers.utils.torch_utils import randn_tensor
 from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
-from collections import OrderedDict
-from collections import deque
-
-
-class DDIMScheduler_with_logprob(DDIMScheduler):
-    """
-    DDIMScheduler with multiplicative and additive noise support.
-    Based on DiffusionDriveV2 implementation.
-    """
-    def step(
-        self,
-        model_output: torch.Tensor,
-        timestep: int,
-        sample: torch.Tensor,
-        eta: float = 1.0,  # 1.0 for ddpm, 0.0 for ddim
-        use_clipped_model_output: bool = False,
-        generator=None,
-        variance_noise: Optional[torch.Tensor] = None,
-        prev_sample: Optional[torch.FloatTensor] = None,
-        return_dict: bool = True,
-    ) -> Union[Tuple, torch.Tensor]:
-        """
-        Predict the sample from the previous timestep by reversing the SDE.
-        Implements multiplicative and additive noise following DiffusionDriveV2.
-        """
-        if self.num_inference_steps is None:
-            raise ValueError(
-                "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
-            )
-
-        # 1. get previous step value (=t-1)
-        prev_timestep = (
-            timestep - self.config.num_train_timesteps // self.num_inference_steps
-        )
-
-        # 2. compute alphas, betas
-        alpha_prod_t = self.alphas_cumprod[timestep]
-        alpha_prod_t_prev = self.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else self.final_alpha_cumprod
-
-        beta_prod_t = 1 - alpha_prod_t
-
-        # 3. compute predicted original sample from predicted noise
-        if self.config.prediction_type == "epsilon":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
-            pred_epsilon = model_output
-        elif self.config.prediction_type == "sample":
-            pred_original_sample = model_output
-            pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
-        elif self.config.prediction_type == "v_prediction":
-            pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
-            pred_epsilon = (alpha_prod_t**0.5) * model_output + (beta_prod_t**0.5) * sample
-        else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, or"
-                " `v_prediction`"
-            )
-
-        # 4. Clip or threshold "predicted x_0"
-        if self.config.thresholding:
-            pred_original_sample = self._threshold_sample(pred_original_sample)
-        elif self.config.clip_sample:
-            pred_original_sample = pred_original_sample.clamp(
-                -self.config.clip_sample_range, self.config.clip_sample_range
-            )
-
-        # 5. compute variance: "sigma_t(η)"
-        variance = self._get_variance(timestep, prev_timestep)
-        std_dev_t = (eta * variance ** (0.5)).clamp_(min=1e-10)
-
-        if use_clipped_model_output:
-            pred_epsilon = (sample - alpha_prod_t ** (0.5) * pred_original_sample) / beta_prod_t ** (0.5)
-
-        # 6. compute "direction pointing to x_t"
-        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2).clamp_(min=0) ** (0.5) * pred_epsilon
-
-        # 7. compute x_t without "random noise"
-        prev_sample_mean = alpha_prod_t_prev ** (0.5) * pred_original_sample + pred_sample_direction
-
-        if prev_sample_mean is not None and generator is not None:
-            raise ValueError(
-                "Cannot pass both generator and prev_sample. Please make sure that either `generator` or"
-                " `prev_sample` stays `None`."
-            )
-        
-        # 8. Add multiplicative and additive noise (DiffusionDriveV2 style)
-        if eta > 0:
-            std_dev_t_mul = torch.clip(std_dev_t, min=0.04)
-            std_dev_t_add = torch.tensor(0.0).to(std_dev_t.device)
-        else:
-            std_dev_t_mul = torch.tensor(0.0).to(std_dev_t.device)
-            std_dev_t_add = torch.tensor(0.0).to(std_dev_t.device)
-        
-        if prev_sample is None:
-            # Multiplicative noise - applied per sample, shared across time steps
-            # Shape: (B, 1, 1, 2) for x and y separately
-            if model_output.dim() == 3:
-                # Shape: (B, T, 2) -> need (B, 1, 2) noise
-                variance_noise_x = randn_tensor(
-                    [model_output.shape[0], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                ) * std_dev_t_mul + 1.0
-                variance_noise_y = randn_tensor(
-                    [model_output.shape[0], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                ) * std_dev_t_mul + 1.0
-                variance_noise_mul = torch.cat((variance_noise_x, variance_noise_y), dim=-1)
-                variance_noise_mul = variance_noise_mul.expand(-1, model_output.shape[1], -1)
-                
-                # Additive noise
-                variance_noise_x_add = randn_tensor(
-                    [model_output.shape[0], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                )
-                variance_noise_y_add = randn_tensor(
-                    [model_output.shape[0], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                )
-                variance_noise_add = torch.cat((variance_noise_x_add, variance_noise_y_add), dim=-1)
-                variance_noise_add = variance_noise_add.expand(-1, model_output.shape[1], -1)
-            else:
-                # 4D case: (B, G, T, 2) for multi-modal
-                variance_noise_horizon = randn_tensor(
-                    [model_output.shape[0], model_output.shape[1], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                ) * std_dev_t_mul + 1.0
-                variance_noise_vert = randn_tensor(
-                    [model_output.shape[0], model_output.shape[1], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                ) * std_dev_t_mul + 1.0
-                variance_noise_mul = torch.cat((variance_noise_horizon, variance_noise_vert), dim=-1)
-                variance_noise_mul = variance_noise_mul.repeat(1, 1, model_output.shape[2], 1)
-                
-                variance_noise_x = randn_tensor(
-                    [model_output.shape[0], model_output.shape[1], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                )
-                variance_noise_y = randn_tensor(
-                    [model_output.shape[0], model_output.shape[1], 1, 1], generator=generator, device=model_output.device, dtype=model_output.dtype
-                )
-                variance_noise_add = torch.cat((variance_noise_x, variance_noise_y), dim=-1)
-                variance_noise_add = variance_noise_add.repeat(1, 1, model_output.shape[2], 1)
-
-            prev_sample = prev_sample_mean * variance_noise_mul + std_dev_t_add * variance_noise_add
-        
-        # Compute log probability for potential RL usage
-        log_prob = (
-            -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t_mul**2 + 1e-8))
-            - torch.log(std_dev_t_mul + 1e-8)
-            - torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
-        )
-        if log_prob.dim() == 3:
-            log_prob = log_prob.sum(dim=(-2, -1))
-        else:
-            log_prob = log_prob.sum(dim=(-3, -2, -1))
-        
-        return prev_sample.type(sample.dtype), log_prob, prev_sample_mean.type(sample.dtype)
 
 
 
@@ -194,7 +42,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # config
         self.cfg = config
         policy_cfg = config['policy']
-        noise_scheduler_cfg = config['noise_scheduler']
 
         obs_as_global_cond = policy_cfg.get('obs_as_global_cond', True)
         self.obs_as_global_cond = obs_as_global_cond
@@ -270,16 +117,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.model = model
         
         # ========== Truncated Diffusion Configuration (DiffusionDriveV2 style) ==========
-        # Use DDIM scheduler for both training and inference with truncated diffusion
         diffusion_cfg = config.get('truncated_diffusion', {})
-        self.use_truncated_diffusion = diffusion_cfg.get('enabled', True)
         self.num_train_timesteps = diffusion_cfg.get('num_train_timesteps', 1000)
         self.trunc_timesteps = diffusion_cfg.get('trunc_timesteps', 8)  # Truncated timestep for anchor during inference
         self.train_trunc_timesteps = diffusion_cfg.get('train_trunc_timesteps', 50)  # Max timestep during training (DiffusionDrive uses 50)
         self.num_diffusion_steps = diffusion_cfg.get('num_diffusion_steps', 2)  # Number of denoising steps
-        self.diffusion_eta = diffusion_cfg.get('eta', 0.0)  # 0.0 for DDIM, 1.0 for DDPM
+        self.diffusion_eta = diffusion_cfg.get('eta', 1.0)  # 1.0 for stochastic multiplicative noise
         
-        # Normalization parameters (DiffusionDriveV2 style: linear mapping to [-1, 1])
+        # Normalization parameters (DiffusionDrive v1 style: linear mapping to [-1, 1])
         # x: 2*(x + x_offset)/x_range - 1
         # y: 2*(y + y_offset)/y_range - 1
         self.norm_x_offset = diffusion_cfg.get('norm_x_offset', 2.0)  # x range: [-2, 78]
@@ -287,30 +132,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.norm_y_offset = diffusion_cfg.get('norm_y_offset', 20.0)  # y range: [-20, 36]
         self.norm_y_range = diffusion_cfg.get('norm_y_range', 56.0)
         
-        # Training scheduler (DDIMScheduler for add_noise)
+        # DDIMScheduler for variance computation (DiffusionDriveV2 style)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
             steps_offset=1,
             beta_schedule="scaled_linear",
             prediction_type="sample",  # Predict clean sample directly
-        )
-        
-        # Inference scheduler with multiplicative/additive noise
-        self.diffusionrl_scheduler = DDIMScheduler_with_logprob(
-            num_train_timesteps=self.num_train_timesteps,
-            steps_offset=1,
-            beta_schedule="scaled_linear",
-            prediction_type="sample",
-        )
-        
-        # Legacy scheduler for backward compatibility (when truncated diffusion is disabled)
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=noise_scheduler_cfg.get('num_diffusion_steps', 100),
-            beta_start=noise_scheduler_cfg.get('beta_start', 0.0001),
-            beta_end=noise_scheduler_cfg.get('beta_end', 0.02),
-            beta_schedule=noise_scheduler_cfg.get('beta_schedule', "squaredcos_cap_v2"),
-            clip_sample=noise_scheduler_cfg.get('clip_sample', False),
-            prediction_type=noise_scheduler_cfg.get('prediction_type', "epsilon"),
         )
 
         self.mask_generator = LowdimMaskGenerator(
@@ -325,13 +152,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.obs_feature_dim = obs_feature_dim
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
-        self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
     
-    # ========== DiffusionDriveV2-style Normalization Functions ==========
+    # ========== DiffusionDrive v1 style Normalization Functions ==========
     def norm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
         """
         Normalize trajectory coordinates to [-1, 1] range.
-        Following DiffusionDriveV2: 2*(x + offset)/range - 1
+        Following DiffusionDrive v1: 2*(x + offset)/range - 1
+        
+        For our data (x: [-0.066, 74.045], y: [-17.526, 32.736]):
+        - x: 2*(x + 1)/76 - 1, maps [-1, 75] to [-1, 1]
+        - y: 2*(y + 18)/52 - 1, maps [-18, 34] to [-1, 1]
         """
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -345,7 +175,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def denorm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
         """
         Denormalize trajectory from [-1, 1] back to original scale.
-        Following DiffusionDriveV2: (x + 1)/2 * range - offset
+        Following DiffusionDrive v1: (x + 1)/2 * range - offset
         """
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -355,6 +185,93 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         odo_info_fut_y = (odo_info_fut_y + 1) / 2 * self.norm_y_range - self.norm_y_offset
         
         return torch.cat([odo_info_fut_x, odo_info_fut_y], dim=-1)
+
+    
+
+    def add_multiplicative_noise_scheduled(
+        self, 
+        sample: torch.Tensor, 
+        timestep: Union[torch.Tensor, int],
+        eta: float = 1.0,
+        std_min: float = 0.04
+    ) -> torch.Tensor:
+        """
+        Add multiplicative noise with scheduler-based variance (DiffusionDriveV2 style).
+        The noise level is determined by the diffusion scheduler's variance at the given timestep.
+        
+        DiffusionDriveV2 formula:
+            prev_sample = prev_sample_mean * variance_noise_mul + std_dev_t_add * variance_noise_add
+        
+        When eta > 0:
+            - std_dev_t_mul = clip(std_dev_t, min=0.04) for multiplicative noise
+            - std_dev_t_add = 0.0 (no additive noise)
+        
+        Multiplicative noise is applied separately to x (horizon) and y (vert) directions,
+        then combined: sample * noise_mul
+        
+        Args:
+            sample: (B, T, 2) normalized trajectory
+            timestep: current diffusion timestep (scalar or tensor)
+            eta: scaling factor for variance (0.0 = deterministic, 1.0 = full stochasticity)
+            std_min: minimum standard deviation to prevent zero noise (V2 uses 0.04)
+            
+        Returns:
+            Noisy sample with timestep-scheduled multiplicative noise applied
+        """
+        device = sample.device
+        dtype = sample.dtype
+        bs = sample.shape[0]
+        T = sample.shape[1]  # trajectory length (num_points)
+        
+        # Get timestep as integer
+        if torch.is_tensor(timestep):
+            t = timestep.item() if timestep.numel() == 1 else timestep[0].item()
+        else:
+            t = timestep
+        t = int(t)
+        
+        # Compute variance from scheduler (DDIM style)
+        # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
+        prev_t = t - self.num_train_timesteps // max(self.num_diffusion_steps, 1)
+        prev_t = max(prev_t, 0)
+        
+        alpha_prod_t = self.diffusion_scheduler.alphas_cumprod[t]
+        alpha_prod_t_prev = self.diffusion_scheduler.alphas_cumprod[prev_t] if prev_t >= 0 else self.diffusion_scheduler.final_alpha_cumprod
+        
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        
+        # Variance formula from DDIM
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        variance = max(variance.item(), 1e-10)
+        
+        # std_dev_t with eta scaling
+        std_dev_t = eta * (variance ** 0.5)
+        
+        # DiffusionDriveV2 style: std_dev_t_mul = clip(std_dev_t, min=0.04)
+        std_dev_t_mul = max(std_dev_t, std_min)
+        
+        # Generate multiplicative noise for horizon (x) and vert (y) separately
+        # DiffusionDriveV2: variance_noise_horizon/vert shape is (B, G, 1, 1), then repeat
+        # Our shape: (B, 1, 1) for horizon and vert, then cat to (B, 1, 2), then repeat to (B, T, 2)
+        
+        # variance_noise_horizon = randn * std_dev_t_mul + 1.0  (for x direction)
+        variance_noise_horizon = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        # variance_noise_vert = randn * std_dev_t_mul + 1.0  (for y direction)
+        variance_noise_vert = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        
+        # Concatenate horizon and vert: (B, 1, 1) + (B, 1, 1) -> (B, 1, 2)
+        variance_noise_mul = torch.cat([variance_noise_horizon, variance_noise_vert], dim=-1)
+        
+        # Repeat across trajectory length: (B, 1, 2) -> (B, T, 2)
+        variance_noise_mul = variance_noise_mul.expand(-1, T, -1)
+        
+        # Apply multiplicative noise: sample * variance_noise_mul
+        # This matches DiffusionDriveV2: prev_sample = prev_sample_mean * variance_noise_mul
+        # (when std_dev_t_add = 0, the additive term is zero)
+        noisy_sample = sample * variance_noise_mul
+        
+        return noisy_sample
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """
@@ -534,30 +451,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Get ego_status
         ego_status = nobs['ego_status'].to(dtype=model_dtype)
 
-        # ========== Compute Loss Based on Diffusion Mode ==========
-        if self.use_truncated_diffusion and anchor is not None:
-            # Truncated Diffusion Training (DiffusionDriveV2 style)
-            loss = self._compute_truncated_diffusion_loss(
-                trajectory=trajectory,
-                anchor=anchor,
-                cond=cond,
-                gen_vit_tokens=gen_vit_tokens,
-                reasoning_query_tokens=reasoning_query_tokens,
-                ego_status=ego_status,
-                device=device,
-                model_dtype=model_dtype
-            )
-        else:
-            # Legacy DDPM Training (backward compatible)
-            loss = self._compute_ddpm_loss(
-                trajectory=trajectory,
-                cond=cond,
-                gen_vit_tokens=gen_vit_tokens,
-                reasoning_query_tokens=reasoning_query_tokens,
-                ego_status=ego_status,
-                device=device,
-                model_dtype=model_dtype
-            )
+        # ========== Compute Loss (Truncated Diffusion DiffusionDriveV2 style) ==========
+        loss = self._compute_truncated_diffusion_loss(
+            trajectory=trajectory,
+            anchor=anchor,
+            cond=cond,
+            gen_vit_tokens=gen_vit_tokens,
+            reasoning_query_tokens=reasoning_query_tokens,
+            ego_status=ego_status,
+            device=device,
+            model_dtype=model_dtype
+        )
         
         return loss
     
@@ -574,11 +478,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     ) -> torch.Tensor:
         """
         Compute loss using truncated diffusion (DiffusionDriveV2 style).
-        Instead of starting from pure noise, we start from anchor with small noise.
+        Instead of starting from pure noise, we start from anchor with multiplicative noise.
         The model predicts the clean sample directly.
         
-        Training: Add noise at random timesteps [0, train_trunc_timesteps)
-        Inference: Add noise at fixed trunc_timesteps (smaller value)
+        Training: Add scheduler-based multiplicative noise (noise level depends on timestep)
         """
         batch_size = trajectory.shape[0]
         
@@ -592,12 +495,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             (batch_size,), device=device
         ).long()
         
-        # 3. Add noise to anchor
-        noise = torch.randn_like(anchor_norm, device=device)
-        noisy_anchor = self.diffusion_scheduler.add_noise(
-            original_samples=anchor_norm,
-            noise=noise,
-            timesteps=timesteps
+        # 3. Add scheduler-based multiplicative noise to anchor (DiffusionDriveV2 style)
+        # Noise level is determined by the timestep through scheduler's variance
+        # For training, we use each sample's individual timestep
+        # Since add_multiplicative_noise_scheduled expects a single timestep,
+        # we use the mean timestep for the batch (or could loop per sample)
+        mean_timestep = timesteps.float().mean().int().item()
+        noisy_anchor = self.add_multiplicative_noise_scheduled(
+            anchor_norm,
+            timestep=mean_timestep,
+            eta=1.0,
+            std_min=0.04
         )
         
         # 4. Clamp to valid range
@@ -630,74 +538,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         loss = loss.mean()
         
         return loss
-    
-    def _compute_ddpm_loss(
-        self,
-        trajectory: torch.Tensor,
-        cond: torch.Tensor,
-        gen_vit_tokens: torch.Tensor,
-        reasoning_query_tokens: torch.Tensor,
-        ego_status: torch.Tensor,
-        device: torch.device,
-        model_dtype: torch.dtype
-    ) -> torch.Tensor:
-        """
-        Compute loss using standard DDPM (legacy, backward compatible).
-        """
-        batch_size = trajectory.shape[0]
-        
-        # Normalize trajectory for training
-        if self.enable_action_normalization and self.action_stats is not None:
-            trajectory = self.normalize_action(trajectory)
-        if torch.isnan(trajectory).any() or torch.isinf(trajectory).any():
-            print("Warning: NaN or Inf detected in normalized trajectory")
-            trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
-        noise = torch.randn(trajectory.shape, device=trajectory.device)
-        
-        # Sample a random timestep for each image
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.get('num_train_timesteps', 100), 
-            (batch_size,), device=trajectory.device
-        ).long()
-        
-        # Add noise to the clean images according to the noise magnitude at each timestep
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
-        
-        # compute loss mask
-        loss_mask = ~condition_mask
-        
-        # apply conditioning
-        noisy_trajectory[condition_mask] = trajectory[condition_mask]
-        
-        pred = self.model(
-            noisy_trajectory,
-            timesteps,
-            cond,
-            gen_vit_tokens=gen_vit_tokens,
-            reasoning_query_tokens=reasoning_query_tokens,
-            ego_status=ego_status
-        )
-
-        pred_type = self.noise_scheduler.config.prediction_type 
-        if pred_type == 'epsilon':
-            target = noise
-        elif pred_type == 'sample':
-            target = trajectory
-        else:
-            raise ValueError(f"Unsupported prediction type {pred_type}")
-
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
-        
-        if loss.shape[-1] > 2:
-            loss = loss[..., :2]  
-            
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
-        return loss
-    
 
     def conditional_sample(self, 
             condition_data, condition_mask,
@@ -708,80 +548,51 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             **kwargs
             ):
         """
-        Generate trajectory samples using diffusion.
-        Supports both truncated diffusion (with anchor) and standard diffusion.
+        Generate trajectory samples using truncated diffusion (DiffusionDriveV2 style).
         """
         model = self.model
         device = condition_data.device
         bs = condition_data.shape[0]
         model_dtype = condition_data.dtype
         
-        # ===== OPTIMIZATION: Cache encoder outputs =====
-        with torch.no_grad():
-            memory, vl_features, reasoning_features, vl_padding_mask, reasoning_padding_mask = \
-                model.encode_conditions(
-                    cond=cond,
-                    gen_vit_tokens=gen_vit_tokens,
-                    reasoning_query_tokens=reasoning_query_tokens
-                )
-        
-        # ========== Choose Diffusion Mode ==========
-        if self.use_truncated_diffusion and anchor is not None:
-            # Truncated Diffusion with Anchor (DiffusionDriveV2 style)
-            trajectory = self._truncated_diffusion_sample(
-                anchor=anchor,
-                memory=memory,
-                vl_features=vl_features,
-                reasoning_features=reasoning_features,
-                cond=cond,
-                ego_status=ego_status,
-                vl_padding_mask=vl_padding_mask,
-                reasoning_padding_mask=reasoning_padding_mask,
-                device=device,
-                model_dtype=model_dtype,
-                generator=generator
-            )
-        else:
-            # Standard Diffusion (legacy)
-            trajectory = self._standard_diffusion_sample(
-                condition_data=condition_data,
-                condition_mask=condition_mask,
-                memory=memory,
-                vl_features=vl_features,
-                reasoning_features=reasoning_features,
-                cond=cond,
-                ego_status=ego_status,
-                vl_padding_mask=vl_padding_mask,
-                reasoning_padding_mask=reasoning_padding_mask,
-                device=device,
-                generator=generator,
-                **kwargs
-            )
+        # Truncated Diffusion with Anchor (DiffusionDriveV2 style)
+        trajectory = self._truncated_diffusion_sample(
+            anchor=anchor,
+            cond=cond,
+            ego_status=ego_status,
+            gen_vit_tokens=gen_vit_tokens,
+            reasoning_query_tokens=reasoning_query_tokens,
+            device=device,
+            model_dtype=model_dtype,
+            generator=generator
+        )
 
         return trajectory
     
     def _truncated_diffusion_sample(
         self,
         anchor: torch.Tensor,
-        memory: torch.Tensor,
-        vl_features: torch.Tensor,
-        reasoning_features: torch.Tensor,
         cond: torch.Tensor,
         ego_status: torch.Tensor,
-        vl_padding_mask: torch.Tensor,
-        reasoning_padding_mask: torch.Tensor,
+        gen_vit_tokens: torch.Tensor,
+        reasoning_query_tokens: torch.Tensor,
         device: torch.device,
         model_dtype: torch.dtype,
         generator=None
     ) -> torch.Tensor:
         """
-        Truncated diffusion sampling (DiffusionDriveV2 style).
-        Start from anchor with small noise, denoise for few steps.
+        Truncated diffusion sampling (DiffusionDriveV2 style with multiplicative noise).
+        Start from anchor with multiplicative noise, denoise for few steps.
+        
+        Key insight:
+        - The model predicts the CLEAN trajectory directly (not noise, not residual)
+        - Uses multiplicative noise with scheduler-based variance (timestep-dependent)
+        - Final output is the model's direct prediction
         """
         bs = anchor.shape[0]
         
         # Set up scheduler
-        self.diffusionrl_scheduler.set_timesteps(self.num_train_timesteps, device)
+        self.diffusion_scheduler.set_timesteps(self.num_train_timesteps, device)
         
         # Compute rollout timesteps
         step_ratio = 20 / self.num_diffusion_steps
@@ -791,16 +602,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # 1. Normalize anchor
         diffusion_output = self.norm_odo(anchor)  # (B, T, 2)
         
-        # 2. Add truncated noise
-        noise = torch.randn(diffusion_output.shape, device=device, dtype=model_dtype)
-        trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * self.trunc_timesteps
-        diffusion_output = self.diffusion_scheduler.add_noise(
-            original_samples=diffusion_output,
-            noise=noise,
-            timesteps=trunc_timesteps
+        # 2. Add initial multiplicative noise using truncated timestep (scheduler-based)
+        # Use trunc_timesteps to determine initial noise level
+        diffusion_output = self.add_multiplicative_noise_scheduled(
+            diffusion_output, 
+            timestep=self.trunc_timesteps,
+            eta=1.0,
+            std_min=0.04
         )
         
         # 3. Denoising loop
+        pred = None  # Will hold the final model prediction
         for i, k in enumerate(roll_timesteps):
             # Clamp and denormalize
             x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
@@ -814,95 +626,35 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 timesteps = timesteps[None].to(device)
             timesteps = timesteps.expand(bs)
             
-            # Predict clean sample
-            pred = self.model.decode_with_cache(
+            # Predict clean sample - model directly outputs the trajectory
+            pred = self.model(
                 sample=noisy_traj_points,
                 timestep=timesteps,
-                memory=memory,
-                vl_features=vl_features,
-                reasoning_features=reasoning_features,
                 cond=cond,
-                ego_status=ego_status,
-                vl_padding_mask=vl_padding_mask,
-                reasoning_padding_mask=reasoning_padding_mask
+                gen_vit_tokens=gen_vit_tokens,
+                reasoning_query_tokens=reasoning_query_tokens,
+                ego_status=ego_status
             )
             
-            # Normalize prediction
+            # For next iteration, use the normalized prediction as input
+            # Apply scheduler-based multiplicative noise for refinement
             x_start = self.norm_odo(pred)  # (B, T, 2)
             
-            # DDIM step with multiplicative/additive noise
-            diffusion_output, _, _ = self.diffusionrl_scheduler.step(
-                model_output=x_start,
-                timestep=k,
-                sample=diffusion_output,
-                eta=self.diffusion_eta,
-                generator=generator
-            )
+            # Add noise for next iteration based on the next timestep
+            if i < len(roll_timesteps) - 1:
+                next_k = roll_timesteps[i + 1]
+                # Apply multiplicative noise based on scheduler variance at next timestep
+                diffusion_output = self.add_multiplicative_noise_scheduled(
+                    x_start,
+                    timestep=next_k,
+                    eta=1.0,
+                    std_min=0.02
+                )
+            else:
+                diffusion_output = x_start
         
-        # 4. Final denormalization
-        trajectory = self.denorm_odo(torch.clamp(diffusion_output, min=-1, max=1))
-        
-        return trajectory
-    
-    def _standard_diffusion_sample(
-        self,
-        condition_data: torch.Tensor,
-        condition_mask: torch.Tensor,
-        memory: torch.Tensor,
-        vl_features: torch.Tensor,
-        reasoning_features: torch.Tensor,
-        cond: torch.Tensor,
-        ego_status: torch.Tensor,
-        vl_padding_mask: torch.Tensor,
-        reasoning_padding_mask: torch.Tensor,
-        device: torch.device,
-        generator=None,
-        **kwargs
-    ) -> torch.Tensor:
-        """
-        Standard diffusion sampling (legacy DDPM).
-        """
-        scheduler = self.noise_scheduler
-        
-        # Sample from Gaussian noise
-        trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=device,
-            generator=generator
-        )
-    
-        # Set step values
-        scheduler.set_timesteps(self.num_inference_steps)
-        
-        for t in scheduler.timesteps:
-            # Apply conditioning
-            trajectory[condition_mask] = condition_data[condition_mask]
-
-            # Predict model output using cached encoder outputs
-            model_output = self.model.decode_with_cache(
-                sample=trajectory,
-                timestep=t,
-                memory=memory,
-                vl_features=vl_features,
-                reasoning_features=reasoning_features,
-                cond=cond,
-                ego_status=ego_status,
-                vl_padding_mask=vl_padding_mask,
-                reasoning_padding_mask=reasoning_padding_mask
-            )
-
-            # Compute previous sample: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, 
-                generator=generator,
-                **kwargs
-            ).prev_sample
-        
-        # Enforce conditioning
-        trajectory[condition_mask] = condition_data[condition_mask]
-
-        return trajectory
+        # 4. Return the model's direct prediction (NOT denorm_odo(diffusion_output))
+        return pred
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
@@ -969,14 +721,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         naction_pred = nsample[...,:Da]
         
         # For truncated diffusion, the output is already in original scale
-        # For legacy mode, we may need to unnormalize
-        if not self.use_truncated_diffusion:
-            # Clamp normalized predictions to [-1, 1] to prevent extreme values
-            naction_pred = torch.clamp(naction_pred, -1.0, 1.0)
-            
-            # Unnormalize action predictions back to original range
-            if self.enable_action_normalization and self.action_stats is not None:
-                naction_pred = self.unnormalize_action(naction_pred)
+        # No need to unnormalize
         
         action_pred = naction_pred.detach().cpu().numpy()
         action = action_pred
