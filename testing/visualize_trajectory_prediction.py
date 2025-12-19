@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import time
 import torch
 import yaml
 import numpy as np
@@ -54,7 +55,7 @@ def load_model(config, checkpoint_path, device):
 
 def main():
     # Configuration
-    config_path = os.path.join(project_root, "config", "pdm_server.yaml")
+    config_path = os.path.join(project_root, "config", "pdm_mini_server.yaml")
     checkpoint_path = os.path.join(project_root, "checkpoints", "carla_dit_best", "carla_policy_best.pt")
     config = load_config(config_path)
     
@@ -120,12 +121,16 @@ def main():
                 'ego_status': sample['ego_status'].unsqueeze(0).to(device),  # Keep last 4 frames from 5-frame horizon
                 'gen_vit_tokens': sample['gen_vit_tokens'].unsqueeze(0).to(device),  # (1, ...)
                 'reasoning_query_tokens': sample['reasoning_query_tokens'].unsqueeze(0).to(device),  # (1, ...)
+                'anchor': sample['anchor']
             }
 
             
             # Predict
+            time1=time.time()
             result = policy.predict_action(obs_dict)
             pred = result['action'][0]  # (pred_horizon, 2)
+            time2=time.time()
+            print(f"Prediction time for sample {idx}: {time2 - time1:.4f} seconds")
             
             samples.append(sample)
             predictions.append(pred)
