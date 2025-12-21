@@ -32,10 +32,14 @@ sys.path = [str(p) for p in sys.path]
 
 from leaderboard.autoagents import autonomous_agent
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
-from team_code.planner import RoutePlanner
-from team_code.orion.pid_controller import PIDController  # Use orion's PID controller
+from team_code.simlingo.nav_planner import RoutePlanner, LateralPIDController  
+import team_code.simlingo.transfuser_utils as t_u  
+from team_code.render import render, render_self_car, render_waypoints
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
 from scipy.optimize import fsolve
+from scipy.interpolate import PchipInterpolator
+import xml.etree.ElementTree as ET  
+from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  
 # mot dependencies
 project_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
@@ -63,6 +67,10 @@ from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from mot.evaluation.inference import InterleaveInferencer
 from transformers import AutoTokenizer
 
+try:
+    import pygame
+except ImportError:
+    raise RuntimeError("cannot import pygame, make sure pygame package is installed")
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
@@ -114,6 +122,75 @@ def load_best_model(checkpoint_path, config, device):
                 print(f"    {key}: {value:.4f}")
 
     return policy
+
+# display purpose only
+class DisplayInterface(object):
+    def __init__(self):
+        self._width = 1200
+        self._height = 600
+        self._surface = None
+
+        pygame.init()
+        pygame.font.init()
+        self._clock = pygame.time.Clock()
+        self._display = pygame.display.set_mode(
+            (self._width, self._height), pygame.HWSURFACE | pygame.DOUBLEBUF
+        )
+
+        pygame.display.set_caption("CORL Agent")
+
+    def run_interface(self, input_data):
+        rgb = input_data['rgb']
+        trajectory = input_data['predicted_trajectory']
+        decision_1s = input_data['decision_1s']
+        decision_2s = input_data['decision_2s']
+        decision_3s = input_data['decision_3s']
+        surface = np.zeros((600, 1200, 3),np.uint8)
+        surface[:, :800] = rgb
+        surface[:400,800:1200] = input_data['bev_traj']
+        surface[440:600,1000:1200] = trajectory[0:160,:]
+        surface = cv2.putText(surface, input_data['language_1'], (20,560), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
+        surface = cv2.putText(surface, input_data['language_2'], (20,580), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
+        surface = cv2.putText(surface, input_data['control'], (20,540), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
+        surface = cv2.putText(surface, input_data['speed'], (20,520), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
+        surface = cv2.putText(surface, input_data['time'], (20,500), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
+
+        # surface = cv2.putText(surface, 'Left  View', (40,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
+        # surface = cv2.putText(surface, 'Focus View', (335,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
+        # surface = cv2.putText(surface, 'Right View', (640,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
+
+        surface = cv2.putText(surface, 'Behavior Decision', (820,420), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 2)
+        surface = cv2.putText(surface, 'Planned Trajectory', (1010,420), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 2)
+        surface = cv2.putText(surface, decision_1s, (820,480), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
+        surface = cv2.putText(surface, decision_2s, (820,510), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
+        surface = cv2.putText(surface, decision_3s, (820,540), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
+
+        surface[:150,198:202]=0
+        surface[:150,323:327]=0
+        surface[:150,473:477]=0
+        surface[:150,598:602]=0
+        surface[148:152, :200] = 0
+        surface[148:152, 325:475] = 0
+        surface[148:152, 600:800] = 0
+        surface[430:600, 998:1000] = 255
+        surface[0:600, 798:800] = 255
+        surface[0:600, 1198:1200] = 255
+        surface[0:2, 800:1200] = 255
+        surface[598:600, 800:1200] = 255
+        surface[398:400, 800:1200] = 255
+
+
+        # display image
+        self._surface = pygame.surfarray.make_surface(surface.swapaxes(0, 1))
+        if self._surface is not None:
+            self._display.blit(self._surface, (0, 0))
+
+        pygame.display.flip()
+        pygame.event.get()
+        return surface
+
+    def _quit(self):
+        pygame.quit()
 
 # mot utils
 @dataclass
@@ -368,29 +445,100 @@ def attach_debugger():
     debugpy.wait_for_client()
     print("Attached!")
 
-def build_cleaned_prompt_and_modes(target_point):
+def build_cleaned_prompt_and_modes(target_point_speed):
 
-    if isinstance(target_point, torch.Tensor):
-        tp = target_point.detach().cpu().view(-1)
-        x, y = float(tp[0].item()), float(tp[1].item())
-    elif isinstance(target_point, np.ndarray):
-        tp = target_point.reshape(-1)
-        x, y = float(tp[0]), float(tp[1])
-    elif isinstance(target_point, (list, tuple)):
-        assert len(target_point) >= 2
-        x, y = float(target_point[0]), float(target_point[1])
+    if isinstance(target_point_speed, torch.Tensor):
+        tp = target_point_speed.detach().cpu().view(-1)
+        speed, x, y = float(tp[0].item()), float(tp[1].item()), float(tp[2].item())
+    elif isinstance(target_point_speed, np.ndarray):
+        tp = target_point_speed.reshape(-1)
+        speed, x, y = float(tp[0]), float(tp[1]), float(tp[2])
+    elif isinstance(target_point_speed, (list, tuple)):
+        assert len(target_point_speed) >= 3
+        speed, x, y = float(target_point_speed[0]), float(target_point_speed[1]), float(target_point_speed[2])
     else:
-        raise TypeError(f"Unsupported type for target_point: {type(target_point)}")
+        raise TypeError(f"Unsupported type for target_point: {type(target_point_speed)}")
 
     x_str = f"{x:.6f}"
     y_str = f"{y:.6f}"
-
-    prompt = f"Your target point is ({x_str}, {y_str}), what's your driving suggestion?"
+    prompt = f"Your target point is ({x_str}, {y_str}), and your current velocity is {speed:.2f} m/s. Predict the driving actions ( now, +1s, +2s) and plan the trajectory for the next 3 seconds."
 
     understanding_output = False
     reasoning_output = True
 
     return prompt, understanding_output, reasoning_output
+
+def parse_decision_sequence(decision_str):
+    """
+    Parse decision sequence from model output.
+    
+    Args:
+        decision_str: String like '<|im_start|> stop, accelerate, stop<|im_end|>'
+                      or 'stop, accelerate, stop'
+    
+    Returns:
+        tuple: (decision_now, decision_1s, decision_2s) - three decisions as strings
+               Returns (None, None, None) if parsing fails
+    
+    Example:
+        >>> parse_decision_sequence('<|im_start|> stop, accelerate, stop<|im_end|>')
+        ('stop', 'accelerate', 'stop')
+    """
+    if not decision_str or not isinstance(decision_str, str):
+        return (None, None, None)
+    
+    # Remove special tokens
+    cleaned = decision_str.replace('<|im_start|>', '').replace('<|im_end|>', '')
+    # Strip whitespace
+    cleaned = cleaned.strip()
+    
+    # Split by comma
+    parts = [p.strip() for p in cleaned.split(',')]
+    
+    # Ensure we have exactly 3 decisions
+    if len(parts) >= 3:
+        return (parts[0], parts[1], parts[2])
+    elif len(parts) == 2:
+        return (parts[0], parts[1], None)
+    elif len(parts) == 1:
+        return (parts[0], None, None)
+    else:
+        return (None, None, None)
+
+def split_prompt(prompt_cleaned):
+    """
+    Split the prompt into two sentences.
+    
+    Args:
+        prompt_cleaned: String like 'Your target point is (53.101654, 0.201010), and your current velocity is 0.00 m/s. Predict the driving actions ( now, +1s, +2s) and plan the trajectory for the next 3 seconds.'
+    
+    Returns:
+        tuple: (sentence1, sentence2)
+    
+    Example:
+        >>> split_prompt('Your target point is (...). Predict the driving actions...')
+        ('Your target point is (...).', 'Predict the driving actions...')
+    """
+    if not prompt_cleaned or not isinstance(prompt_cleaned, str):
+        return (None, None)
+    
+    # Find the first period followed by space (end of first sentence)
+    # Pattern: "...m/s. Predict..."
+    split_marker = "m/s. "
+    if split_marker in prompt_cleaned:
+        idx = prompt_cleaned.find(split_marker)
+        sentence1 = prompt_cleaned[:idx + 4]  # Include "m/s."
+        sentence2 = prompt_cleaned[idx + 5:]  # Skip "m/s. "
+        return (sentence1.strip(), sentence2.strip())
+    
+    # Fallback: split by ". " if marker not found
+    if ". " in prompt_cleaned:
+        idx = prompt_cleaned.find(". ")
+        sentence1 = prompt_cleaned[:idx + 1]
+        sentence2 = prompt_cleaned[idx + 2:]
+        return (sentence1.strip(), sentence2.strip())
+    
+    return (prompt_cleaned, None)
 
 class MOTAgent(autonomous_agent.AutonomousAgent):
 	def setup(self, path_to_conf_file):
@@ -446,7 +594,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
     	)
 		print("✓ MoT model loaded.")
 
-		self.pidcontroller = PIDController()
+		# Use simlingo's controllers (LateralPIDController for steering, PIDController for speed)
+		self.turn_controller = LateralPIDController(inference_mode=True)  # Set inference_mode=True for model predictions
+		self.speed_controller = t_u.PIDController(k_p=1.75, k_i=1.0, k_d=2.0, n=20)  # Same as simlingo config
+		
+		# Control config (same as simlingo's GlobalConfig)
+		self.carla_fps = 20
+		self.wp_dilation = 1
+		self.data_save_freq = 5
+		self.brake_speed = 0.4
+		self.brake_ratio = 1.1
+		self.clip_delta = 1.0
+		self.clip_throttle = 1.0
+		self.stuck_threshold = 800
+		self.creep_duration = 15
+		self.creep_throttle = 0.4
+		
+		# Stuck detection (same as simlingo)
+		self.stuck_detector = 0
+		self.force_move = 0
 
 		self.steer_step = 0
 		self.last_moving_status = 0
@@ -461,7 +627,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.lat_ref, self.lon_ref = 42.0, 2.0
 		control = carla.VehicleControl()
 		control.steer = 0.0
-		control.throttle = 0.4
+		control.throttle = 0.0
 		control.brake = 0.0	
 		self.prev_control = control
 
@@ -500,29 +666,96 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Store predicted trajectory for BEV visualization
 		self.last_pred_traj = None  # Store the last predicted trajectory (in ego frame)
+		self.last_target_point = None  # Store the last target point (in ego frame)
 
 	def _init(self):
+		# Use _global_plan_world_coord directly (already in CARLA coordinates)
+		# This avoids the GPS-to-CARLA conversion which can fail when fsolve doesn't converge
+		# Get lat_ref/lon_ref from CARLA map directly
 		try:
-			locx, locy = self._global_plan_world_coord[0][0].location.x, self._global_plan_world_coord[0][0].location.y
-			lon, lat = self._global_plan[0][0]['lon'], self._global_plan[0][0]['lat']
-			E = EARTH_RADIUS_EQUA
-			def equations(vars):
-				x, y = vars
-				eq1 = lon * math.cos(x * math.pi / 180) - (locx * x * 180) / (math.pi * E) - math.cos(x * math.pi / 180) * y
-				eq2 = math.log(math.tan((lat + 90) * math.pi / 360)) * E * math.cos(x * math.pi / 180) + locy - math.cos(x * math.pi / 180) * E * math.log(math.tan((90 + x) * math.pi / 360))
-				return [eq1, eq2]
-			initial_guess = [0, 0]
-			solution = fsolve(equations, initial_guess)
-			self.lat_ref, self.lon_ref = solution[0], solution[1]
+			world_map = CarlaDataProvider.get_map()
+			xodr = world_map.to_opendrive()
+			tree = ET.ElementTree(ET.fromstring(xodr))
+			
+			# Default values if not found in OpenDRIVE
+			self.lat_ref = 42.0
+			self.lon_ref = 2.0
+			
+			for opendrive in tree.iter('OpenDRIVE'):
+				for header in opendrive.iter('header'):
+					for georef in header.iter('geoReference'):
+						if georef.text:
+							str_list = georef.text.split(' ')
+							for item in str_list:
+								if '+lat_0' in item:
+									self.lat_ref = float(item.split('=')[1])
+								if '+lon_0' in item:
+									self.lon_ref = float(item.split('=')[1])
+			print(f"[DEBUG _init] Got lat_ref={self.lat_ref}, lon_ref={self.lon_ref} from CARLA map OpenDRIVE")
 		except Exception as e:
-			print(e, flush=True)
-			self.lat_ref, self.lon_ref = 0, 0
-		print(self.lat_ref, self.lon_ref, self.save_name)
+			print(f"[DEBUG _init] Failed to get lat_ref/lon_ref from map: {e}")
+			# Fallback: try fsolve (might not converge)
+			try:
+				locx, locy = self._global_plan_world_coord[0][0].location.x, self._global_plan_world_coord[0][0].location.y
+				lon, lat = self._global_plan[0][0]['lon'], self._global_plan[0][0]['lat']
+				print(f"[DEBUG _init] First waypoint - CARLA: ({locx}, {locy}), GPS: lat={lat}, lon={lon}")
+				earth_radius_equa = 6378137.0
+				def equations(variables):
+					x, y = variables
+					eq1 = (lon * math.cos(x * math.pi / 180.0) - (locx * x * 180.0) / (math.pi * earth_radius_equa)
+								 - math.cos(x * math.pi / 180.0) * y)
+					eq2 = (math.log(math.tan((lat + 90.0) * math.pi / 360.0)) * earth_radius_equa
+								 * math.cos(x * math.pi / 180.0) + locy - math.cos(x * math.pi / 180.0) * earth_radius_equa
+								 * math.log(math.tan((90.0 + x) * math.pi / 360.0)))
+					return [eq1, eq2]
+				initial_guess = [0.0, 0.0]
+				solution = fsolve(equations, initial_guess)
+				self.lat_ref, self.lon_ref = solution[0], solution[1]
+				print(f"[DEBUG _init] Fallback fsolve: lat_ref={self.lat_ref}, lon_ref={self.lon_ref}")
+			except Exception as e2:
+				print(f"[DEBUG _init] Fallback fsolve also failed: {e2}")
+				self.lat_ref, self.lon_ref = 0.0, 0.0
 		
-		self._route_planner = RoutePlanner(4.0, 50.0, lat_ref=self.lat_ref, lon_ref=self.lon_ref)
-		self._route_planner.set_route(self._global_plan, True)
+		print(f"[DEBUG _init] Final lat_ref={self.lat_ref}, lon_ref={self.lon_ref}, save_name={self.save_name}")
+		
+
+		self.route_planner_min_distance = 7.5
+		self.route_planner_max_distance = 50.0
+		self._route_planner = RoutePlanner(self.route_planner_min_distance, self.route_planner_max_distance,
+										   self.lat_ref, self.lon_ref)
+		
+		# Debug: Print _global_plan_world_coord format
+		print(f"[DEBUG _init] _global_plan_world_coord length: {len(self._global_plan_world_coord)}")
+		if len(self._global_plan_world_coord) > 0:
+			print(f"[DEBUG _init] _global_plan_world_coord[0] type: {type(self._global_plan_world_coord[0])}")
+			first_wp = self._global_plan_world_coord[0]
+			if isinstance(first_wp, tuple) and len(first_wp) >= 2:
+				print(f"[DEBUG _init] First waypoint location: ({first_wp[0].location.x}, {first_wp[0].location.y}, {first_wp[0].location.z})")
+				print(f"[DEBUG _init] First waypoint cmd: {first_wp[1]}")
+		
+		# Use _global_plan_world_coord with gps=False (recommended, GPS is deprecated in nav_planner.py)
+		self._route_planner.set_route(self._global_plan_world_coord, gps=False)
+		
+		# Debug: Print route after set_route
+		print(f"[DEBUG _init] After set_route, route length: {len(self._route_planner.route)}")
+		if len(self._route_planner.route) > 0:
+			first_route = list(self._route_planner.route)[0]
+			print(f"[DEBUG _init] First route point (CARLA coords): {first_route[0]}, cmd: {first_route[1]}")
+			if len(self._route_planner.route) > 1:
+				second_route = list(self._route_planner.route)[1]
+				print(f"[DEBUG _init] Second route point (CARLA coords): {second_route[0]}, cmd: {second_route[1]}")
+		
+		# Initialize command tracking 
+		self.commands = deque(maxlen=2)
+		self.commands.append(4)
+		self.commands.append(4)
+		self.target_point_prev = [1e5, 1e5, 1e5]
+		self.last_command = -1
+		self.last_command_tmp = -1
+		
 		self.initialized = True
 		self.metric_info = {}
+		self._hic = DisplayInterface()
 
 	def _build_obs_dict(self, tick_data, lidar, rgb_front, speed, theta, target_point, cmd_one_hot, waypoint):
 		"""
@@ -580,36 +813,42 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 
 		current_pos = tick_data['gps']  
-		current_theta = tick_data['theta']  
-		# For coordinate transformation, use theta - pi/2 (consistent with training data's ego_matrix)
-		current_theta_for_transform = current_theta - np.pi/2
+		current_theta = tick_data['theta']  # This is already preprocessed: compass - 90°
+		
+		# Build rotation matrix for world-to-ego transformation
+		# R = [[cos, -sin], [sin, cos]] is the ego-to-world rotation
+		# R.T = [[cos, sin], [-sin, cos]] is the world-to-ego rotation
+		# This matches inverse_conversion_2d: R.T @ (point - translation)
+		cos_theta = np.cos(current_theta)
+		sin_theta = np.sin(current_theta)
 		current_R = np.array([
-			[np.cos(current_theta_for_transform), np.sin(current_theta_for_transform)],
-			[-np.sin(current_theta_for_transform), np.cos(current_theta_for_transform)]
-		])
+			[cos_theta, sin_theta],
+			[-sin_theta, cos_theta]
+		])  # This is R.T, for world-to-ego transformation
 		
 		# Transform each historical waypoint to current frame
 		waypoint_relative_list = []
 		for i in range(self.obs_horizon):
 			past_waypoint = waypoint_stacked[0, i].cpu().numpy()  # [x, y] in global coordinates
-			# Transform from world to ego frame: R @ (past - current)
+			# Transform from world to ego frame: R.T @ (past - current)
 			relative_waypoint = current_R @ (past_waypoint - current_pos)
 			waypoint_relative_list.append(torch.from_numpy(relative_waypoint).float().to('cuda'))
 		
 		waypoint_relative_stacked = torch.stack(waypoint_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
-		
 		target_point_transformed_list = []
 		for i in range(self.obs_horizon):
 			past_world_pos = waypoint_list[i].cpu().numpy()  # [x, y] in world coordinates
-			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame (raw compass)
-			# For coordinate transformation, use theta - pi/2 (consistent with training data's ego_matrix)
-			past_theta_for_transform = past_theta - np.pi/2
-			target_in_past_ego = target_point_list[i].squeeze().cpu().numpy()  # [x, y]
+			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame (already preprocessed)
+			target_in_past_ego = target_point_list[i].squeeze().cpu().numpy()  # [x, y] in past ego frame
+			
+			# Build past ego-to-world rotation matrix
+			cos_past = np.cos(past_theta)
+			sin_past = np.sin(past_theta)
 			past_R_ego_to_world = np.array([
-				[np.cos(past_theta_for_transform), -np.sin(past_theta_for_transform)],
-				[np.sin(past_theta_for_transform), np.cos(past_theta_for_transform)]
-			])
+				[cos_past, -sin_past],
+				[sin_past, cos_past]
+			])  # This is R, for ego-to-world transformation
 			
 			# Step 1: Transform target point from past ego frame to world frame
 			target_world = past_R_ego_to_world @ target_in_past_ego + past_world_pos
@@ -620,6 +859,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			target_point_transformed_list.append(torch.from_numpy(target_in_current_ego).float().to('cuda'))
 		
 		target_point_transformed_stacked = torch.stack(target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		
 		
 		# Concatenate all ego status features: speed + theta + throttle + brake + cmd + target_point + waypoint_relative
 		# ego_status_stacked: (1, obs_horizon, 1+1+1+1+6+2+2) = (1, obs_horizon, 14)
@@ -655,7 +895,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				# imu
 				{
 					'type': 'sensor.other.imu',
-					'x': -1.4, 'y': 0.0, 'z': 0.0,
+					'x': 0.0, 'y': 0.0, 'z': 0.0,
 					'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
 					'sensor_tick': 0.05,
 					'id': 'IMU'
@@ -663,7 +903,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				# gps
 				{
 					'type': 'sensor.other.gnss',
-					'x': -1.4, 'y': 0.0, 'z': 0.0,
+					'x': 0.0, 'y': 0.0, 'z': 0.0,
 					'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
 					'sensor_tick': 0.01,
 					'id': 'GPS'
@@ -739,35 +979,149 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		speed = input_data['SPEED'][1]['speed']
 
 		if (math.isnan(compass) == True): #It can happen that the compass sends nan for a few frames
+			print("compass sends nan!!!")
 			compass = 0.0
 
+		compass_processed = t_u.preprocess_compass(compass)
+		gps_full = input_data['GPS'][1]  # [lat, lon, altitude]
+		gps_pos = self._route_planner.convert_gps_to_carla(gps_full)
+		
 		result = {
 				'rgb_front': rgb_front,
 				'lidar_bev': lidar_bev_tensor,
-				'gps': gps,
+				'gps': gps_pos[:2],  # Use converted CARLA coordinates
 				'speed': speed,
-				'compass': compass,
+				'compass': compass_processed,  # Use preprocessed compass
 				'bev': bev
 				}
-		pos = self.gps_to_location(result['gps'])
-		result['gps'] = pos
-		next_wp, next_cmd = self._route_planner.run_step(pos)
-		result['next_command'] = next_cmd.value
-		# theta for target_point transformation (used locally in this function)
-		theta_for_transform = compass - np.pi/2
-		R = np.array([
-			[np.cos(theta_for_transform), np.sin(theta_for_transform)],
-			[-np.sin(theta_for_transform),  np.cos(theta_for_transform)]
-			])
-
-		local_command_point = np.array([next_wp[0]-pos[0], next_wp[1]-pos[1]])
-		local_command_point = R.dot(local_command_point)
 		
-		result['target_point'] = local_command_point  # numpy array (2,)
-		# theta for model input should match training data format (raw compass value)
-		result['theta'] = compass
+		waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
+		
+		# Debug: print run_step results
+		if self.step <= 5:
+			print(f"\n[DEBUG tick step {self.step}]")
+			print(f"  GPS input to run_step: {np.append(result['gps'], gps_pos[2])}")
+			print(f"  waypoint_route length: {len(waypoint_route)}")
+			if len(waypoint_route) > 0:
+				wp0 = list(waypoint_route)[0]
+				print(f"  waypoint_route[0]: pos={wp0[0]}, cmd={wp0[1]}")
+			if len(waypoint_route) > 1:
+				wp1 = list(waypoint_route)[1]
+				print(f"  waypoint_route[1]: pos={wp1[0]}, cmd={wp1[1]}")
+		
+		if len(waypoint_route) > 2:
+			target_point, far_command = waypoint_route[1]
+			next_target_point, next_far_command = waypoint_route[2]
+		elif len(waypoint_route) > 1:
+			target_point, far_command = waypoint_route[1]
+			next_target_point, next_far_command = waypoint_route[1]
+		else:
+			target_point, far_command = waypoint_route[0]
+			next_target_point, next_far_command = waypoint_route[0]
+		
+		if self.last_command_tmp != far_command:
+			self.last_command = self.last_command_tmp
+		self.last_command_tmp = far_command
+		
+		if hasattr(target_point, '__iter__') and len(target_point) >= 2:
+			if (target_point[:2] != self.target_point_prev[:2]).any() if isinstance(target_point, np.ndarray) else (list(target_point[:2]) != list(self.target_point_prev[:2])):
+				self.target_point_prev = target_point
+				self.commands.append(far_command.value)
+		
+		result['next_command'] = self.commands[-2]
+		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass'])
+		
+		# Debug: print target point transformation
+		if self.step <= 5:
+			print(f"  target_point (world): {target_point[:2]}")
+			print(f"  ego position (gps): {result['gps']}")
+			print(f"  compass (heading): {result['compass']:.4f} rad ({np.rad2deg(result['compass']):.2f} deg)")
+			print(f"  ego_target_point: {ego_target_point}")
+		
+		result['target_point'] = ego_target_point  # numpy array (2,)
+		result['theta'] = compass_processed
 
 		return result
+	
+	def control_pid(self, route_waypoints, velocity, speed_waypoints):
+		"""
+		Predicts vehicle control with a PID controller.
+		
+		Args:
+			route_waypoints: (1, N, 2) tensor in ego frame [x_forward, y_left]
+			velocity: float, current speed in m/s
+			speed_waypoints: (1, N, 2) tensor for speed calculation
+		"""
+		assert route_waypoints.size(0) == 1
+		route_waypoints_np = route_waypoints[0].data.cpu().numpy()  # (N, 2)
+		speed = velocity  # Already a float
+		speed_waypoints_np = speed_waypoints[0].data.cpu().numpy()  # (N, 2)
+		
+		# MoT trajectory: 6 points, 0.5s interval each, total 3s
+		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
+		# To calculate desired speed (m/s), use displacement over time
+		# simlingo used displacement from half_second to one_second, then * 2
+		# For MoT: point[0] is at 0.5s, point[1] is at 1.0s
+		# Displacement from point[0] to point[1] is 0.5s of travel, so * 2 for m/s
+		mot_waypoint_interval = 0.5  # seconds between waypoints
+		one_second_idx = 1  # point[1] is at 1.0s
+		half_second_idx = 0  # point[0] is at 0.5s
+		
+		if speed_waypoints_np.shape[0] >= 2:
+			# Displacement from 0.5s to 1.0s position, multiply by 2 to get m/s
+			desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx]) * 2.0
+		else:
+			# Fallback: use first point distance, assuming it represents 0.5s travel
+			desired_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
+
+		brake = ((desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio))
+		
+		delta = np.clip(desired_speed - speed, 0.0, self.clip_delta)
+		throttle = self.speed_controller.step(delta)
+		throttle = np.clip(throttle, 0.0, self.clip_throttle)
+		throttle = throttle if not brake else 0.0
+		
+
+		route_interp = self.interpolate_waypoints(route_waypoints_np)
+		
+		# Steering control using LateralPIDController (same as simlingo)
+		steer = self.turn_controller.step(route_interp, speed)
+		steer = np.clip(steer, -1.0, 1.0)
+		steer = round(steer, 3)
+		
+		
+		return steer, throttle, brake
+	
+	def interpolate_waypoints(self, waypoints):
+		"""
+		Interpolate waypoints to be 0.1m apart
+		
+		Args:
+			waypoints: (N, 2) numpy array in ego frame [x_forward, y_left]
+			
+		Returns:
+			interp_points: (M, 2) numpy array with points 0.1m apart
+		"""
+		waypoints = waypoints.copy()
+		# Add origin point at the beginning
+		waypoints = np.concatenate((np.zeros_like(waypoints[:1]), waypoints))
+		shift = np.roll(waypoints, 1, axis=0)
+		shift[0] = shift[1]
+		
+		dists = np.linalg.norm(waypoints - shift, axis=1)
+		dists = np.cumsum(dists)
+		dists += np.arange(0, len(dists)) * 1e-4  # Prevents dists not being strictly increasing
+		
+		interp = PchipInterpolator(dists, waypoints, axis=0)
+		
+		x = np.arange(0.1, dists[-1], 0.1)
+		
+		interp_points = interp(x)
+		
+		if interp_points.shape[0] == 0:
+			interp_points = waypoints[None, -1]
+		
+		return interp_points
 	
 	@torch.no_grad()
 	def run_step(self, input_data, timestamp):
@@ -843,12 +1197,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			lidar_pil = Image.fromarray(lidar_np, mode='RGB')
 			lidar_pil_list = [lidar_pil]  
 			
-			prompt_cleaned, understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point)
+			target_point_speed=torch.cat([speed, target_point], dim=-1)  # (1, 3)
+			prompt_cleaned, understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point_speed)
 
 			predicted_answer = self.inferencer(
 				image=rgb_pil_list,  
 				front=[rgb_pil_list[-1]],  
-				lidar=lidar_pil_list,  
+				lidar=lidar_pil_list,
+				v_target_point=target_point_speed,
 				text=prompt_cleaned,
 				understanding_output=understanding_output,
 				reasoning_output=reasoning_output,
@@ -857,57 +1213,119 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				text_temperature=0.0,
 			)
 
-			pred_traj = predicted_answer['traj']  # Shape: (1, 6, 2)
+			pred_traj = predicted_answer['traj']  # Shape: (1, 6, 2) in ego frame [x_forward, y_left]
+			pred_decision = predicted_answer['text']
 			print(f"pred_traj: {pred_traj}")
 			
-			# Store predicted trajectory for BEV visualization (in original [x, y] format)
 			self.last_pred_traj = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2) in [x, y] format
+			self.last_target_point = target_point.squeeze(0).float().cpu().numpy()  # (2,) in [x, y] format
 		
-			# Convert to numpy and remove batch dimension: (1, 6, 2) -> (6, 2)
-			# Convert to float32 first since numpy doesn't support BFloat16
-			waypoints_np = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2)
-			# Swap x,y to y,x for PID controller (PID expects [y, x] format)
-			waypoints_np = waypoints_np[:, [1, 0]]  # (6, 2) with columns swapped  
+			# ================== control_pid method ==================
+			route_waypoints = pred_traj.float()  # (1, 6, 2) - use as route_waypoints
+			speed_waypoints = pred_traj.float()  # (1, 6, 2) - use as speed_waypoints (same for MoT)
+			gt_velocity = tick_data['speed']
 			
-			# PID controller expects speed as numpy scalar (for .astype() call in metadata)
-			speed_np = np.float32(tick_data['speed'])
-			target_np = target_point.squeeze().cpu().numpy()  # (2,)
-			target_np = target_np[[1, 0]]  
+			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints)
 			
-			# Use orion's PID controller for control
-			steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(
-				waypoints_np, speed_np, target_np
-			)
-			
-			# Apply orion's simple post-processing
-			if brake_traj < 0.05: 
-				brake_traj = 0.0
-			if throttle_traj > brake_traj: 
-				brake_traj = 0.0
-			if tick_data['speed'] > 5:
-				throttle_traj = 0
+			# Restart mechanism in case the car got stuck 
+			if gt_velocity < 0.1:
+				self.stuck_detector += 1
+			else:
+				self.stuck_detector = 0
+				
+			if self.stuck_detector > self.stuck_threshold:
+				self.force_move = self.creep_duration
+				
+			if self.force_move > 0:
+				throttle = max(self.creep_throttle, throttle)
+				brake = False
+				self.force_move -= 1
+				print(f"force_move: {self.force_move}")
 			
 			control = carla.VehicleControl()
-			self.pid_metadata = metadata_traj
-			self.pid_metadata['agent'] = 'only_traj'
-			control.steer = np.clip(float(steer_traj), -1, 1)
-			control.throttle = np.clip(float(throttle_traj), 0, 0.75)
-			control.brake = np.clip(float(brake_traj), 0, 1)
-			self.pid_metadata['steer'] = control.steer
-			self.pid_metadata['throttle'] = control.throttle
-			self.pid_metadata['brake'] = control.brake
-			self.pid_metadata['steer_traj'] = float(steer_traj)
-			self.pid_metadata['throttle_traj'] = float(throttle_traj)
-			self.pid_metadata['brake_traj'] = float(brake_traj)
-			self.pid_metadata['plan'] = waypoints_np.tolist()
-			self.pid_metadata['command'] = command
-		
-		self.prev_control = control
-		metric_info = self.get_metric_info()
-		self.metric_info[self.step] = metric_info
-		if SAVE_PATH is not None:
-			self.save(tick_data)
-		
+			control.steer = float(steer)
+			control.throttle = float(throttle)
+			control.brake = float(brake)
+			
+			# Store metadata
+			self.pid_metadata = {
+				'agent': 'mot',
+				'steer': control.steer,
+				'throttle': control.throttle,
+				'brake': control.brake,
+				'speed': gt_velocity,
+				'command': command,
+			}
+
+			self.prev_control = control
+			metric_info = self.get_metric_info()
+			self.metric_info[self.step] = metric_info
+
+			if SAVE_PATH is not None:
+				self.save(tick_data)
+
+			##### Rendering ####
+			ego_car_map = render_self_car(
+				loc=np.array([0, 0]),
+				ori=np.array([0, -1]),
+				box=np.array([2.45, 1.0]),
+				color=[1, 1, 0], pixels_per_meter=10, max_distance=30,
+			)
+
+			# Prepare trajectory for rendering
+			traj_for_render = pred_traj.squeeze(0).cpu().float().numpy().copy()  # (6, 2)
+			traj_for_render[:, 1] = -traj_for_render[:, 1]  # Negate y: left -> right
+			tp_for_render = target_point.cpu().float().numpy().copy()
+			if tp_for_render.ndim == 2:
+				tp_for_render = tp_for_render.squeeze(0)
+			tp_for_render[1] = -tp_for_render[1]  # Negate y: left -> right
+			
+
+			trajectory = np.concatenate((traj_for_render, tp_for_render.reshape(1, 2)), axis=0)
+			trajectory = trajectory[:, [1, 0]]
+			trajectory[:, 0] = -trajectory[:, 0]  # y (now in col 0) 
+			trajectory[:, 1] = -trajectory[:, 1]  # x (now in col 1)
+			render_trajectory = render_waypoints(trajectory, pixels_per_meter=30, max_distance=20, color=(0, 255, 0))
+
+			ego_car_map = cv2.resize(ego_car_map, (200, 200))
+			render_trajectory = cv2.resize(render_trajectory, (200, 200))
+
+			surround_map = np.clip(
+				(
+					ego_car_map.astype(np.float32)
+					+ render_trajectory.astype(np.float32)
+				),
+				0,
+				255,
+			).astype(np.uint8)
+			tick_data["predicted_trajectory"] = surround_map
+			decision_1s, decision_2s, decision_3s = parse_decision_sequence(pred_decision)
+			tick_data["decision_1s"] = decision_1s
+			tick_data["decision_2s"] = decision_2s
+			tick_data["decision_3s"] = decision_3s
+
+			tick_data["rgb_raw"] = tick_data["rgb_front"]
+
+			tick_data["rgb"] = cv2.resize(tick_data["rgb_front"], (800, 600))
+			tick_data["bev_traj"] = cv2.resize(tick_data["bev_traj"], (400, 400))
+
+			tick_data["control"] = "throttle: %.2f, steer: %.2f, brake: %.2f" % (
+				control.throttle,
+				control.steer,
+				control.brake,
+			)
+			tick_data["speed"] = "speed: %.2f Km/h, target point x: %.2f m, target point y: %.2f m" % (gt_velocity*3.6, target_point.squeeze(0).cpu().float().numpy()[0], target_point.squeeze(0).cpu().float().numpy()[1])
+			
+			sentence1, sentence2 = split_prompt(prompt_cleaned)
+			tick_data["language_1"] = "Instruction: " + sentence1
+			tick_data["language_2"] = sentence2
+
+			tick_data["mes"] = "speed: %.2f" % gt_velocity
+			tick_data["time"] = "time: %.3f" % timestamp
+
+			surface = self._hic.run_interface(tick_data)
+			tick_data["surface"] = surface
+
 		return control
 
 	def save(self, tick_data):
@@ -917,7 +1335,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Draw trajectory on BEV image if available
 		bev_img = tick_data['bev'].copy()
 		if self.last_pred_traj is not None:
-			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj)
+			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point)
+		tick_data['bev_traj'] = bev_img
 		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		
 		if 'lidar_bev' in tick_data:
@@ -936,7 +1355,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		json.dump(self.metric_info, outfile, indent=4)
 		outfile.close()
 
-	def _draw_trajectory_on_bev(self, bev_img, traj):
+	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None):
 		"""
 		Draw predicted trajectory on BEV image.
 		
@@ -945,12 +1364,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		- FOV: 50 degrees
 		- Image size: 512x512
 		
-		Trajectory is in ego frame: [x, y] where x is forward, y is left
+		Trajectory is in ego frame: [x, y] where x is forward, y is left (model convention)
+		For BEV visualization, we negate y to convert to right-positive convention.
 		BEV image: center is ego position, up is forward (negative x in image coords)
 		
 		Args:
 			bev_img: numpy array (512, 512, 3) RGB image
-			traj: numpy array (6, 2) trajectory points in ego frame [x, y]
+			traj: numpy array (6, 2) trajectory points in ego frame [x_forward, y_left]
+			target_point: numpy array (2,) target point in ego frame [x_forward, y_left], optional
 		
 		Returns:
 			bev_img: numpy array with trajectory drawn
@@ -969,15 +1390,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		cx, cy = img_w // 2, img_h // 2
 		
 		# Convert trajectory points to pixel coordinates
-		# Ego frame: x is forward, y is left
+		# Model ego frame: x is forward, y is LEFT (positive y = left)
 		# BEV image: center is ego, up (-row) is forward, right (+col) is right
-		# So: pixel_col = cx - y / meters_per_pixel (y left -> -col)
+		# Need to negate y to convert from left-positive to right-positive
+		# So: pixel_col = cx + y / meters_per_pixel (negate y: left -> right, then right is +col)
 		#     pixel_row = cy - x / meters_per_pixel (x forward -> -row, i.e., up)
 		
 		pixels = []
 		for i in range(len(traj)):
-			x, y = traj[i]  # x: forward, y: left
-			pixel_col = int(cx - y / meters_per_pixel)
+			x, y = traj[i]  # x: forward, y: left (model convention)
+			# Negate y for visualization: left-positive -> right-positive
+			pixel_col = int(cx + y / meters_per_pixel)  # y_left negated: +y_left -> -col, so use + to flip
 			pixel_row = int(cy - x / meters_per_pixel)
 			pixels.append((pixel_col, pixel_row))
 		
@@ -998,6 +1421,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				color_r = int(255 * (1 - i / (len(pixels) - 1)))
 				color_b = int(255 * (i / (len(pixels) - 1)))
 				cv2.circle(bev_img, (col, row), 5, (color_r, 0, color_b), -1)
+		
+		# Draw target point if provided (cyan/aqua color with larger circle)
+		if target_point is not None:
+			x, y = target_point[0], target_point[1]  # x: forward, y: left (model convention)
+			# Negate y for visualization
+			tp_col = int(cx + y / meters_per_pixel)  # Negate y: +y_left -> -col, use + to flip
+			tp_row = int(cy - x / meters_per_pixel)
+			if 0 <= tp_col < img_w and 0 <= tp_row < img_h:
+				cv2.circle(bev_img, (tp_col, tp_row), 10, (0, 255, 255), -1)  # Cyan circle for target point
+				cv2.circle(bev_img, (tp_col, tp_row), 12, (255, 255, 255), 2)  # White border
 		
 		# Draw ego position (center)
 		cv2.circle(bev_img, (cx, cy), 8, (255, 255, 0), -1)  # Yellow circle for ego
