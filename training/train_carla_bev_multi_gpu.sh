@@ -2,10 +2,14 @@
 
 # Multi-GPU Distributed Training Script for CARLA BEV Policy
 # Usage: bash train_carla_bev_multi_gpu.sh [num_gpus] [config_path]
+# pkill -9 -f "train_carla_bev"
+
+# Select GPUs 1-7 (excluding GPU 0)
+export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
 
 # Default values
-NUM_GPUS=${1:-2}  # Default to 2 GPUs
-CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_server_mini.yaml"}
+NUM_GPUS=${1:-7}  # Default to 7 GPUs (GPU 1-7)
+CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml"}
 
 # Set environment variables for better performance
 export OMP_NUM_THREADS=8
@@ -27,5 +31,5 @@ torchrun \
     --rdzv_id=123456789 \
     --rdzv_backend=c10d \
     --rdzv_endpoint=localhost:29501 \
-    train_carla_bev.py \
+    training/train_carla_bev.py \
     --config_path "$CONFIG_PATH"

@@ -15,6 +15,7 @@ import time
 from scipy.spatial import cKDTree
 
 from agents.navigation.global_route_planner import GlobalRoutePlanner
+from agents.navigation.local_planner import RoadOption
 
 class PIDController(object):
     """
@@ -166,6 +167,10 @@ class RoutePlanner(object):
     def __init__(self, min_distance, max_distance, lat_ref=0.0, lon_ref=0.0):
         self.saved_route = deque()
         self.route = deque()
+        ### Oscar: fixing the route planner's bug
+        self.lane_info = deque()
+        ##################################
+
         self.saved_route_distances = deque()
         self.route_distances = deque()
 
@@ -231,6 +236,8 @@ class RoutePlanner(object):
             distance = (diff[0]**2 + diff[1]**2)**0.5
             self.route_distances.append(distance)
 
+        print('set route done.')
+
     def run_step(self, gps):
         if len(self.route) <= 2:
             self.is_last = True
@@ -248,9 +255,24 @@ class RoutePlanner(object):
             diff = self.route[i][0] - gps
             distance = (diff[0]**2 + diff[1]**2)**0.5
 
-            if farthest_in_range < distance <= self.min_distance:
-                farthest_in_range = distance
-                to_pop = i
+            ### Oscar: this is for teporarily fixing the bug of the route planner ###
+            if (self.route[i][1] == RoadOption.CHANGELANELEFT or\
+                self.route[i][1] == RoadOption.CHANGELANERIGHT) and \
+                self.route_distances[min(i+1, len(self.route_distances))] < self.min_distance:
+                # self.route[i-1][1] == RoadOption.LANEFOLLOW:
+                if farthest_in_range < distance <= self.min_distance * 2:
+                    farthest_in_range = distance
+                    to_pop = i
+            elif (self.route[i][1] == RoadOption.CHANGELANELEFT or\
+                self.route[i][1] == RoadOption.CHANGELANERIGHT) and \
+                self.route[min(i+1, len(self.route))][1] == RoadOption.LANEFOLLOW:
+                if farthest_in_range < distance <= self.min_distance * 2:
+                    farthest_in_range = distance
+                    to_pop = i
+            else:
+                if farthest_in_range < distance <= self.min_distance:
+                    farthest_in_range = distance
+                    to_pop = i
 
         for _ in range(to_pop):
             if len(self.route) > 2:

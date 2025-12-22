@@ -17,6 +17,8 @@ import imageio
 import random
 import sys
 import numpy as np
+from filterpy.kalman import MerweScaledSigmaPoints
+from filterpy.kalman import UnscentedKalmanFilter as UKF
 
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
 leaderboard_root = str(os.path.join(project_root, 'leaderboard'))
@@ -79,6 +81,7 @@ print('*'*10)
 print(PLANNER_TYPE)
 print('*'*10)
 EARTH_RADIUS_EQUA = 6378137.0
+USE_UKF = True  # Enable Unscented Kalman Filter for GPS/compass smoothing
 
 # dp utils
 def get_entry_point():
@@ -560,10 +563,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
 		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
-		self.net = load_best_model(checkpoint_path, self.config, device)
-		self.net = self.net.to(torch.bfloat16)
-		if hasattr(self.net, 'obs_encoder'):
-			self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
+		# self.net = load_best_model(checkpoint_path, self.config, device)
+		# self.net = self.net.to(torch.bfloat16)
+		# if hasattr(self.net, 'obs_encoder'):
+		# 	self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
 		print("✓ Diffusion policy loaded (bfloat16).")
 		
 		if torch.cuda.is_available():
@@ -630,6 +633,31 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		control.throttle = 0.0
 		control.brake = 0.0	
 		self.prev_control = control
+		self.control = control  # Store control for UKF prediction
+		
+		# Initialize Unscented Kalman Filter (same as simlingo)
+		self.carla_frame_rate = 1.0 / 20.0  # CARLA frame rate
+		if USE_UKF:
+			self.points = MerweScaledSigmaPoints(n=4, alpha=0.00001, beta=2, kappa=0, subtract=residual_state_x)
+			self.ukf = UKF(dim_x=4,
+						   dim_z=4,
+						   fx=bicycle_model_forward,
+						   hx=measurement_function_hx,
+						   dt=self.carla_frame_rate,
+						   points=self.points,
+						   x_mean_fn=state_mean,
+						   z_mean_fn=measurement_mean,
+						   residual_x=residual_state_x,
+						   residual_z=residual_measurement_h)
+			# State noise, same as measurement because we initialize with the first measurement later
+			self.ukf.P = np.diag([0.5, 0.5, 0.000001, 0.000001])
+			# Measurement noise
+			self.ukf.R = np.diag([0.5, 0.5, 0.000000000000001, 0.000000000000001])
+			self.ukf.Q = np.diag([0.0001, 0.0001, 0.001, 0.001])  # Model noise
+			# Used to set the filter state equal the first measurement
+			self.filter_initialized = False
+			# Stores the last filtered positions of the ego vehicle
+			self.state_log = deque(maxlen=20)
 
 		if SAVE_PATH is not None:
 			now = datetime.datetime.now()
@@ -655,7 +683,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.lidar_bev_history = deque(maxlen=obs_horizon*10) 
 		self.rgb_history = deque(maxlen=obs_horizon*10)
 		self.speed_history = deque(maxlen=obs_horizon*10)
-		self.theta_history = deque(maxlen=obs_horizon*10)
+		self.theta_history = deque(maxlen=obs_horizon*10)		# tg = tick_data['target_point']
+		# tg[1] = 0.05
+		# target_point = torch.from_numpy(tg).unsqueeze(0).float().to('cuda', dtype=torch.float32)e(maxlen=obs_horizon*10)
 		self.throttle_history = deque(maxlen=obs_horizon*10)
 		self.next_command_history = deque(maxlen=obs_horizon*10)
 		self.target_point_history = deque(maxlen=obs_horizon*10)
@@ -929,27 +959,58 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 	def tick(self, input_data):
 		self.step += 1
-		rgb_front =  cv2.cvtColor(input_data['CAM_FRONT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
+		rgb_front = cv2.cvtColor(input_data['CAM_FRONT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
 		lidar_ego = lidar_to_ego_coordinate(input_data['LIDAR'])
-		gps = input_data['GPS'][1][:2]
-		compass = input_data['IMU'][1][-1]
+		
+		# Process GPS and compass using simlingo's method
+		gps_full = input_data['GPS'][1]  # [lat, lon, altitude]
+		gps_pos = self._route_planner.convert_gps_to_carla(gps_full)
+		
+		# Handle compass NaN (same as simlingo)
+		compass_raw = input_data['IMU'][1][-1]
+		if math.isnan(compass_raw):
+			print("compass sends nan!!!")
+			compass_raw = 0.0
+		
+		# Preprocess compass to CARLA coordinate system
+		compass = t_u.preprocess_compass(compass_raw)
+		
+		# Get speed for UKF
+		speed = input_data['SPEED'][1]['speed']
+		
+		# Apply Unscented Kalman Filter (same as simlingo)
+		if USE_UKF:
+			if not self.filter_initialized:
+				self.ukf.x = np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed])
+				self.filter_initialized = True
+
+			self.ukf.predict(steer=self.control.steer, throttle=self.control.throttle, brake=self.control.brake)
+			self.ukf.update(np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed]))
+			filtered_state = self.ukf.x
+
+			self.state_log.append(filtered_state)
+			gps_filtered = filtered_state[0:2]
+			compass_filtered = filtered_state[2]
+		else:
+			gps_filtered = np.array([gps_pos[0], gps_pos[1]])
+			compass_filtered = compass
 		
 		# Combine two frames of lidar data using algin_lidar
+		# Use filtered GPS for lidar alignment
 		if self.last_lidar is not None and self.last_ego_transform is not None:
 			# Calculate relative transformation between current and last frame
-			current_pos = np.array([gps[0], gps[1], 0.0])
+			current_pos = np.array([gps_filtered[0], gps_filtered[1], 0.0])
 			last_pos = np.array([self.last_ego_transform['gps'][0], self.last_ego_transform['gps'][1], 0.0])
 			relative_translation = current_pos - last_pos
 			
-			# Calculate relative rotation
-			current_yaw = compass
+			# Calculate relative rotation using filtered compass
+			current_yaw = compass_filtered
 			last_yaw = self.last_ego_transform['compass']
 			relative_rotation = current_yaw - last_yaw
 			
 			# Rotate difference vector from global to local coordinate system
-			orientation_target = np.deg2rad(current_yaw)
-			rotation_matrix = np.array([[np.cos(orientation_target), -np.sin(orientation_target), 0.0],
-										[np.sin(orientation_target), np.cos(orientation_target), 0.0], 
+			rotation_matrix = np.array([[np.cos(current_yaw), -np.sin(current_yaw), 0.0],
+										[np.sin(current_yaw), np.cos(current_yaw), 0.0], 
 										[0.0, 0.0, 1.0]])
 			relative_translation_local = rotation_matrix.T @ relative_translation
 			
@@ -960,9 +1021,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			lidar_combined = lidar_ego
 		
-		# Store current frame for next iteration
+		# Store current frame for next iteration (use filtered values)
 		self.last_lidar = lidar_ego
-		self.last_ego_transform = {'gps': gps, 'compass': compass}
+		self.last_ego_transform = {'gps': gps_filtered, 'compass': compass_filtered}
 		
 		# Generate lidar BEV image from combined lidar data
 		lidar_bev_img = generate_lidar_bev_images(
@@ -974,24 +1035,15 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Convert BEV image to tensor format for interfuser_bev_encoder backbone
 		lidar_bev_tensor = torch.from_numpy(lidar_bev_img).permute(2, 0, 1).float() / 255.0
 		
-		#Process other sensors
+		# Process other sensors
 		bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
-		speed = input_data['SPEED'][1]['speed']
-
-		if (math.isnan(compass) == True): #It can happen that the compass sends nan for a few frames
-			print("compass sends nan!!!")
-			compass = 0.0
-
-		compass_processed = t_u.preprocess_compass(compass)
-		gps_full = input_data['GPS'][1]  # [lat, lon, altitude]
-		gps_pos = self._route_planner.convert_gps_to_carla(gps_full)
 		
 		result = {
 				'rgb_front': rgb_front,
 				'lidar_bev': lidar_bev_tensor,
-				'gps': gps_pos[:2],  # Use converted CARLA coordinates
+				'gps': gps_filtered,  # Use UKF filtered CARLA coordinates
 				'speed': speed,
-				'compass': compass_processed,  # Use preprocessed compass
+				'compass': compass_filtered,  # Use UKF filtered compass
 				'bev': bev
 				}
 		
@@ -1000,7 +1052,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Debug: print run_step results
 		if self.step <= 5:
 			print(f"\n[DEBUG tick step {self.step}]")
-			print(f"  GPS input to run_step: {np.append(result['gps'], gps_pos[2])}")
+			print(f"  GPS raw: {gps_pos[:2]}, filtered: {gps_filtered}")
+			print(f"  Compass raw: {compass:.4f}, filtered: {compass_filtered:.4f}")
 			print(f"  waypoint_route length: {len(waypoint_route)}")
 			if len(waypoint_route) > 0:
 				wp0 = list(waypoint_route)[0]
@@ -1018,7 +1071,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		else:
 			target_point, far_command = waypoint_route[0]
 			next_target_point, next_far_command = waypoint_route[0]
-		
+
 		if self.last_command_tmp != far_command:
 			self.last_command = self.last_command_tmp
 		self.last_command_tmp = far_command
@@ -1029,7 +1082,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.commands.append(far_command.value)
 		
 		result['next_command'] = self.commands[-2]
-		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass'])
+		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass']) #result['compass'])
 		
 		# Debug: print target point transformation
 		if self.step <= 5:
@@ -1039,7 +1092,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(f"  ego_target_point: {ego_target_point}")
 		
 		result['target_point'] = ego_target_point  # numpy array (2,)
-		result['theta'] = compass_processed
+		result['theta'] = compass_filtered  # Use UKF filtered compass
 
 		return result
 	
@@ -1147,7 +1200,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_front = rgb_front.to('cuda', dtype=torch.float32)
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
 		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
-		
+		# tg = tick_data['target_point']
+		# tg[1] = 0.05
+		# target_point = torch.from_numpy(tg).unsqueeze(0).float().to('cuda', dtype=torch.float32)
+
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
 		self.rgb_history.append(rgb_front)
@@ -1258,6 +1314,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			}
 
 			self.prev_control = control
+			self.control = control  # Update control for UKF prediction in next tick
 			metric_info = self.get_metric_info()
 			self.metric_info[self.step] = metric_info
 
@@ -1438,7 +1495,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		return bev_img
 
 	def destroy(self):
-		del self.net
+		# del self.net
 		torch.cuda.empty_cache()
 
 	def gps_to_location(self, gps):
@@ -1485,5 +1542,106 @@ def algin_lidar(lidar, translation, yaw):
 	aligned_lidar = (rotation_matrix.T @ (lidar - translation).T).T
 
 	return aligned_lidar
+
+
+# ============== UKF Filter Functions ==============
+
+def bicycle_model_forward(x, dt, steer, throttle, brake):
+	"""
+	Kinematic bicycle model.
+	Numbers are the tuned parameters from World on Rails
+	"""
+	front_wb = -0.090769015
+	rear_wb = 1.4178275
+
+	steer_gain = 0.36848336
+	brake_accel = -4.952399
+	throt_accel = 0.5633837
+
+	locs_0 = x[0]
+	locs_1 = x[1]
+	yaw = x[2]
+	speed = x[3]
+
+	if brake:
+		accel = brake_accel
+	else:
+		accel = throt_accel * throttle
+
+	wheel = steer_gain * steer
+
+	beta = math.atan(rear_wb / (front_wb + rear_wb) * math.tan(wheel))
+	next_locs_0 = locs_0.item() if hasattr(locs_0, 'item') else locs_0
+	next_locs_0 = next_locs_0 + speed * math.cos(yaw + beta) * dt
+	next_locs_1 = locs_1.item() if hasattr(locs_1, 'item') else locs_1
+	next_locs_1 = next_locs_1 + speed * math.sin(yaw + beta) * dt
+	next_yaws = yaw + speed / rear_wb * math.sin(beta) * dt
+	next_speed = speed + accel * dt
+	next_speed = next_speed * (next_speed > 0.0)  # Fast ReLU
+
+	next_state_x = np.array([next_locs_0, next_locs_1, next_yaws, next_speed])
+
+	return next_state_x
+
+
+def measurement_function_hx(vehicle_state):
+	"""
+	For now we use the same internal state as the measurement state
+	:param vehicle_state: VehicleState vehicle state variable containing
+		an internal state of the vehicle from the filter
+	:return: np array: describes the vehicle state as numpy array.
+		0: pos_x, 1: pos_y, 2: rotation, 3: speed
+	"""
+	return vehicle_state
+
+
+def state_mean(state, wm):
+	"""
+	We use the arctan of the average of sin and cos of the angle to calculate
+	the average of orientations.
+	:param state: array of states to be averaged. First index is the timestep.
+	:param wm: weights
+	:return: averaged state
+	"""
+	x = np.zeros(4)
+	sum_sin = np.sum(np.dot(np.sin(state[:, 2]), wm))
+	sum_cos = np.sum(np.dot(np.cos(state[:, 2]), wm))
+	x[0] = np.sum(np.dot(state[:, 0], wm))
+	x[1] = np.sum(np.dot(state[:, 1], wm))
+	x[2] = math.atan2(sum_sin, sum_cos)
+	x[3] = np.sum(np.dot(state[:, 3], wm))
+
+	return x
+
+
+def measurement_mean(state, wm):
+	"""
+	We use the arctan of the average of sin and cos of the angle to
+	calculate the average of orientations.
+	:param state: array of states to be averaged. First index is the timestep.
+	:param wm: weights
+	:return: averaged measurement
+	"""
+	x = np.zeros(4)
+	sum_sin = np.sum(np.dot(np.sin(state[:, 2]), wm))
+	sum_cos = np.sum(np.dot(np.cos(state[:, 2]), wm))
+	x[0] = np.sum(np.dot(state[:, 0], wm))
+	x[1] = np.sum(np.dot(state[:, 1], wm))
+	x[2] = math.atan2(sum_sin, sum_cos)
+	x[3] = np.sum(np.dot(state[:, 3], wm))
+
+	return x
+
+
+def residual_state_x(a, b):
+	y = a - b
+	y[2] = t_u.normalize_angle(y[2])
+	return y
+
+
+def residual_measurement_h(a, b):
+	y = a - b
+	y[2] = t_u.normalize_angle(y[2])
+	return y
 
 

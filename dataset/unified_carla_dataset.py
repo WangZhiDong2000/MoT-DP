@@ -216,12 +216,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         theta_data = final_sample['theta_hist']
         ego_status_components.append(theta_data.unsqueeze(-1))  # (obs_horizon, 1)
         
-        throttle_data = final_sample['throttle_hist']
-        ego_status_components.append(throttle_data.unsqueeze(-1))  # (obs_horizon, 1)
-
-        brake_data = final_sample['brake_hist']
-        ego_status_components.append(brake_data.unsqueeze(-1))  # (obs_horizon, 1)
-        
         # 5. command_hist (one-hot, shape: (obs_horizon, 6))
         command_data = final_sample['command_hist']
         ego_status_components.append(command_data)  # (obs_horizon, 6)

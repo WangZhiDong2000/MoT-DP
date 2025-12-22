@@ -24,7 +24,7 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1.0e-08
-  lr: 5.0e-05
+  lr: 5.0e-05  #多GPU相应增加学习率 
   weight_decay: 1.0e-05
 shape_meta:
   action:
@@ -56,7 +56,7 @@ shape_meta:
 enable_action_normalization: true
 bev_encoder:
   pretrained_path: /root/z_projects/code/MoT-DP-1/checkpoints/interfuser/lidar_bev_encoder_only.pth
-  state_dim: 14
+  state_dim: 12
   feature_dim: 256
   use_group_norm: true
   freeze_backbone: false

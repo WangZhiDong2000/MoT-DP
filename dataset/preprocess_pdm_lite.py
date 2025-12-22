@@ -435,16 +435,8 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             frame_data['ego_waypoints'] = np.array(waypoints)
             assert frame_data['ego_waypoints'].shape == (action_horizon + 1, 2)
             
-            # Save ego_waypoints[1:] to anchor folder (excluding the current position [0,0])
-            anchor_dir = join(folder_path, 'anchor')
-            os.makedirs(anchor_dir, exist_ok=True)
-            anchor_waypoints = frame_data['ego_waypoints'][1:]  # Shape: (action_horizon, 2)
-            anchor_file = join(anchor_dir, f"{ii:04d}.npy")
-            np.save(anchor_file, anchor_waypoints)
-            
-            # Load anchor waypoints from saved file and store relative path
-            frame_data['anchor'] = join(folder_name, 'anchor', f"{ii:04d}.npy")
-            
+           
+    
             # Route information
             route = current_anno_in_list['route']
             if len(route) < 20:
