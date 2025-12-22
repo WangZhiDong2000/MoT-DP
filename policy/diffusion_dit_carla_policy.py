@@ -153,7 +153,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
     
-    # ========== DiffusionDrive v1 style Normalization Functions ==========
+    # ========== Normalization Functions ==========
     def norm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
         """
         Normalize trajectory coordinates to [-1, 1] range.
@@ -392,6 +392,15 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             raise KeyError(f"Missing required field in obs_dict for TCP feature extraction: {e}")
         except Exception as e:
             raise RuntimeError(f"Error in TCP feature extraction: {e}")
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Forward method for DDP compatibility.
+        DDP only synchronizes gradients when forward() is called, not for other methods.
+        This method simply calls compute_loss() to enable proper gradient synchronization
+        in distributed training.
+        """
+        return self.compute_loss(batch)
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """

@@ -170,72 +170,73 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
     model_for_inference = policy.module if world_size > 1 else policy
     
     val_metrics = defaultdict(list)
-    with torch.no_grad():
-        if rank == 0:
-            pbar = tqdm(val_loader, desc="Validating", leave=False)
-        else:
-            pbar = val_loader
-        
-        for batch_idx, batch in enumerate(pbar):
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device)
-
-            loss = model_for_inference.compute_loss(batch)
-            val_metrics['loss'].append(loss.item())
-            
-            obs_dict = {
-                'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
-                'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
-                'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
-                'gen_vit_tokens': batch['gen_vit_tokens'],
-                'reasoning_query_tokens': batch['reasoning_query_tokens'],
-                'anchor': batch['anchor']  # Pass anchor for truncated diffusion
-            }
-            target_actions = batch['agent_pos']  
-            
-            try:
-                result = model_for_inference.predict_action(obs_dict)
-                predicted_actions = torch.from_numpy(result['action']).to(device)
-                
-                if target_actions.dim() == 3:  # (B, T, 2)
-                    target_actions = target_actions[:, :predicted_actions.shape[1]]
-                elif target_actions.dim() == 2:  # (B, 2) 
-                    target_actions = target_actions.unsqueeze(1)  # (B, 1, 2)
-                
-                fut_obstacles = batch.get('fut_obstacles', None)
-
-                driving_metrics = compute_driving_metrics(
-                    predicted_actions, 
-                    target_actions, 
-                    fut_obstacles=fut_obstacles 
-                )
-                for key, value in driving_metrics.items():
-                    val_metrics[key].append(value)
-                    
-                if rank == 0:
-                    pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
-            except Exception as e:
-                print(f"Warning: Error in action prediction during validation: {e}")
-                continue
     
+    # Only rank 0 performs validation
     if rank == 0:
-        pbar.close() 
-    
-    averaged_metrics = {}
-    for key, values in val_metrics.items():
-        if values:  
-            mean_value = np.mean(values)
-            if np.isnan(mean_value):
-                print(f"Warning: computed NaN for metric 'val_{key}'")
-                averaged_metrics[f'val_{key}'] = 0.0  
-            elif np.isinf(mean_value):
-                print(f"Warning: computed Inf for metric 'val_{key}'")
-                averaged_metrics[f'val_{key}'] = 1e10 if mean_value > 0 else -1e10 
-            else:
-                averaged_metrics[f'val_{key}'] = mean_value
+        with torch.no_grad():
+            pbar = tqdm(val_loader, desc="Validating", leave=False)
+            
+            for batch_idx, batch in enumerate(pbar):
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(device)
+
+                loss = model_for_inference.compute_loss(batch)
+                val_metrics['loss'].append(loss.item())
+                
+                obs_dict = {
+                    'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
+                    'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
+                    'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
+                    'gen_vit_tokens': batch['gen_vit_tokens'],
+                    'reasoning_query_tokens': batch['reasoning_query_tokens'],
+                    'anchor': batch['anchor']  # Pass anchor for truncated diffusion
+                }
+                target_actions = batch['agent_pos']  
+                
+                try:
+                    result = model_for_inference.predict_action(obs_dict)
+                    predicted_actions = torch.from_numpy(result['action']).to(device)
+                    
+                    if target_actions.dim() == 3:  # (B, T, 2)
+                        target_actions = target_actions[:, :predicted_actions.shape[1]]
+                    elif target_actions.dim() == 2:  # (B, 2) 
+                        target_actions = target_actions.unsqueeze(1)  # (B, 1, 2)
+                    
+                    fut_obstacles = batch.get('fut_obstacles', None)
+
+                    driving_metrics = compute_driving_metrics(
+                        predicted_actions, 
+                        target_actions, 
+                        fut_obstacles=fut_obstacles 
+                    )
+                    for key, value in driving_metrics.items():
+                        val_metrics[key].append(value)
+                        
+                    pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+                except Exception as e:
+                    print(f"Warning: Error in action prediction during validation: {e}")
+                    continue
         
-    return averaged_metrics
+            pbar.close() 
+    
+        # Compute averaged metrics
+        averaged_metrics = {}
+        for key, values in val_metrics.items():
+            if values:  
+                mean_value = np.mean(values)
+                if np.isnan(mean_value):
+                    print(f"Warning: computed NaN for metric 'val_{key}'")
+                    averaged_metrics[f'val_{key}'] = 0.0  
+                elif np.isinf(mean_value):
+                    print(f"Warning: computed Inf for metric 'val_{key}'")
+                    averaged_metrics[f'val_{key}'] = 1e10 if mean_value > 0 else -1e10 
+                else:
+                    averaged_metrics[f'val_{key}'] = mean_value
+        
+        return averaged_metrics
+    else:
+        return {}
 
 @record  # Records error and tracebacks in case of failure
 def train_pdm_policy(config_path):
@@ -344,15 +345,13 @@ def train_pdm_policy(config_path):
         print(f"\nTraining samples: {len(train_dataset)}")
         print(f"Validation samples: {len(val_dataset)}")
     
-    '''
-    TODO:  how to load action stats from config file
-    '''
+
 
     action_stats = {
-    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
-    'std': torch.tensor([14.527670860290527, 3.224050521850586]),
+    'min': torch.tensor([-0.06638534367084503, -17.525903701782227]),
+    'max': torch.tensor([74.04539489746094, 32.73622512817383]),
+    'mean': torch.tensor([12.758530616760254, 0.354688435792923]),
+    'std': torch.tensor([6.723825454711914, 2.5529885292053223]),
     } 
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
@@ -369,13 +368,9 @@ def train_pdm_policy(config_path):
             rank=rank,
             drop_last=True
         )
-        sampler_val = torch.utils.data.distributed.DistributedSampler(
-            val_dataset,
-            shuffle=False,
-            num_replicas=world_size,
-            rank=rank,
-            drop_last=True
-        )
+        # For validation, only rank 0 needs the full dataset
+        # Other ranks don't participate in validation
+        sampler_val = None
     else:
         sampler_train = None
         sampler_val = None
@@ -392,17 +387,38 @@ def train_pdm_policy(config_path):
         drop_last=True
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        sampler=sampler_val,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=persistent_workers if num_workers > 0 else False,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        drop_last=True
-    )
+    # Validation loader: only create meaningful loader for rank 0
+    # Other ranks get an empty loader since they don't validate
+    if world_size > 1 and rank != 0:
+        # Create empty validation loader for non-rank 0 processes
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            sampler=torch.utils.data.distributed.DistributedSampler(
+                val_dataset,
+                shuffle=False,
+                num_replicas=world_size,
+                rank=rank,
+                drop_last=True
+            ),
+            shuffle=False,
+            num_workers=0,  # No workers needed for empty validation
+            pin_memory=False,
+            drop_last=True
+        )
+    else:
+        # Rank 0 or single GPU: use full validation dataset
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            sampler=sampler_val,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=persistent_workers if num_workers > 0 else False,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            drop_last=True
+        )
     
     if rank == 0:
         print("Initializing policy model...")
@@ -414,10 +430,10 @@ def train_pdm_policy(config_path):
             policy,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False
+            find_unused_parameters=True  # Required: some parameters in obs_encoder may not be used in all forward passes
         )
         if rank == 0:
-            print(f"✓ Model wrapped with DistributedDataParallel")
+            print(f"✓ Model wrapped with DistributedDataParallel (find_unused_parameters=True)")
             print(f"Policy action steps (n_action_steps): {policy.module.n_action_steps}")
     else:
         if rank == 0:
@@ -425,6 +441,17 @@ def train_pdm_policy(config_path):
     
     lr = config.get('optimizer', {}).get('lr', 5e-5)
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
+    
+    # Linear learning rate scaling for distributed training
+    # With N GPUs and same batch_size per GPU, effective batch_size = N * batch_size
+    # Scale learning rate linearly: lr_scaled = lr * world_size
+    scale_lr = config.get('optimizer', {}).get('scale_lr', True)  # Default to True
+    if scale_lr and world_size > 1:
+        lr_scaled = lr * world_size
+        if rank == 0:
+            print(f"✓ Learning rate scaled for {world_size} GPUs: {lr} -> {lr_scaled}")
+        lr = lr_scaled
+    
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
 
     # 设置 checkpoint 目录
@@ -435,7 +462,7 @@ def train_pdm_policy(config_path):
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
-    best_l2_3s = float('inf')
+    best_l2_avg = float('inf')  # Use average L2 error as best metric
     val_loss = None  # 初始化验证损失
     val_metrics = {}  # 初始化验证指标  
     
@@ -457,9 +484,10 @@ def train_pdm_policy(config_path):
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
             
-            # Use .module to access the original model's methods when using DDP
-            model_for_loss = policy.module if world_size > 1 else policy
-            loss = model_for_loss.compute_loss(batch)
+            # IMPORTANT: Call policy(batch) which invokes forward() method
+            # DDP only synchronizes gradients when forward() is called
+            # This ensures proper gradient synchronization across all GPUs
+            loss = policy(batch)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -561,16 +589,18 @@ def train_pdm_policy(config_path):
                 sys.stdout.flush()
 
             
-                print(f"Validation metrics:")
+                print(f"Validation metrics: (total {len(val_metrics)} metrics)")
+                if len(val_metrics) == 0:
+                    print("  Warning: No validation metrics were computed!")
                 for key, value in val_metrics.items():
                     print(f"  {key}: {value:.4f}")
         
                 val_loss = val_metrics.get('val_loss', float('inf'))
-                l2_3s = val_metrics.get('val_L2_3s', float('inf'))
+                l2_avg = val_metrics.get('val_L2_avg', float('inf'))
                 
-                # Save best model based on L2_3s instead of val_loss
-                if l2_3s < best_l2_3s:
-                    best_l2_3s = l2_3s
+                # Save best model based on L2_avg (average L2 error across all timesteps)
+                if l2_avg < best_l2_avg:
+                    best_l2_avg = l2_avg
                     torch.save({
                             'model_state_dict': model_to_save.state_dict(),
                             'config': config,
@@ -579,22 +609,22 @@ def train_pdm_policy(config_path):
                             'train_loss': avg_train_loss,
                             'val_metrics': val_metrics
                             }, os.path.join(checkpoint_dir, "carla_policy_best.pt"))
-                    print(f"✓ New best model saved with L2_3s: {l2_3s:.4f} (val_loss: {val_loss:.4f})")
+                    print(f"✓ New best model saved with L2_avg: {l2_avg:.4f} (val_loss: {val_loss:.4f})")
                    
                     safe_wandb_log({
                             "best_model/epoch": epoch,
-                            "best_model/L2_3s": l2_3s,
+                            "best_model/L2_avg": l2_avg,
                             "best_model/val_loss": val_loss,
                             "best_model/train_loss": avg_train_loss
                         }, use_wandb)
     
     if rank == 0:
         print("Training completed!")
-        print(f"Best L2_3s: {best_l2_3s:.4f}")
+        print(f"Best L2_avg: {best_l2_avg:.4f}")
         safe_wandb_log({
             "training/completed": 0.0,
             "training/total_epochs": num_epochs,
-            "training/best_l2_3s": best_l2_3s,
+            "training/best_l2_avg": best_l2_avg,
             "training/final_train_loss": avg_train_loss
         }, use_wandb)
         

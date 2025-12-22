@@ -136,68 +136,21 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             elif key == 'ego_waypoints':
                 ego_waypoints = torch.from_numpy(sample['ego_waypoints'][1:]).float()
                 final_sample['agent_pos'] = ego_waypoints
-            elif key == 'anchor':
-                # Load anchor waypoints from numpy file, or use GT trajectory as fallback
-                anchor_path = sample.get('anchor', None)
-                if anchor_path is not None:
-                    full_anchor_path = os.path.join(self.image_data_root, anchor_path)
-                    if os.path.exists(full_anchor_path):
-                        anchor_data = np.load(full_anchor_path)
-                        final_sample['anchor'] = torch.from_numpy(anchor_data).float()
-                    else:
-                        # Fallback to GT trajectory if anchor file not found
-                        if 'agent_pos' in final_sample:
-                            final_sample['anchor'] = final_sample['agent_pos'].clone()
-                else:
-                    # No anchor path provided, use GT trajectory as anchor
-                    if 'agent_pos' in final_sample:
-                        final_sample['anchor'] = final_sample['agent_pos'].clone()
-
             elif key == 'vqa':
-                if 'gen_vit_tokens' in vqa_feature:
-                    final_sample['gen_vit_tokens'] = vqa_feature['gen_vit_tokens']
+                # Load dp_vit_feat as gen_vit_tokens
+                final_sample['gen_vit_tokens'] = vqa_feature['dp_vit_feat']
                 
-                # Use answer_token_indexes to filter valid reasoning_query_tokens
-                if 'reasoning_query_tokens' in vqa_feature and 'answer_token_indexes' in vqa_feature:
-                    reasoning_query_tokens = vqa_feature['reasoning_query_tokens']
-                    answer_token_indexes = vqa_feature['answer_token_indexes']
-                    
-                    # Filter reasoning_query_tokens using answer_token_indexes
-                    # answer_token_indexes contains valid indices into reasoning_query_tokens
-                    valid_tokens = reasoning_query_tokens[answer_token_indexes]
-                    
-                    # Pad to fixed length of 7
-                    max_answer_tokens = 7
-                    token_dim = valid_tokens.shape[-1] if valid_tokens.dim() > 1 else 1
-                    
-                    # Pad reasoning_query_tokens to length 7
-                    if valid_tokens.shape[0] < max_answer_tokens:
-                        # Pad with zeros
-                        padding_size = max_answer_tokens - valid_tokens.shape[0]
-                        if valid_tokens.dim() == 1:
-                            padding = torch.zeros(padding_size, dtype=valid_tokens.dtype)
-                        else:
-                            padding = torch.zeros((padding_size, token_dim), dtype=valid_tokens.dtype)
-                        padded_tokens = torch.cat([valid_tokens, padding], dim=0)
-                    elif valid_tokens.shape[0] > max_answer_tokens:
-                        padded_tokens = valid_tokens[:max_answer_tokens]
-                    else:
-                        padded_tokens = valid_tokens
-                    
-                    final_sample['reasoning_query_tokens'] = padded_tokens
-                    
-                    # Pad answer_token_indexes to fixed length of 7
-                    if answer_token_indexes.shape[0] < max_answer_tokens:
-                        # Pad with -1 (invalid index)
-                        padding = torch.full((max_answer_tokens - answer_token_indexes.shape[0],), -1, dtype=answer_token_indexes.dtype)
-                        final_sample['answer_token_indexes'] = torch.cat([answer_token_indexes, padding])
-                    elif answer_token_indexes.shape[0] > max_answer_tokens:
-                        # Truncate if longer than max
-                        final_sample['answer_token_indexes'] = answer_token_indexes[:max_answer_tokens]
-                    else:
-                        final_sample['answer_token_indexes'] = answer_token_indexes
-                elif 'reasoning_query_tokens' in vqa_feature:
-                    final_sample['reasoning_query_tokens'] = vqa_feature['reasoning_query_tokens']
+                # Load pred_traj as anchor
+                anchor = vqa_feature['pred_traj']
+                # Remove extra batch dimension if present: (1, T, 2) -> (T, 2)
+                if anchor.dim() == 3 and anchor.shape[0] == 1:
+                    anchor = anchor.squeeze(0)
+                final_sample['anchor'] = anchor
+                
+                # Load reasoning_feat as reasoning_query_tokens (take first 7)
+                reasoning_feat = vqa_feature['reasoning_feat']  # shape: (8, 2560)
+                # Take first 7 tokens
+                final_sample['reasoning_query_tokens'] = reasoning_feat[:7]  # shape: (7, 2560)
 
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
@@ -205,7 +158,7 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample[key] = value
 
         # Build ego_status: concatenate historical low-dimensional states
-        # Order: speed_hist, theta_hist, throttle_hist, brake_hist, command_hist, waypoints_hist
+        # Order: speed_hist, theta_hist, command_hist, waypoints_hist
         ego_status_components = []
         
         # 1. speed_hist
@@ -231,9 +184,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         # Concatenate all components along the feature dimension
         final_sample['ego_status'] = torch.cat(ego_status_components, dim=-1)  # (obs_horizon, feature_dim)
 
-        # Ensure anchor exists (use GT trajectory as fallback for truncated diffusion)
-        if 'anchor' not in final_sample and 'agent_pos' in final_sample:
-            final_sample['anchor'] = final_sample['agent_pos'].clone()
 
         return final_sample
 
@@ -288,15 +238,19 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
     anchor = sample.get('anchor')
     
     if isinstance(agent_pos, torch.Tensor):
-        agent_pos = agent_pos.numpy()
+        agent_pos = agent_pos.float().numpy()
     if isinstance(waypoints_hist, torch.Tensor):
-        waypoints_hist = waypoints_hist.numpy()
+        waypoints_hist = waypoints_hist.float().numpy()
     if isinstance(target_point, torch.Tensor):
-        target_point = target_point.numpy()
+        target_point = target_point.float().numpy()
     if isinstance(target_point_hist, torch.Tensor):
-        target_point_hist = target_point_hist.numpy()
+        target_point_hist = target_point_hist.float().numpy()
     if isinstance(anchor, torch.Tensor):
-        anchor = anchor.numpy()
+        # Handle bfloat16 by converting to float32 first
+        anchor = anchor.float().numpy()
+        # Remove extra dimension if shape is (1, N, 2)
+        if anchor.ndim == 3 and anchor.shape[0] == 1:
+            anchor = anchor[0]
     
     plt.figure(figsize=(12, 12))
     
@@ -327,32 +281,32 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
     plt.plot(0, 0, 'ko', markersize=15, label='Current position (t=0)', 
             markeredgecolor='yellow', markeredgewidth=2, zorder=5)
     
-    # ========== Plot Future Waypoints (Predictions) ==========
-    if len(agent_pos) > 0:
-        # Plot line connecting future points
+    # ========== Plot Future Waypoints (GT trajectory - agent_pos) ==========
+    if agent_pos is not None and len(agent_pos) > 0:
+        # Plot line connecting future points (RED for GT)
         future_waypoints = np.vstack([[[0, 0]], agent_pos])
-        plt.plot(future_waypoints[:, 1], future_waypoints[:, 0], 'r--', 
-                linewidth=2, alpha=0.6, label='Predicted trajectory', zorder=2)
+        plt.plot(future_waypoints[:, 1], future_waypoints[:, 0], 'r-', 
+                linewidth=2.5, alpha=0.8, label='GT trajectory (agent_pos)', zorder=4)
         
         # Plot each future waypoint as discrete point
         for i, waypoint in enumerate(agent_pos, 1):
-            plt.plot(waypoint[1], waypoint[0], 'r^', markersize=10, 
-                    markeredgecolor='darkred', markeredgewidth=1, zorder=4)
+            plt.plot(waypoint[1], waypoint[0], 'ro', markersize=10, 
+                    markeredgecolor='darkred', markeredgewidth=1.5, zorder=5)
     
-    # ========== Plot Anchor Waypoints ==========
+    # ========== Plot Anchor Waypoints (predicted trajectory) ==========
     if anchor is not None and len(anchor) > 0:
-        # Plot line connecting anchor points (in cyan/magenta color)
+        # Plot line connecting anchor points (CYAN for anchor/prediction)
         # Ensure anchor has shape (N, 2)
         if anchor.ndim == 1:
             anchor = anchor.reshape(-1, 2)
         anchor_waypoints = np.vstack([[0, 0], anchor])
-        plt.plot(anchor_waypoints[:, 1], anchor_waypoints[:, 0], 'm-', 
-                linewidth=2.5, alpha=0.7, label='Anchor trajectory', zorder=3)
+        plt.plot(anchor_waypoints[:, 1], anchor_waypoints[:, 0], 'c-', 
+                linewidth=2.5, alpha=0.7, label='Anchor trajectory (pred_traj)', zorder=3)
         
         # Plot each anchor waypoint as discrete point
         for i, waypoint in enumerate(anchor, 1):
-            plt.plot(waypoint[1], waypoint[0], 'ms', markersize=8, 
-                    markeredgecolor='darkmagenta', markeredgewidth=1.5, zorder=4)
+            plt.plot(waypoint[1], waypoint[0], 'c^', markersize=8, 
+                    markeredgecolor='darkcyan', markeredgewidth=1.5, zorder=4)
     
     # ========== Plot Current Target Point ==========
     if target_point is not None:
@@ -490,7 +444,7 @@ def test_pdm():
     """Test with PDM Lite dataset."""
     import random
     
-    dataset_path = '/share-data/pdm_lite_mini/tmp_data/val'
+    dataset_path = '/mnt/data/pdm_lite_mini/tmp_data/val'
     obs_horizon = 4
     """
     Prints detailed information about a sample and the dataset.
@@ -505,7 +459,7 @@ def test_pdm():
     print("\n========== Testing PDM Lite Dataset ==========")
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        image_data_root='/share-data/pdm_lite_mini/'
+        image_data_root='/mnt/data/pdm_lite_mini/'
     )
     
     print(f"\n总样本数: {len(dataset)}")
