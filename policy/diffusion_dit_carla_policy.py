@@ -273,6 +273,79 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         return noisy_sample
 
+    def add_multiplicative_noise_scheduled_batch(
+        self, 
+        sample: torch.Tensor, 
+        timesteps: torch.Tensor,
+        eta: float = 1.0,
+        std_min: float = 0.04
+    ) -> torch.Tensor:
+        """
+        Add multiplicative noise with per-sample timesteps (batch version).
+        Each sample in the batch gets noise corresponding to its own timestep.
+        
+        This is the correct implementation for training where each sample should have
+        noise added according to its own sampled timestep.
+        
+        Args:
+            sample: (B, T, 2) normalized trajectory
+            timesteps: (B,) tensor of timesteps, one per sample
+            eta: scaling factor for variance (0.0 = deterministic, 1.0 = full stochasticity)
+            std_min: minimum standard deviation to prevent zero noise (V2 uses 0.04)
+            
+        Returns:
+            Noisy sample with per-sample timestep-scheduled multiplicative noise applied
+        """
+        device = sample.device
+        dtype = sample.dtype
+        bs = sample.shape[0]
+        T = sample.shape[1]  # trajectory length (num_points)
+        
+        # Compute variance for each sample based on its timestep
+        # Pre-compute alpha_cumprod values on CPU then move to device
+        alphas_cumprod = self.diffusion_scheduler.alphas_cumprod
+        
+        # Get prev_t for each sample
+        step_ratio = self.num_train_timesteps // max(self.num_diffusion_steps, 1)
+        prev_timesteps = (timesteps - step_ratio).clamp(min=0)
+        
+        # Gather alpha_prod values for each sample
+        alpha_prod_t = alphas_cumprod[timesteps.cpu()].to(device=device, dtype=dtype)  # (B,)
+        alpha_prod_t_prev = alphas_cumprod[prev_timesteps.cpu()].to(device=device, dtype=dtype)  # (B,)
+        
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        
+        # Variance formula from DDIM: (B,)
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        variance = variance.clamp(min=1e-10)
+        
+        # std_dev_t with eta scaling: (B,)
+        std_dev_t = eta * (variance ** 0.5)
+        
+        # DiffusionDriveV2 style: std_dev_t_mul = clip(std_dev_t, min=0.04)
+        std_dev_t_mul = std_dev_t.clamp(min=std_min)  # (B,)
+        
+        # Reshape for broadcasting: (B,) -> (B, 1, 1)
+        std_dev_t_mul = std_dev_t_mul.view(bs, 1, 1)
+        
+        # Generate multiplicative noise for horizon (x) and vert (y) separately
+        # variance_noise_horizon = randn * std_dev_t_mul + 1.0  (for x direction)
+        variance_noise_horizon = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        # variance_noise_vert = randn * std_dev_t_mul + 1.0  (for y direction)
+        variance_noise_vert = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        
+        # Concatenate horizon and vert: (B, 1, 1) + (B, 1, 1) -> (B, 1, 2)
+        variance_noise_mul = torch.cat([variance_noise_horizon, variance_noise_vert], dim=-1)
+        
+        # Repeat across trajectory length: (B, 1, 2) -> (B, T, 2)
+        variance_noise_mul = variance_noise_mul.expand(-1, T, -1)
+        
+        # Apply multiplicative noise: sample * variance_noise_mul
+        noisy_sample = sample * variance_noise_mul
+        
+        return noisy_sample
+
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         """
         Normalize action from original range to [-1, 1]
@@ -505,14 +578,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         ).long()
         
         # 3. Add scheduler-based multiplicative noise to anchor (DiffusionDriveV2 style)
-        # Noise level is determined by the timestep through scheduler's variance
-        # For training, we use each sample's individual timestep
-        # Since add_multiplicative_noise_scheduled expects a single timestep,
-        # we use the mean timestep for the batch (or could loop per sample)
-        mean_timestep = timesteps.float().mean().int().item()
-        noisy_anchor = self.add_multiplicative_noise_scheduled(
+        # FIXED: Use per-sample timestep for noise generation to match the timesteps passed to model
+        # This ensures consistency between the noise level and the timestep condition
+        noisy_anchor = self.add_multiplicative_noise_scheduled_batch(
             anchor_norm,
-            timestep=mean_timestep,
+            timesteps=timesteps,  # Use per-sample timesteps
             eta=1.0,
             std_min=0.04
         )

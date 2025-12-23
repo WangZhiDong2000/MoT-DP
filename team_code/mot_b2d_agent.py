@@ -597,11 +597,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
     	)
 		print("✓ MoT model loaded.")
 
-		# Use simlingo's controllers (LateralPIDController for steering, PIDController for speed)
 		self.turn_controller = LateralPIDController(inference_mode=True)  # Set inference_mode=True for model predictions
-		self.speed_controller = t_u.PIDController(k_p=1.75, k_i=1.0, k_d=2.0, n=20)  # Same as simlingo config
+		self.speed_controller = t_u.PIDController(k_p=1.75, k_i=1.0, k_d=2.0, n=20)  
 		
-		# Control config (same as simlingo's GlobalConfig)
+		# Control config 
 		self.carla_fps = 20
 		self.wp_dilation = 1
 		self.data_save_freq = 5
@@ -609,12 +608,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.brake_ratio = 1.1
 		self.clip_delta = 1.0
 		self.clip_throttle = 1.0
-		self.stuck_threshold = 800
+		self.stuck_threshold = 200 #800
+		self.stuck_helper_threshold = 100
 		self.creep_duration = 15
 		self.creep_throttle = 0.4
 		
-		# Stuck detection (same as simlingo)
+		# Stuck detection
 		self.stuck_detector = 0
+		self.stuck_helper = 0
 		self.force_move = 0
 
 		self.steer_step = 0
@@ -635,7 +636,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.prev_control = control
 		self.control = control  # Store control for UKF prediction
 		
-		# Initialize Unscented Kalman Filter (same as simlingo)
+		# Initialize Unscented Kalman Filter 
 		self.carla_frame_rate = 1.0 / 20.0  # CARLA frame rate
 		if USE_UKF:
 			self.points = MerweScaledSigmaPoints(n=4, alpha=0.00001, beta=2, kappa=0, subtract=residual_state_x)
@@ -721,14 +722,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 									self.lat_ref = float(item.split('=')[1])
 								if '+lon_0' in item:
 									self.lon_ref = float(item.split('=')[1])
-			print(f"[DEBUG _init] Got lat_ref={self.lat_ref}, lon_ref={self.lon_ref} from CARLA map OpenDRIVE")
 		except Exception as e:
-			print(f"[DEBUG _init] Failed to get lat_ref/lon_ref from map: {e}")
 			# Fallback: try fsolve (might not converge)
 			try:
 				locx, locy = self._global_plan_world_coord[0][0].location.x, self._global_plan_world_coord[0][0].location.y
 				lon, lat = self._global_plan[0][0]['lon'], self._global_plan[0][0]['lat']
-				print(f"[DEBUG _init] First waypoint - CARLA: ({locx}, {locy}), GPS: lat={lat}, lon={lon}")
 				earth_radius_equa = 6378137.0
 				def equations(variables):
 					x, y = variables
@@ -741,12 +739,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				initial_guess = [0.0, 0.0]
 				solution = fsolve(equations, initial_guess)
 				self.lat_ref, self.lon_ref = solution[0], solution[1]
-				print(f"[DEBUG _init] Fallback fsolve: lat_ref={self.lat_ref}, lon_ref={self.lon_ref}")
 			except Exception as e2:
-				print(f"[DEBUG _init] Fallback fsolve also failed: {e2}")
 				self.lat_ref, self.lon_ref = 0.0, 0.0
-		
-		print(f"[DEBUG _init] Final lat_ref={self.lat_ref}, lon_ref={self.lon_ref}, save_name={self.save_name}")
 		
 
 		self.route_planner_min_distance = 7.5
@@ -754,27 +748,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self._route_planner = RoutePlanner(self.route_planner_min_distance, self.route_planner_max_distance,
 										   self.lat_ref, self.lon_ref)
 		
-		# Debug: Print _global_plan_world_coord format
-		print(f"[DEBUG _init] _global_plan_world_coord length: {len(self._global_plan_world_coord)}")
 		if len(self._global_plan_world_coord) > 0:
-			print(f"[DEBUG _init] _global_plan_world_coord[0] type: {type(self._global_plan_world_coord[0])}")
 			first_wp = self._global_plan_world_coord[0]
-			if isinstance(first_wp, tuple) and len(first_wp) >= 2:
-				print(f"[DEBUG _init] First waypoint location: ({first_wp[0].location.x}, {first_wp[0].location.y}, {first_wp[0].location.z})")
-				print(f"[DEBUG _init] First waypoint cmd: {first_wp[1]}")
 		
 		# Use _global_plan_world_coord with gps=False (recommended, GPS is deprecated in nav_planner.py)
 		self._route_planner.set_route(self._global_plan_world_coord, gps=False)
 		
-		# Debug: Print route after set_route
-		print(f"[DEBUG _init] After set_route, route length: {len(self._route_planner.route)}")
-		if len(self._route_planner.route) > 0:
-			first_route = list(self._route_planner.route)[0]
-			print(f"[DEBUG _init] First route point (CARLA coords): {first_route[0]}, cmd: {first_route[1]}")
-			if len(self._route_planner.route) > 1:
-				second_route = list(self._route_planner.route)[1]
-				print(f"[DEBUG _init] Second route point (CARLA coords): {second_route[0]}, cmd: {second_route[1]}")
-		
+				
 		# Initialize command tracking 
 		self.commands = deque(maxlen=2)
 		self.commands.append(4)
@@ -962,11 +942,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_front = cv2.cvtColor(input_data['CAM_FRONT'][1][:, :, :3], cv2.COLOR_BGR2RGB)
 		lidar_ego = lidar_to_ego_coordinate(input_data['LIDAR'])
 		
-		# Process GPS and compass using simlingo's method
 		gps_full = input_data['GPS'][1]  # [lat, lon, altitude]
 		gps_pos = self._route_planner.convert_gps_to_carla(gps_full)
 		
-		# Handle compass NaN (same as simlingo)
+		# Handle compass NaN 
 		compass_raw = input_data['IMU'][1][-1]
 		if math.isnan(compass_raw):
 			print("compass sends nan!!!")
@@ -978,7 +957,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Get speed for UKF
 		speed = input_data['SPEED'][1]['speed']
 		
-		# Apply Unscented Kalman Filter (same as simlingo)
+		# Apply Unscented Kalman Filter 
 		if USE_UKF:
 			if not self.filter_initialized:
 				self.ukf.x = np.array([gps_pos[0], gps_pos[1], t_u.normalize_angle(compass), speed])
@@ -1049,18 +1028,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
 		
-		# Debug: print run_step results
-		if self.step <= 5:
-			print(f"\n[DEBUG tick step {self.step}]")
-			print(f"  GPS raw: {gps_pos[:2]}, filtered: {gps_filtered}")
-			print(f"  Compass raw: {compass:.4f}, filtered: {compass_filtered:.4f}")
-			print(f"  waypoint_route length: {len(waypoint_route)}")
-			if len(waypoint_route) > 0:
-				wp0 = list(waypoint_route)[0]
-				print(f"  waypoint_route[0]: pos={wp0[0]}, cmd={wp0[1]}")
-			if len(waypoint_route) > 1:
-				wp1 = list(waypoint_route)[1]
-				print(f"  waypoint_route[1]: pos={wp1[0]}, cmd={wp1[1]}")
+
 		
 		if len(waypoint_route) > 2:
 			target_point, far_command = waypoint_route[1]
@@ -1083,7 +1051,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		result['next_command'] = self.commands[-2]
 		ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass']) #result['compass'])
-		
+		ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass']) #result['compass'])
+
 		# Debug: print target point transformation
 		if self.step <= 5:
 			print(f"  target_point (world): {target_point[:2]}")
@@ -1092,6 +1061,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			print(f"  ego_target_point: {ego_target_point}")
 		
 		result['target_point'] = ego_target_point  # numpy array (2,)
+		result['next_target_point'] = ego_next_target_point  # numpy array (2,)
 		result['theta'] = compass_filtered  # Use UKF filtered compass
 
 		return result
@@ -1112,10 +1082,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
 		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
-		# To calculate desired speed (m/s), use displacement over time
-		# simlingo used displacement from half_second to one_second, then * 2
-		# For MoT: point[0] is at 0.5s, point[1] is at 1.0s
-		# Displacement from point[0] to point[1] is 0.5s of travel, so * 2 for m/s
 		mot_waypoint_interval = 0.5  # seconds between waypoints
 		one_second_idx = 1  # point[1] is at 1.0s
 		half_second_idx = 0  # point[0] is at 0.5s
@@ -1137,7 +1103,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		route_interp = self.interpolate_waypoints(route_waypoints_np)
 		
-		# Steering control using LateralPIDController (same as simlingo)
 		steer = self.turn_controller.step(route_interp, speed)
 		steer = np.clip(steer, -1.0, 1.0)
 		steer = round(steer, 3)
@@ -1200,6 +1165,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_front = rgb_front.to('cuda', dtype=torch.float32)
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
 		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
+		next_target_point = torch.from_numpy(tick_data['next_target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
 		# tg = tick_data['target_point']
 		# tg[1] = 0.05
 		# target_point = torch.from_numpy(tg).unsqueeze(0).float().to('cuda', dtype=torch.float32)
@@ -1253,7 +1219,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			lidar_pil = Image.fromarray(lidar_np, mode='RGB')
 			lidar_pil_list = [lidar_pil]  
 			
-			target_point_speed=torch.cat([speed, target_point], dim=-1)  # (1, 3)
+			if self.stuck_helper > 0:
+				target_point_speed=torch.cat([speed, next_target_point], dim=-1)
+				print("Get stucked! Trigger the stuck helper!")
+			else:
+				target_point_speed=torch.cat([speed, target_point], dim=-1)  # (1, 3)
+
 			prompt_cleaned, understanding_output, reasoning_output = build_cleaned_prompt_and_modes(target_point_speed)
 
 			predicted_answer = self.inferencer(
@@ -1285,18 +1256,29 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			# Restart mechanism in case the car got stuck 
 			if gt_velocity < 0.1:
+				if self.stuck_detector > self.stuck_threshold:
+					self.stuck_helper += 1
 				self.stuck_detector += 1
-			else:
-				self.stuck_detector = 0
+			
+			if self.stuck_helper > self.stuck_helper_threshold or gt_velocity > 3.0:
+					self.stuck_helper = 0
+					self.stuck_detector = 0
+			
+			# if self.stuck_helper > 0 and gt_velocity < 1.5:
+			# 	throttle = max(self.creep_throttle, throttle)
+			# 	brake = False
+
+			print(f"stuck_helper: {self.stuck_helper}")
+			print(f"stuck_detector: {self.stuck_detector}")
+
+			# if self.stuck_detector > self.stuck_threshold:
+			# 	self.force_move = self.creep_duration
 				
-			if self.stuck_detector > self.stuck_threshold:
-				self.force_move = self.creep_duration
-				
-			if self.force_move > 0:
-				throttle = max(self.creep_throttle, throttle)
-				brake = False
-				self.force_move -= 1
-				print(f"force_move: {self.force_move}")
+			# if self.force_move > 0:
+			# 	throttle = max(self.creep_throttle, throttle)
+			# 	brake = False
+			# 	self.force_move -= 1
+			# 	print(f"force_move: {self.force_move}")
 			
 			control = carla.VehicleControl()
 			control.steer = float(steer)
@@ -1643,5 +1625,8 @@ def residual_measurement_h(a, b):
 	y = a - b
 	y[2] = t_u.normalize_angle(y[2])
 	return y
+
+
+
 
 

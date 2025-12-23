@@ -484,12 +484,19 @@ def train_pdm_policy(config_path):
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
             
-            # IMPORTANT: Call policy(batch) which invokes forward() method
+            # IMPORTANT: zero_grad BEFORE forward pass, not after
+            # This is the standard PyTorch training pattern
+            optimizer.zero_grad()
+            
+            # Call policy(batch) which invokes forward() method
             # DDP only synchronizes gradients when forward() is called
             # This ensures proper gradient synchronization across all GPUs
             loss = policy(batch)
-            optimizer.zero_grad()
             loss.backward()
+            
+            # Optional: gradient clipping for training stability
+            # torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            
             optimizer.step()
             train_losses.append(loss.item())
             
