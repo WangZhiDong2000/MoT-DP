@@ -257,12 +257,12 @@ class SinusoidalPosEmb(nn.Module):
 
     def forward(self, x):
         device = x.device
-        dtype = x.dtype  # Preserve input dtype for bfloat16 compatibility
+        # Use float32 for computation, then convert if needed
+        # x is typically long (timestep), so we use float32 for sinusoidal computation
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        # Ensure arange tensor matches input dtype to avoid precision loss with bfloat16
-        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float32) * -emb)
+        emb = x[:, None].float() * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
@@ -1217,10 +1217,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         ego_status: (B, status_dim) current ego status
         output: (B,T,input_dim)
         """
-        sample = sample.contiguous()
-        cond = cond.contiguous() 
-        vl_embeds=gen_vit_tokens.contiguous()
-        reasoning_embeds = reasoning_query_tokens.contiguous()
+        # Ensure all inputs match the model's dtype (important for bfloat16 models)
+        model_dtype = next(self.parameters()).dtype
+        
+        sample = sample.contiguous().to(dtype=model_dtype)
+        cond = cond.contiguous().to(dtype=model_dtype)
+        vl_embeds = gen_vit_tokens.contiguous().to(dtype=model_dtype)
+        reasoning_embeds = reasoning_query_tokens.contiguous().to(dtype=model_dtype)
+        if ego_status is not None:
+            ego_status = ego_status.to(dtype=model_dtype)
         
         # 1. Prepare timesteps
         timesteps = timestep
@@ -1232,6 +1237,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         
         # 2. Generate conditioning from timestep and ego_status (AdaLN)
         time_embedding = self.time_emb(timesteps)  # (B, n_emb)
+        # Convert to model dtype
+        time_embedding = time_embedding.to(dtype=model_dtype)
+        
         conditioning = None
         hist_features = None
         # Handle 3D ego_status (B, To, status_dim)

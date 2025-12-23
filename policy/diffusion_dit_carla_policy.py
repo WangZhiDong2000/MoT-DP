@@ -707,7 +707,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             
             # Predict clean sample - model directly outputs the trajectory
             pred = self.model(
-                sample=noisy_traj_points,
+                sample=noisy_traj_points.to(dtype=model_dtype),
                 timestep=timesteps,
                 cond=cond,
                 gen_vit_tokens=gen_vit_tokens,
@@ -755,6 +755,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
         feature_dim = batch_features.shape[-1]
         cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
+        cond = cond.to(dtype=model_dtype)  # Ensure cond has correct dtype
         shape = (B, T, Da)
        
         cond_data = torch.zeros(size=shape, device=device, dtype=model_dtype)  # Use model dtype
@@ -802,7 +803,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # For truncated diffusion, the output is already in original scale
         # No need to unnormalize
         
-        action_pred = naction_pred.detach().cpu().numpy()
+        # Convert to float32 before numpy (numpy doesn't support bfloat16)
+        action_pred = naction_pred.detach().float().cpu().numpy()
         action = action_pred
         result = {
             'action': action,

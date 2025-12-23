@@ -453,6 +453,47 @@ def train_pdm_policy(config_path):
         lr = lr_scaled
     
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    # Learning rate scheduler with warmup for multi-GPU training stability
+    # Warmup prevents large gradient updates in early training when model parameters are random
+    warmup_epochs = int(config.get('training', {}).get('warmup_epochs', 5))
+    lr_final = float(config.get('training', {}).get('lr_final', 1e-7))
+    use_lr_scheduler = config.get('training', {}).get('use_lr_scheduler', True)
+    
+    if use_lr_scheduler:
+        from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+        
+        # Calculate total training steps
+        total_epochs = int(config.get('training', {}).get('num_epochs', 50))
+        
+        # Warmup scheduler: linearly increase LR from lr/10 to lr over warmup_epochs
+        warmup_scheduler = LinearLR(
+            optimizer, 
+            start_factor=0.1, 
+            end_factor=1.0, 
+            total_iters=warmup_epochs
+        )
+        
+        # Cosine annealing scheduler: decay LR from lr to lr_final
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer, 
+            T_max=total_epochs - warmup_epochs, 
+            eta_min=lr_final
+        )
+        
+        # Combine warmup and cosine annealing
+        scheduler = SequentialLR(
+            optimizer, 
+            schedulers=[warmup_scheduler, cosine_scheduler], 
+            milestones=[warmup_epochs]
+        )
+        
+        if rank == 0:
+            print(f"✓ Learning rate scheduler: {warmup_epochs} epochs warmup + cosine annealing to {lr_final}")
+    else:
+        scheduler = None
+        if rank == 0:
+            print("✓ No learning rate scheduler used")
 
     # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit")
@@ -492,10 +533,30 @@ def train_pdm_policy(config_path):
             # DDP only synchronizes gradients when forward() is called
             # This ensures proper gradient synchronization across all GPUs
             loss = policy(batch)
+            
+            # Check for NaN/Inf loss to prevent gradient explosion
+            if torch.isnan(loss) or torch.isinf(loss):
+                if rank == 0:
+                    print(f"Warning: NaN/Inf loss detected at batch {batch_idx}, skipping this batch")
+                optimizer.zero_grad()
+                continue
+            
             loss.backward()
             
-            # Optional: gradient clipping for training stability
-            # torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            # Gradient clipping for training stability (CRITICAL for multi-GPU training)
+            # This prevents gradient explosion which can cause val_loss to spike
+            max_grad_norm = config.get('training', {}).get('max_grad_norm', 1.0)
+            if world_size > 1:
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.module.parameters(), max_norm=max_grad_norm)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+            
+            # Skip optimizer step if gradients are invalid
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                if rank == 0:
+                    print(f"Warning: NaN/Inf gradient norm detected at batch {batch_idx}, skipping optimizer step")
+                optimizer.zero_grad()
+                continue
             
             optimizer.step()
             train_losses.append(loss.item())
@@ -503,7 +564,8 @@ def train_pdm_policy(config_path):
             if rank == 0:
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
-                    'avg_loss': f'{np.mean(train_losses):.4f}'
+                    'avg_loss': f'{np.mean(train_losses):.4f}',
+                    'grad_norm': f'{grad_norm.item():.4f}' if isinstance(grad_norm, torch.Tensor) else f'{grad_norm:.4f}'
                 })
             
             if batch_idx % 10 == 0 and rank == 0:
@@ -513,7 +575,8 @@ def train_pdm_policy(config_path):
                     "train/epoch":  epoch ,
                     "train/step": step,
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
-                    "train/batch_idx": batch_idx
+                    "train/batch_idx": batch_idx,
+                    "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
                 }, use_wandb)
         
         if rank == 0:
@@ -523,12 +586,21 @@ def train_pdm_policy(config_path):
         if rank == 0:
             print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
         
+        # Update learning rate scheduler after each epoch
+        if scheduler is not None:
+            scheduler.step()
+            if rank == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"  Learning rate: {current_lr:.2e}")
+        
         # Get model state dict (handle DDP wrapper)
         model_to_save = policy.module if world_size > 1 else policy
         
         if rank == 0:
             torch.save({
                         'model_state_dict': model_to_save.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                         'config': config,
                         'epoch': epoch,
                         'val_loss': val_loss,
@@ -538,7 +610,7 @@ def train_pdm_policy(config_path):
         
             safe_wandb_log({
                 "train/loss_epoch": avg_train_loss,
-                "train/epoch": 0.0,
+                "train/epoch": epoch,
                 "train/samples_processed": (epoch + 1) * len(train_dataset)
             }, use_wandb)
 

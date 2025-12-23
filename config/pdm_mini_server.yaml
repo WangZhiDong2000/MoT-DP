@@ -99,6 +99,8 @@ truncated_diffusion:
 training:
   num_epochs: 1000
   max_grad_norm: 1.0
+  warmup_epochs: 5
+  use_lr_scheduler: true
   dataset_path: /mnt/data/pdm_lite_mini/tmp_data
   image_data_root: /mnt/data/pdm_lite_mini
   sample_interval: 1

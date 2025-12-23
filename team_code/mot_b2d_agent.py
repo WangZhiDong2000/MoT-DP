@@ -77,9 +77,6 @@ except ImportError:
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 PLANNER_TYPE = os.environ.get('PLANNER_TYPE', None)
-print('*'*10)
-print(PLANNER_TYPE)
-print('*'*10)
 EARTH_RADIUS_EQUA = 6378137.0
 USE_UKF = True  # Enable Unscented Kalman Filter for GPS/compass smoothing
 
@@ -103,10 +100,10 @@ def load_best_model(checkpoint_path, config, device):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     action_stats = {
-    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
-    'std': torch.tensor([14.527670860290527, 3.224050521850586]),
+    'min': torch.tensor([-0.06638534367084503, -17.525903701782227]),
+    'max': torch.tensor([74.04539489746094, 32.73622512817383]),
+    'mean': torch.tensor([12.758530616760254, 0.354688435792923]),
+    'std': torch.tensor([16.723825454711914, 2.5529885292053223]),
     }
 
     policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
@@ -563,10 +560,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
 		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
-		# self.net = load_best_model(checkpoint_path, self.config, device)
-		# self.net = self.net.to(torch.bfloat16)
-		# if hasattr(self.net, 'obs_encoder'):
-		# 	self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
+		self.net = load_best_model(checkpoint_path, self.config, device)
+		self.net = self.net.to(torch.bfloat16)
+		if hasattr(self.net, 'obs_encoder'):
+			self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
 		print("✓ Diffusion policy loaded (bfloat16).")
 		
 		if torch.cuda.is_available():
@@ -697,6 +694,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Store predicted trajectory for BEV visualization
 		self.last_pred_traj = None  # Store the last predicted trajectory (in ego frame)
+		self.last_dp_pred_traj = None  # Store the last DP refined trajectory (in ego frame)
 		self.last_target_point = None  # Store the last target point (in ego frame)
 
 	def _init(self):
@@ -876,8 +874,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		ego_status_stacked = torch.cat([
 			speed_stacked,                        # (1, obs_horizon, 1)
 			theta_stacked,                        # (1, obs_horizon, 1)
-			throttle_stacked,                     # (1, obs_horizon, 1)
-			brake_stacked,                        # (1, obs_horizon, 1)
 			cmd_stacked,                          # (1, obs_horizon, 6)
 			target_point_transformed_stacked,     # (1, obs_horizon, 2) - target points transformed to current ego frame
 			waypoint_relative_stacked             # (1, obs_horizon, 2) - ego positions in current frame
@@ -1242,11 +1238,33 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 			pred_traj = predicted_answer['traj']  # Shape: (1, 6, 2) in ego frame [x_forward, y_left]
 			pred_decision = predicted_answer['text']
-			print(f"pred_traj: {pred_traj}")
 			
 			self.last_pred_traj = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2) in [x, y] format
 			self.last_target_point = target_point.squeeze(0).float().cpu().numpy()  # (2,) in [x, y] format
 		
+			# DP trajectory refinement
+			# Add batch dimension to features: (seq_len, feat_dim) -> (1, seq_len, feat_dim)
+			dp_vit_feat = predicted_answer['dp_vit_feat']
+			if dp_vit_feat.dim() == 2:
+				dp_vit_feat = dp_vit_feat.unsqueeze(0)  # (1, Nvit, C)
+			
+			reason_feat = predicted_answer['reason_feat']
+			if reason_feat.dim() == 2:
+				reason_feat = reason_feat.unsqueeze(0)  # (1, Nr, C)
+			
+			dp_obs_dict = {
+                    'lidar_bev': lidar_stacked,
+                    'ego_status': ego_status_stacked,  
+                    'gen_vit_tokens': dp_vit_feat,
+                    'reasoning_query_tokens': reason_feat[:7],
+                    'anchor': predicted_answer['traj']  # Pass anchor for truncated diffusion
+                }
+			dp_pred_traj = self.net.predict_action(dp_obs_dict)
+			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
+			print("dp_pred_traj:", dp_pred_traj)
+
+
+
 			# ================== control_pid method ==================
 			route_waypoints = pred_traj.float()  # (1, 6, 2) - use as route_waypoints
 			speed_waypoints = pred_traj.float()  # (1, 6, 2) - use as speed_waypoints (same for MoT)
@@ -1264,21 +1282,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					self.stuck_helper = 0
 					self.stuck_detector = 0
 			
-			# if self.stuck_helper > 0 and gt_velocity < 1.5:
-			# 	throttle = max(self.creep_throttle, throttle)
-			# 	brake = False
 
 			print(f"stuck_helper: {self.stuck_helper}")
 			print(f"stuck_detector: {self.stuck_detector}")
 
-			# if self.stuck_detector > self.stuck_threshold:
-			# 	self.force_move = self.creep_duration
-				
-			# if self.force_move > 0:
-			# 	throttle = max(self.creep_throttle, throttle)
-			# 	brake = False
-			# 	self.force_move -= 1
-			# 	print(f"force_move: {self.force_move}")
 			
 			control = carla.VehicleControl()
 			control.steer = float(steer)
@@ -1311,7 +1318,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				color=[1, 1, 0], pixels_per_meter=10, max_distance=30,
 			)
 
-			# Prepare trajectory for rendering
+			# Prepare trajectory for rendering (pred_traj - green)
 			traj_for_render = pred_traj.squeeze(0).cpu().float().numpy().copy()  # (6, 2)
 			traj_for_render[:, 1] = -traj_for_render[:, 1]  # Negate y: left -> right
 			tp_for_render = target_point.cpu().float().numpy().copy()
@@ -1325,14 +1332,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			trajectory[:, 0] = -trajectory[:, 0]  # y (now in col 0) 
 			trajectory[:, 1] = -trajectory[:, 1]  # x (now in col 1)
 			render_trajectory = render_waypoints(trajectory, pixels_per_meter=30, max_distance=20, color=(0, 255, 0))
+			
+			# Prepare dp_pred_traj for rendering (red)
+			dp_traj_for_render = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) - already numpy
+			dp_traj_for_render[:, 1] = -dp_traj_for_render[:, 1]  # Negate y: left -> right
+			dp_trajectory = np.concatenate((dp_traj_for_render, tp_for_render.reshape(1, 2)), axis=0)
+			dp_trajectory = dp_trajectory[:, [1, 0]]
+			dp_trajectory[:, 0] = -dp_trajectory[:, 0]  # y (now in col 0) 
+			dp_trajectory[:, 1] = -dp_trajectory[:, 1]  # x (now in col 1)
+			render_dp_trajectory = render_waypoints(dp_trajectory, pixels_per_meter=30, max_distance=20, color=(255, 0, 0))
 
 			ego_car_map = cv2.resize(ego_car_map, (200, 200))
 			render_trajectory = cv2.resize(render_trajectory, (200, 200))
+			render_dp_trajectory = cv2.resize(render_dp_trajectory, (200, 200))
 
 			surround_map = np.clip(
 				(
 					ego_car_map.astype(np.float32)
 					+ render_trajectory.astype(np.float32)
+					+ render_dp_trajectory.astype(np.float32)
 				),
 				0,
 				255,
@@ -1374,7 +1392,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Draw trajectory on BEV image if available
 		bev_img = tick_data['bev'].copy()
 		if self.last_pred_traj is not None:
-			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point)
+			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point, self.last_dp_pred_traj)
 		tick_data['bev_traj'] = bev_img
 		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		
@@ -1394,7 +1412,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		json.dump(self.metric_info, outfile, indent=4)
 		outfile.close()
 
-	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None):
+	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, dp_traj=None):
 		"""
 		Draw predicted trajectory on BEV image.
 		
@@ -1411,6 +1429,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			bev_img: numpy array (512, 512, 3) RGB image
 			traj: numpy array (6, 2) trajectory points in ego frame [x_forward, y_left]
 			target_point: numpy array (2,) target point in ego frame [x_forward, y_left], optional
+			dp_traj: numpy array (6, 2) DP refined trajectory points in ego frame, optional
 		
 		Returns:
 			bev_img: numpy array with trajectory drawn
@@ -1461,6 +1480,30 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				color_b = int(255 * (i / (len(pixels) - 1)))
 				cv2.circle(bev_img, (col, row), 5, (color_r, 0, color_b), -1)
 		
+		# Draw DP trajectory if provided (red color)
+		if dp_traj is not None:
+			dp_pixels = []
+			for i in range(len(dp_traj)):
+				x, y = dp_traj[i]  # x: forward, y: left (model convention)
+				pixel_col = int(cx + y / meters_per_pixel)
+				pixel_row = int(cy - x / meters_per_pixel)
+				dp_pixels.append((pixel_col, pixel_row))
+			
+			# Draw DP trajectory lines (red)
+			for i in range(len(dp_pixels) - 1):
+				pt1 = dp_pixels[i]
+				pt2 = dp_pixels[i + 1]
+				if (0 <= pt1[0] < img_w and 0 <= pt1[1] < img_h and
+					0 <= pt2[0] < img_w and 0 <= pt2[1] < img_h):
+					cv2.line(bev_img, pt1, pt2, (255, 0, 0), 2)  # Red line
+			
+			# Draw DP waypoints as circles (red with gradient to orange)
+			for i, (col, row) in enumerate(dp_pixels):
+				if 0 <= col < img_w and 0 <= row < img_h:
+					# Color gradient: start (red) -> end (orange)
+					color_g = int(128 * (i / (len(dp_pixels) - 1))) if len(dp_pixels) > 1 else 0
+					cv2.circle(bev_img, (col, row), 4, (255, color_g, 0), -1)
+		
 		# Draw target point if provided (cyan/aqua color with larger circle)
 		if target_point is not None:
 			x, y = target_point[0], target_point[1]  # x: forward, y: left (model convention)
@@ -1477,7 +1520,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		return bev_img
 
 	def destroy(self):
-		# del self.net
+		del self.net
 		torch.cuda.empty_cache()
 
 	def gps_to_location(self, gps):
@@ -1625,8 +1668,4 @@ def residual_measurement_h(a, b):
 	y = a - b
 	y[2] = t_u.normalize_angle(y[2])
 	return y
-
-
-
-
 
