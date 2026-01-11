@@ -4,12 +4,12 @@
 # Usage: bash train_carla_bev_multi_gpu.sh [num_gpus] [config_path]
 # pkill -9 -f "train_carla_bev"
 
-# Select GPUs 1-7 (excluding GPU 0)
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+# Select GPUs 0-7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Default values
-NUM_GPUS=${1:-7}  # Default to 7 GPUs (GPU 1-7)
-CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml"}
+NUM_GPUS=${1:-8}  # Default to 8 GPUs (GPU 0-7)
+CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml"}
 
 # Set environment variables for better performance
 export OMP_NUM_THREADS=8

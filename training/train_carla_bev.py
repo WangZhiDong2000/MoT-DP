@@ -25,19 +25,6 @@ def load_config(config_path=None):
         config = yaml.safe_load(f)
     return config
 
-def load_action_stats(config):
-    if 'action_stats' in config:
-        action_stats = {
-            'min': torch.tensor(config['action_stats']['min'], dtype=torch.float32),
-            'max': torch.tensor(config['action_stats']['max'], dtype=torch.float32),
-            'mean': torch.tensor(config['action_stats']['mean'], dtype=torch.float32),
-            'std': torch.tensor(config['action_stats']['std'], dtype=torch.float32),
-        }
-        print("✓ Loaded action_stats from config file")
-        return action_stats
-    else:
-        print("⚠ No action_stats found in config, action normalization will be disabled")
-        return None
 
 
 def safe_wandb_log(data, use_wandb=True):
@@ -289,7 +276,6 @@ def train_pdm_policy(config_path):
     
     if use_wandb:
         try:
-            # 支持从config动态读取wandb账号信息并自动登录（谨慎：不要把真实api key提交到仓库）
             logging_cfg = config.get('logging', {})
             wandb_entity = logging_cfg.get('wandb_entity')
             wandb_api_key = logging_cfg.get('wandb_api_key')
@@ -346,13 +332,6 @@ def train_pdm_policy(config_path):
         print(f"Validation samples: {len(val_dataset)}")
     
 
-
-    action_stats = {
-    'min': torch.tensor([-0.06638534367084503, -17.525903701782227]),
-    'max': torch.tensor([74.04539489746094, 32.73622512817383]),
-    'mean': torch.tensor([12.758530616760254, 0.354688435792923]),
-    'std': torch.tensor([6.723825454711914, 2.5529885292053223]),
-    } 
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
@@ -422,7 +401,7 @@ def train_pdm_policy(config_path):
     
     if rank == 0:
         print("Initializing policy model...")
-    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
+    policy = DiffusionDiTCarlaPolicy(config).to(device)
     
     # Wrap model with DistributedDataParallel for multi-GPU training
     if world_size > 1:
@@ -547,12 +526,12 @@ def train_pdm_policy(config_path):
             # This prevents gradient explosion which can cause val_loss to spike
             max_grad_norm = config.get('training', {}).get('max_grad_norm', 1.0)
             if world_size > 1:
-                grad_norm = torch.nn.utils.clip_grad_norm_(policy.module.parameters(), max_norm=max_grad_norm)
+                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(policy.module.parameters(), max_norm=max_grad_norm)
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
             
             # Skip optimizer step if gradients are invalid
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            if torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip):
                 if rank == 0:
                     print(f"Warning: NaN/Inf gradient norm detected at batch {batch_idx}, skipping optimizer step")
                 optimizer.zero_grad()
@@ -561,11 +540,16 @@ def train_pdm_policy(config_path):
             optimizer.step()
             train_losses.append(loss.item())
             
+            # Calculate if clipping occurred
+            grad_norm_value = grad_norm_before_clip.item() if isinstance(grad_norm_before_clip, torch.Tensor) else grad_norm_before_clip
+            was_clipped = grad_norm_value > max_grad_norm
+            
             if rank == 0:
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'avg_loss': f'{np.mean(train_losses):.4f}',
-                    'grad_norm': f'{grad_norm.item():.4f}' if isinstance(grad_norm, torch.Tensor) else f'{grad_norm:.4f}'
+                    'grad_norm': f'{grad_norm_value:.4f}',
+                    'clipped': '✂' if was_clipped else ''
                 })
             
             if batch_idx % 10 == 0 and rank == 0:
@@ -576,7 +560,9 @@ def train_pdm_policy(config_path):
                     "train/step": step,
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
                     "train/batch_idx": batch_idx,
-                    "train/grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                    "train/grad_norm_before_clip": grad_norm_value,
+                    "train/grad_norm_clipped": min(grad_norm_value, max_grad_norm),
+                    "train/grad_clipping_ratio": grad_norm_value / max_grad_norm if max_grad_norm > 0 else 0
                 }, use_wandb)
         
         if rank == 0:
@@ -716,7 +702,7 @@ def train_pdm_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
-    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml", 
+    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_pdm_policy(config_path=args.config_path)

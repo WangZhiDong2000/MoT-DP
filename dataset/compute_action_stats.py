@@ -67,6 +67,9 @@ def compute_action_stats_from_dataset(dataset_path, image_data_root, max_samples
             
             if ego_waypoints is not None:
                 if isinstance(ego_waypoints, torch.Tensor):
+                    # Convert BFloat16 to Float32 if necessary
+                    if ego_waypoints.dtype == torch.bfloat16:
+                        ego_waypoints = ego_waypoints.float()
                     ego_waypoints = ego_waypoints.cpu().numpy()
                 elif not isinstance(ego_waypoints, np.ndarray):
                     ego_waypoints = np.array(ego_waypoints)
@@ -81,10 +84,22 @@ def compute_action_stats_from_dataset(dataset_path, image_data_root, max_samples
             if vqa_path is not None and image_data_root is not None:
                 full_vqa_path = os.path.join(image_data_root, vqa_path)
                 if os.path.exists(full_vqa_path):
-                    vqa_feature = torch.load(full_vqa_path, weights_only=True)
+                    try:
+                        # Try loading with weights_only=True first
+                        vqa_feature = torch.load(full_vqa_path, weights_only=True, map_location='cpu')
+                    except Exception as e:
+                        # Fall back to loading without weights_only if BFloat16 issues occur
+                        if 'BFloat16' in str(e):
+                            vqa_feature = torch.load(full_vqa_path, weights_only=False, map_location='cpu')
+                        else:
+                            raise
+                    
                     if 'pred_traj' in vqa_feature:
                         anchor = vqa_feature['pred_traj']
                         if isinstance(anchor, torch.Tensor):
+                            # Convert BFloat16 to Float32 if necessary
+                            if anchor.dtype == torch.bfloat16:
+                                anchor = anchor.float()
                             anchor = anchor.cpu().numpy()
                         all_anchor.append(anchor)
             
@@ -126,9 +141,21 @@ def compute_action_stats_from_dataset(dataset_path, image_data_root, max_samples
     # Compute anchor stats
     anchor_stats = None
     if len(all_anchor) > 0:
-        all_anchor_flat = np.concatenate(all_anchor, axis=0)
-        print(f"\nTotal anchor waypoints: {len(all_anchor_flat)}")
-        print(f"anchor shape: {all_anchor_flat.shape}")
+        all_anchor_concat = np.concatenate(all_anchor, axis=0)
+        print(f"\nTotal anchor samples: {len(all_anchor_concat)}")
+        print(f"anchor shape before reshape: {all_anchor_concat.shape}")
+        
+        # If anchor has 3 dimensions (e.g., [N, seq_len, 2]), flatten to 2D [N*seq_len, 2]
+        # This way stats will be computed across ALL waypoints, same as agent_pos
+        if all_anchor_concat.ndim == 3:
+            original_shape = all_anchor_concat.shape
+            all_anchor_flat = all_anchor_concat.reshape(-1, all_anchor_concat.shape[-1])
+            print(f"anchor shape after reshape: {all_anchor_flat.shape} (flattened from {original_shape})")
+        else:
+            all_anchor_flat = all_anchor_concat
+            print(f"anchor shape: {all_anchor_flat.shape}")
+        
+        print(f"Total anchor waypoints (after flatten): {len(all_anchor_flat)}")
         
         anchor_stats = {
             'min': np.min(all_anchor_flat, axis=0),
@@ -147,6 +174,7 @@ def compute_action_stats_from_dataset(dataset_path, image_data_root, max_samples
         combined_min = np.minimum(agent_pos_stats['min'], anchor_stats['min'])
         combined_max = np.maximum(agent_pos_stats['max'], anchor_stats['max'])
         # For mean and std, use the combined data
+        # Now both should have the same number of dimensions (2D)
         all_combined = np.concatenate([all_agent_pos_flat, all_anchor_flat], axis=0)
         combined_mean = np.mean(all_combined, axis=0)
         combined_std = np.std(all_combined, axis=0)
@@ -259,19 +287,19 @@ def main():
     parser.add_argument(
         '--dataset_path',
         type=str,
-        default='/mnt/data/pdm_lite_mini/tmp_data',
+        default='/share-data/pdm_lite/tmp_data',
         help='Path to processed dataset (containing train/val folders or pkl files)'
     )
     parser.add_argument(
         '--image_data_root',
         type=str,
-        default='/mnt/data/pdm_lite_mini/',
+        default='/share-data/pdm_lite/',
         help='Root directory for image data (to load vqa feature files for anchor)'
     )
     parser.add_argument(
         '--config_path',
         type=str,
-        default='/root/z_projects/code/MoT-DP-1/config/pdm_mini_server.yaml',
+        default='/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml',
         help='Path to config file to save stats'
     )
     parser.add_argument(

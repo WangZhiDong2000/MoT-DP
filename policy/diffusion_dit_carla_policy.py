@@ -25,18 +25,11 @@ def dict_apply(
             result[key] = func(value)
     return result
 
-def normalize_data(data, stats):
-    ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-    ndata = ndata * 2 - 1
-    return ndata
 
-def unnormalize_data(ndata, stats):
-    ndata = (ndata + 1) / 2
-    data = ndata * (stats['max'] - stats['min']) + stats['min']
-    return data
+
 
 class DiffusionDiTCarlaPolicy(nn.Module):
-    def __init__(self, config: Dict, action_stats: Optional[Dict[str, torch.Tensor]] = None):
+    def __init__(self, config: Dict):
         super().__init__()
         
         # config
@@ -50,15 +43,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         action_dim = action_shape[0]
         
         # Action normalization settings
-        self.enable_action_normalization = config.get('enable_action_normalization', False)
-        self.action_stats = action_stats
-        if self.enable_action_normalization and self.action_stats is not None:
-            print(f"✓ Action normalization enabled with stats:")
-            print(f"  Action min: {self.action_stats['min']}")
-            print(f"  Action max: {self.action_stats['max']}")
-        else:
-            print("⚠ Action normalization disabled")
-            self.action_stats = None
+        self.enable_action_normalization = config.get('enable_action_normalization', True)
         
 
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
@@ -346,47 +331,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         return noisy_sample
 
-    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize action from original range to [-1, 1]
-        Args:
-            action: tensor of shape (..., action_dim)
-        Returns:
-            normalized action in range [-1, 1]
-        """
-        if not self.enable_action_normalization or self.action_stats is None:
-            return action
-        
-        device = action.device
-        action_min = self.action_stats['min'].to(device)
-        action_max = self.action_stats['max'].to(device)
-        
-        # Normalize to [0, 1]
-        normalized = (action - action_min) / (action_max - action_min + 1e-8)
-        # Normalize to [-1, 1]
-        normalized = normalized * 2 - 1
-        return normalized
 
-    def unnormalize_action(self, normalized_action: torch.Tensor) -> torch.Tensor:
-        """
-        Unnormalize action from [-1, 1] back to original range
-        Args:
-            normalized_action: tensor of shape (..., action_dim) in range [-1, 1]
-        Returns:
-            action in original range
-        """
-        if not self.enable_action_normalization or self.action_stats is None:
-            return normalized_action
-        
-        device = normalized_action.device
-        action_min = self.action_stats['min'].to(device)
-        action_max = self.action_stats['max'].to(device)
-        
-        # Unnormalize from [-1, 1] to [0, 1]
-        unnormalized = (normalized_action + 1) / 2
-        # Unnormalize to original range
-        unnormalized = unnormalized * (action_max - action_min) + action_min
-        return unnormalized
+
+    
 
     def extract_tcp_features(self, obs_dict, return_attention=False):
         """

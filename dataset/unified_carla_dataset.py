@@ -444,7 +444,7 @@ def test_pdm():
     """Test with PDM Lite dataset."""
     import random
     
-    dataset_path = '/mnt/data/pdm_lite_mini/tmp_data/val'
+    dataset_path = '/share-data/pdm_lite/tmp_data/val'
     obs_horizon = 4
     """
     Prints detailed information about a sample and the dataset.
@@ -459,7 +459,7 @@ def test_pdm():
     print("\n========== Testing PDM Lite Dataset ==========")
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        image_data_root='/mnt/data/pdm_lite_mini/'
+        image_data_root='/share-data/pdm_lite/'
     )
     
     print(f"\n总样本数: {len(dataset)}")
