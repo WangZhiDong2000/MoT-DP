@@ -26,16 +26,10 @@ def load_config(config_path):
 
 def load_model(config, checkpoint_path, device):
     print(f"Loading model from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     checkpoint_config = checkpoint['config']
-    action_stats = {
-    'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
-    'std': torch.tensor([14.527670860290527, 3.224050521850586]),
-    }
-    
-    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
+
+    policy = DiffusionDiTCarlaPolicy(config).to(device)
     
     if 'model_state_dict' in checkpoint:
         policy.load_state_dict(checkpoint['model_state_dict'])
@@ -55,7 +49,7 @@ def load_model(config, checkpoint_path, device):
 
 def main():
     # Configuration
-    config_path = os.path.join(project_root, "config", "pdm_mini_server.yaml")
+    config_path = os.path.join(project_root, "config", "pdm_local.yaml")
     checkpoint_path = os.path.join(project_root, "checkpoints", "carla_dit_best", "carla_policy_best.pt")
     config = load_config(config_path)
     

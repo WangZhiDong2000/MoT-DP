@@ -24,7 +24,7 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1.0e-08
-  lr: 5.0e-05
+  lr: 1.0e-05
   weight_decay: 1.0e-05
 shape_meta:
   action:
@@ -56,7 +56,7 @@ shape_meta:
 enable_action_normalization: true
 bev_encoder:
   pretrained_path: /home/wang/Project/MoT-DP/checkpoints/interfuser/lidar_bev_encoder_only.pth
-  state_dim: 14
+  state_dim: 12
   feature_dim: 256
   use_group_norm: true
   freeze_backbone: false
@@ -80,21 +80,23 @@ policy:
   obs_as_cond: true
   n_cond_layers: 6
   action_horizon: 6
-  num_inference_steps: 10 # 100
-  use_anchor: false
-
-noise_scheduler:
-  num_diffusion_steps: 100
-  beta_start: 0.0001
-  beta_end: 0.02
-  beta_schedule: squaredcos_cap_v2
-  clip_sample: false
-  prediction_type: epsilon
+truncated_diffusion:
+  num_train_timesteps: 1000
+  trunc_timesteps: 8
+  train_trunc_timesteps: 50
+  num_diffusion_steps: 2
+  eta: 1.0
+  norm_x_offset: 16.0
+  norm_x_range: 92.0
+  norm_y_offset: 45.0
+  norm_y_range: 88.0 #  Extended range: x=[-16.0, 76.0], y=[-45.0, 43.0]
 training:
   num_epochs: 1000
   max_grad_norm: 1.0
-  dataset_path: /share-data/pdm_lite/tmp_data
-  image_data_root: /share-data/pdm_lite
+  warmup_epochs: 5
+  use_lr_scheduler: true
+  dataset_path: /home/wang/Dataset/pdm_lite_mini/tmp_data
+  image_data_root: /home/wang/Dataset/pdm_lite_mini
   sample_interval: 1
   lr_final: 1e-7
   validation_freq: 5
@@ -125,38 +127,19 @@ model_optimization:
   gradient_accumulation_steps: 2
   warmup_steps: 500
   lr_scheduler: cosine
-# action_stats:
-#   min:
-#   - -14.108696937561035
-#   - -43.720863342285156
-#   max:
-#   - 74.04539489746094
-#   - 41.13515090942383
-#   mean:
-#   - 6.945382118225098
-#   - -0.008451690897345543
-#   std:
-#   - 10.920757293701172
-#   - 2.322951555252075
-    # action_stats = {
-    # 'min': torch.tensor([-11.77335262298584, -59.26432800292969]),
-    # 'max': torch.tensor([98.34003448486328, 55.585079193115234]),
-    # 'mean': torch.tensor([9.755727767944336, 0.03559679538011551]),
-    # 'std': torch.tensor([14.527670860290527, 3.224050521850586]),
-    # } 
 action_stats:
   min:
-  - -11.77335262298584
-  - -59.26432800292969
+  - -14.108696937561035
+  - -43.720863342285156
   max:
-  - 98.34003448486328
-  - 55.585079193115234
+  - 74.04539489746094
+  - 41.13515090942383
   mean:
-  - 9.755727767944336
-  - 0.03559679538011551
+  - 8.067095756530762
+  - -0.013612879440188408
   std:
-  - 14.527670860290527
-  - 3.224050521850586
+  - 11.3925199508667
+  - 2.4904565811157227
 controller:
   turn_KP: 0.75
   turn_KI: 0.75
@@ -169,8 +152,7 @@ controller:
   aim_dist: 4.0
   angle_thresh: 0.3
   dist_thresh: 10.0
-  brake_speed: 0.05        # Extremely low - almost never brake for low desired speed
-  brake_ratio: 2.8         # Very high tolerance - allow even more recovery (180% overspeed before braking)
-  clip_delta: 1.0          # Maximum acceleration to help recover from stops quickly
-  max_throttle: 1.0        # Allow full throttle in PID
-
+  brake_speed: 0.4
+  brake_ratio: 1.1
+  clip_delta: 0.25
+  max_throttle: 0.75

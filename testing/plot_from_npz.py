@@ -117,8 +117,8 @@ def visualize_from_npz(npz_path, save_path):
 
 
 if __name__ == "__main__":
-    npz_path = "/root/z_projects/code/MoT-DP-1/image/trajectory_data.npz"
-    save_path = "/root/z_projects/code/MoT-DP-1/image/trajectory_predictions_4samples.png"
+    npz_path = "/home/wang/Project/MoT-DP/image/trajectory_data.npz"
+    save_path = "/home/wang/Project/MoT-DP/image/trajectory_predictions_4samples.png"
     
     if not os.path.exists(npz_path):
         print(f"⚠ Data file not found: {npz_path}")

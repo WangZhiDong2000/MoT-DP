@@ -99,14 +99,7 @@ def load_best_model(checkpoint_path, config, device):
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    action_stats = {
-    'min': torch.tensor([-0.06638534367084503, -17.525903701782227]),
-    'max': torch.tensor([74.04539489746094, 32.73622512817383]),
-    'mean': torch.tensor([12.758530616760254, 0.354688435792923]),
-    'std': torch.tensor([16.723825454711914, 2.5529885292053223]),
-    }
-
-    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)
+    policy = DiffusionDiTCarlaPolicy(config).to(device)
     policy.load_state_dict(checkpoint['model_state_dict'])
     policy.eval()
     
@@ -559,7 +552,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
-		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
+		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best_200.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
 		self.net = self.net.to(torch.bfloat16)
 		if hasattr(self.net, 'obs_encoder'):
@@ -1248,7 +1241,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			if dp_vit_feat.dim() == 2:
 				dp_vit_feat = dp_vit_feat.unsqueeze(0)  # (1, Nvit, C)
 			
-			reason_feat = predicted_answer['reason_feat']
+			reason_feat = predicted_answer['reasoning_feat']
 			if reason_feat.dim() == 2:
 				reason_feat = reason_feat.unsqueeze(0)  # (1, Nr, C)
 			
@@ -1266,8 +1259,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 
 			# ================== control_pid method ==================
-			route_waypoints = pred_traj.float()  # (1, 6, 2) - use as route_waypoints
-			speed_waypoints = pred_traj.float()  # (1, 6, 2) - use as speed_waypoints (same for MoT)
+			# route_waypoints = pred_traj.float()  # (1, 6, 2) - use as route_waypoints
+			# speed_waypoints = pred_traj.float()  # (1, 6, 2) - use as speed_waypoints (same for MoT)
+			route_waypoints = torch.from_numpy(dp_pred_traj['action']).float()
+			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float()
 			gt_velocity = tick_data['speed']
 			
 			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints)
