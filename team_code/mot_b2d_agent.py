@@ -862,7 +862,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		target_point_transformed_stacked = torch.stack(target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
 		
-		# Concatenate all ego status features: speed + theta + throttle + brake + cmd + target_point + waypoint_relative
+		# Concatenate all ego status features: speed + theta + cmd + target_point + waypoint_relative
 		# ego_status_stacked: (1, obs_horizon, 1+1+1+1+6+2+2) = (1, obs_horizon, 14)
 		ego_status_stacked = torch.cat([
 			speed_stacked,                        # (1, obs_horizon, 1)
@@ -1138,14 +1138,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		# Prepare current observations
 		gt_velocity = torch.FloatTensor([tick_data['speed']]).to('cuda', dtype=torch.float32)
+		# Use the same method as agent_simlingo.py: t_u.command_to_one_hot with self.commands[-2]
+		one_hot_command = t_u.command_to_one_hot(self.commands[-2])
+		cmd_one_hot = torch.from_numpy(one_hot_command[np.newaxis]).to('cuda', dtype=torch.float32)
+		# Keep command variable for metadata (convert from 1-6 to 0-5 range)
 		command = tick_data['next_command']
 		if command < 0:
 			command = 4
 		command -= 1
-		assert command in [0, 1, 2, 3, 4, 5]
-		cmd_one_hot = [0] * 6
-		cmd_one_hot[command] = 1
-		cmd_one_hot = torch.tensor(cmd_one_hot).view(1, 6).to('cuda', dtype=torch.float32)
 		speed = torch.FloatTensor([float(tick_data['speed'])]).view(1,1).to('cuda', dtype=torch.float32)
 		theta = torch.FloatTensor([float(tick_data['theta'])]).view(1,1).to('cuda', dtype=torch.float32)
 		lidar = tick_data['lidar_bev'].to('cuda', dtype=torch.float32)
