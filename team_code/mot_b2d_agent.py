@@ -1072,12 +1072,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
 		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
 		mot_waypoint_interval = 0.5  # seconds between waypoints
-		one_second_idx = 1  # point[1] is at 1.0s
+		one_second_idx = 2 #1  # point[1] is at 1.0s
 		half_second_idx = 0  # point[0] is at 0.5s
 		
 		if speed_waypoints_np.shape[0] >= 2:
 			# Displacement from 0.5s to 1.0s position, multiply by 2 to get m/s
-			desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx]) * 2.0
+			# desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx]) * 2.0
+			desired_speed = np.linalg.norm(speed_waypoints_np[one_second_idx] - speed_waypoints_np[half_second_idx])
 		else:
 			# Fallback: use first point distance, assuming it represents 0.5s travel
 			desired_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
