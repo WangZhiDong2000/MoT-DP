@@ -152,6 +152,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 # Take first 7 tokens
                 final_sample['reasoning_query_tokens'] = reasoning_feat[:7]  # shape: (7, 2560)
 
+            elif key == 'route':
+                # Load route waypoints (expected shape: (20, 2))
+                route_data = torch.from_numpy(value).float()
+                final_sample['route'] = route_data
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
@@ -229,13 +233,14 @@ class CARLAImageDataset(torch.utils.data.Dataset):
 # Visualization Functions
 # ============================================================================
 
-def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projects/code/MoT-DP-1/image'):
+def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/home/wang/Project/MoT-DP/image'):
 
     agent_pos = sample.get('agent_pos')
     waypoints_hist = sample.get('waypoints_hist')
     target_point = sample.get('target_point')
     target_point_hist = sample.get('target_point_hist')
     anchor = sample.get('anchor')
+    route = sample.get('route')
     
     if isinstance(agent_pos, torch.Tensor):
         agent_pos = agent_pos.float().numpy()
@@ -251,6 +256,8 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
         # Remove extra dimension if shape is (1, N, 2)
         if anchor.ndim == 3 and anchor.shape[0] == 1:
             anchor = anchor[0]
+    if isinstance(route, torch.Tensor):
+        route = route.float().numpy()
     
     plt.figure(figsize=(12, 12))
     
@@ -307,6 +314,18 @@ def visualize_trajectory(sample, obs_horizon, rand_idx, save_dir='/root/z_projec
         for i, waypoint in enumerate(anchor, 1):
             plt.plot(waypoint[1], waypoint[0], 'c^', markersize=8, 
                     markeredgecolor='darkcyan', markeredgewidth=1.5, zorder=4)
+    
+    # ========== Plot Route Waypoints (planned route) ==========
+    if route is not None and len(route) > 0:
+        # Plot line connecting route points (MAGENTA for route)
+        # route shape: (20, 2) - [x, y] in ego frame
+        plt.plot(route[:, 1], route[:, 0], 'm--', 
+                linewidth=2.0, alpha=0.6, label='Route waypoints', zorder=2)
+        
+        # Plot discrete route points
+        for i, waypoint in enumerate(route):
+            plt.plot(waypoint[1], waypoint[0], 'ms', markersize=6, 
+                    markeredgecolor='darkmagenta', markeredgewidth=1.0, alpha=0.6, zorder=3)
     
     # ========== Plot Current Target Point ==========
     if target_point is not None:
@@ -431,7 +450,7 @@ def print_sample_details(sample, dataset, rand_idx, obs_horizon,
 
     print("\nKey fields:")
     for key in ['town_name', 'speed', 'command', 'next_command', 'target_point', 
-                'target_point_hist', 'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed', 'gen_vit_tokens']:
+                'target_point_hist', 'ego_waypoints', 'image', 'agent_pos', 'meta_action_direction', 'meta_action_speed', 'gen_vit_tokens', 'route']:
         if key in first_sample:
             value = first_sample[key]
             print(f"  {key}: shape={getattr(value, 'shape', 'N/A')}, type={type(value)}")
@@ -444,7 +463,7 @@ def test_pdm():
     """Test with PDM Lite dataset."""
     import random
     
-    dataset_path = '/share-data/pdm_lite/tmp_data/val'
+    dataset_path = '/home/wang/Dataset/pdm_lite_mini/tmp_data/val'
     obs_horizon = 4
     """
     Prints detailed information about a sample and the dataset.
@@ -459,7 +478,7 @@ def test_pdm():
     print("\n========== Testing PDM Lite Dataset ==========")
     dataset = CARLAImageDataset(
         dataset_path=dataset_path,
-        image_data_root='/share-data/pdm_lite/'
+        image_data_root='/home/wang/Dataset/pdm_lite_mini'
     )
     
     print(f"\n总样本数: {len(dataset)}")

@@ -182,7 +182,8 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 target_actions = batch['agent_pos']  
                 
                 try:
-                    result = model_for_inference.predict_action(obs_dict)
+                    # predict_route=True to also get route prediction in one forward pass
+                    result = model_for_inference.predict_action(obs_dict, predict_route=False)
                     predicted_actions = torch.from_numpy(result['action']).to(device)
                     
                     if target_actions.dim() == 3:  # (B, T, 2)
@@ -199,6 +200,22 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                     )
                     for key, value in driving_metrics.items():
                         val_metrics[key].append(value)
+                    
+                    # Compute route prediction metrics if route ground truth is available
+                    if 'route' in batch and batch['route'] is not None and 'route_pred' in result:
+                        try:
+                            route_gt = batch['route'].to(device)  # (B, num_waypoints, 2)
+                            route_pred = result['route_pred']  # Already a tensor (B, num_waypoints, 2)
+                            
+                            # Compute L2 distance per waypoint and average
+                            route_l2 = torch.sqrt(((route_pred - route_gt) ** 2).sum(dim=-1))  # (B, num_waypoints)
+                            route_l2_mean = route_l2.mean().item()  # Average over all waypoints and batch
+                            route_l2_final = route_l2[:, -1].mean().item()  # L2 at final waypoint
+                            
+                            val_metrics['route_L2'].append(route_l2_mean)
+                            val_metrics['route_L2_final'].append(route_l2_final)
+                        except Exception as e:
+                            print(f"Warning: Error in route metrics computation: {e}")
                         
                     pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
                 except Exception as e:
@@ -702,7 +719,7 @@ def train_pdm_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
-    parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml", 
+    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/pdm_local.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_pdm_policy(config_path=args.config_path)

@@ -117,6 +117,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.norm_y_offset = diffusion_cfg.get('norm_y_offset', 20.0)  # y range: [-20, 36]
         self.norm_y_range = diffusion_cfg.get('norm_y_range', 56.0)
         
+        # Route prediction auxiliary loss weight
+        self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.1)
+        
         # DDIMScheduler for variance computation (DiffusionDriveV2 style)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
@@ -433,12 +436,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             'agent_pos': (B, horizon, 2) - 未来轨迹点
             'ego_status': (B, obs_horizon, 13) - 车辆状态 [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
             'anchor': (B, horizon, 2) - anchor轨迹点（用于truncated diffusion）
+            'route': (B, num_waypoints, 2) - 路线waypoints（可选，用于route预测辅助任务）
         }
         """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype  # Get model dtype
         nobs = {}
-        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 'reasoning_query_tokens', 'gen_vit_tokens', 'anchor']
+        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 'reasoning_query_tokens', 'gen_vit_tokens', 'anchor', 'route']
         
         for field in required_fields:
             if field in batch:
@@ -464,6 +468,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if anchor is not None:
             anchor = anchor.to(device=device, dtype=model_dtype)  # (B, horizon, 2)
         
+        # Get route ground truth for auxiliary task
+        route_gt = batch.get('route', None)
+        if route_gt is not None:
+            route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
+        
         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
         batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
         feature_dim = batch_features.shape[-1]
@@ -488,6 +497,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
+            route_gt=route_gt,
             device=device,
             model_dtype=model_dtype
         )
@@ -503,7 +513,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         device: torch.device,
-        model_dtype: torch.dtype
+        model_dtype: torch.dtype,
+        route_gt: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute loss using truncated diffusion (DiffusionDriveV2 style).
@@ -511,6 +522,17 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         The model predicts the clean sample directly.
         
         Training: Add scheduler-based multiplicative noise (noise level depends on timestep)
+        
+        Args:
+            trajectory: (B, horizon, 2) - ground truth trajectory
+            anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
+            cond: (B, To, feature_dim) - condition features from BEV encoder
+            gen_vit_tokens: (B, seq_len, dim) - VIT tokens
+            reasoning_query_tokens: (B, seq_len, dim) - reasoning tokens
+            ego_status: (B, To, status_dim) - ego vehicle status
+            device: torch device
+            model_dtype: model dtype (e.g., bfloat16)
+            route_gt: (B, num_waypoints, 2) - optional ground truth route for auxiliary loss
         """
         batch_size = trajectory.shape[0]
         
@@ -540,41 +562,71 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # 5. Denormalize for model input (model expects denormalized coordinates)
         noisy_trajectory_denorm = self.denorm_odo(noisy_anchor)
         
-        # 6. Predict clean sample
-        pred = self.model(
+        # 6. Predict clean sample (and optionally route)
+        # Only predict route during training when route_gt is available
+        predict_route = route_gt is not None
+        model_output = self.model(
             noisy_trajectory_denorm,
             timesteps,  # Use the sampled timesteps
             cond,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
-            ego_status=ego_status
+            ego_status=ego_status,
+            predict_route=predict_route
         )
         
-        # 7. Compute loss - predict clean sample (not noise)
+        # Unpack model output
+        if predict_route:
+            pred, route_pred = model_output
+        else:
+            pred = model_output
+            route_pred = None
+        
+        # 7. Compute trajectory loss - predict clean sample (not noise)
         # Target is the ground truth trajectory (denormalized)
         # DiffusionDrive uses L1 loss
         target = trajectory
         
-        loss = F.l1_loss(pred, target, reduction='none')
+        traj_loss = F.l1_loss(pred, target, reduction='none')
         
-        if loss.shape[-1] > 2:
-            loss = loss[..., :2]
+        if traj_loss.shape[-1] > 2:
+            traj_loss = traj_loss[..., :2]
         
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+        traj_loss = reduce(traj_loss, 'b ... -> b (...)', 'mean')
+        traj_loss = traj_loss.mean()
         
-        return loss
+        # 8. Compute route loss (auxiliary task)
+        total_loss = traj_loss
+        if route_pred is not None and route_gt is not None:
+            route_loss = F.l1_loss(route_pred, route_gt, reduction='none')
+            route_loss = reduce(route_loss, 'b ... -> b (...)', 'mean')
+            route_loss = route_loss.mean()
+            
+            # Combine losses with weight factor
+            # route_loss_weight controls the contribution of route prediction
+            route_loss_weight = getattr(self, 'route_loss_weight', 0.1)
+            total_loss = traj_loss + route_loss_weight * route_loss
+        
+        return total_loss
 
     def conditional_sample(self, 
             condition_data, condition_mask,
             cond=None, generator=None, gen_vit_tokens=None, 
             reasoning_query_tokens=None, ego_status=None,
             anchor=None,  # Anchor trajectory for truncated diffusion
+            predict_route: bool = False,  # Whether to also predict route
             # keyword arguments to scheduler.step
             **kwargs
             ):
         """
         Generate trajectory samples using truncated diffusion (DiffusionDriveV2 style).
+        
+        Args:
+            predict_route: If True, also return route prediction
+            
+        Returns:
+            If predict_route=False: trajectory (B, T, 2)
+            If predict_route=True: (trajectory, route_pred) tuple
         """
         model = self.model
         device = condition_data.device
@@ -582,7 +634,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         model_dtype = condition_data.dtype
         
         # Truncated Diffusion with Anchor (DiffusionDriveV2 style)
-        trajectory = self._truncated_diffusion_sample(
+        result = self._truncated_diffusion_sample(
             anchor=anchor,
             cond=cond,
             ego_status=ego_status,
@@ -590,10 +642,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             reasoning_query_tokens=reasoning_query_tokens,
             device=device,
             model_dtype=model_dtype,
-            generator=generator
+            generator=generator,
+            predict_route=predict_route
         )
 
-        return trajectory
+        return result
     
     def _truncated_diffusion_sample(
         self,
@@ -604,8 +657,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         reasoning_query_tokens: torch.Tensor,
         device: torch.device,
         model_dtype: torch.dtype,
-        generator=None
-    ) -> torch.Tensor:
+        generator=None,
+        predict_route: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Truncated diffusion sampling (DiffusionDriveV2 style with multiplicative noise).
         Start from anchor with multiplicative noise, denoise for few steps.
@@ -614,8 +668,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         - The model predicts the CLEAN trajectory directly (not noise, not residual)
         - Uses multiplicative noise with scheduler-based variance (timestep-dependent)
         - Final output is the model's direct prediction
+        
+        Args:
+            predict_route: If True, also return route prediction from the last step
+            
+        Returns:
+            If predict_route=False: trajectory prediction (B, T, 2)
+            If predict_route=True: (trajectory, route_pred) tuple
         """
         bs = anchor.shape[0]
+        route_pred = None  # Initialize route prediction
         
         # Set up scheduler
         self.diffusion_scheduler.set_timesteps(self.num_train_timesteps, device)
@@ -653,14 +715,23 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             timesteps = timesteps.expand(bs)
             
             # Predict clean sample - model directly outputs the trajectory
-            pred = self.model(
+            # On the last iteration, also predict route if requested
+            is_last_step = (i == len(roll_timesteps) - 1)
+            model_output = self.model(
                 sample=noisy_traj_points.to(dtype=model_dtype),
                 timestep=timesteps,
                 cond=cond,
                 gen_vit_tokens=gen_vit_tokens,
                 reasoning_query_tokens=reasoning_query_tokens,
-                ego_status=ego_status
+                ego_status=ego_status,
+                predict_route=is_last_step and predict_route  # Only predict route on last step
             )
+            
+            # Unpack output
+            if is_last_step and predict_route:
+                pred, route_pred = model_output
+            else:
+                pred = model_output
             
             # For next iteration, use the normalized prediction as input
             # Apply scheduler-based multiplicative noise for refinement
@@ -680,9 +751,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 diffusion_output = x_start
         
         # 4. Return the model's direct prediction (NOT denorm_odo(diffusion_output))
+        if predict_route:
+            return pred, route_pred
         return pred
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], predict_route: bool = True) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype  # Get model dtype
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
@@ -735,15 +808,23 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             if anchor.shape[0] != B:
                 anchor = anchor.expand(B, -1, -1)
         
-        nsample = self.conditional_sample(
+        sample_output = self.conditional_sample(
             cond_data, 
             cond_mask,
             cond=cond,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
-            anchor=anchor
+            anchor=anchor,
+            predict_route=predict_route
         )
+        
+        # Unpack output based on predict_route flag
+        if predict_route:
+            nsample, route_pred = sample_output
+        else:
+            nsample = sample_output
+            route_pred = None
         
         naction_pred = nsample[...,:Da]
         
@@ -757,4 +838,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             'action': action,
             'action_pred': action_pred
         }
+        
+        # Add route prediction to result if available
+        if route_pred is not None:
+            result['route_pred'] = route_pred  # Keep as tensor for L2 computation
+        
         return result

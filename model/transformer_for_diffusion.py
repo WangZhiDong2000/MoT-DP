@@ -693,6 +693,66 @@ class TrajectoryHead(nn.Module):
         return x
 
 
+class RouteHead(nn.Module):
+    """
+    Route prediction head that decodes route waypoints from encoder memory.
+    Uses attention pooling to aggregate memory into a single representation,
+    then projects to route waypoints.
+    
+    Route shape: (num_waypoints, 2) where num_waypoints=20 by default
+    """
+    def __init__(self, n_emb, num_waypoints=20, p_drop=0.1):
+        super().__init__()
+        self.num_waypoints = num_waypoints
+        self.output_dim = num_waypoints * 2  # x, y for each waypoint
+        
+        # Attention pooling to aggregate memory features
+        self.pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
+        self.pool_attn = nn.MultiheadAttention(
+            embed_dim=n_emb,
+            num_heads=8,
+            dropout=p_drop,
+            batch_first=True
+        )
+        
+        # MLP to decode route from pooled features
+        self.ln_f = nn.LayerNorm(n_emb)
+        self.drop = nn.Dropout(p_drop)
+        self.mlp = nn.Sequential(
+            nn.Linear(n_emb, n_emb * 2),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+            nn.Linear(n_emb * 2, n_emb),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+            nn.Linear(n_emb, self.output_dim)
+        )
+    
+    def forward(self, memory: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            memory: (B, T_cond, n_emb) - encoder memory output
+        Returns:
+            route: (B, num_waypoints, 2) - predicted route waypoints
+        """
+        B = memory.shape[0]
+        
+        # Attention pooling: query attends to memory
+        query = self.pool_query.expand(B, -1, -1)  # (B, 1, n_emb)
+        pooled, _ = self.pool_attn(query, memory, memory)  # (B, 1, n_emb)
+        pooled = pooled.squeeze(1)  # (B, n_emb)
+        
+        # Decode route
+        pooled = self.ln_f(pooled)
+        pooled = self.drop(pooled)
+        route_flat = self.mlp(pooled)  # (B, num_waypoints * 2)
+        
+        # Reshape to (B, num_waypoints, 2)
+        route = route_flat.view(B, self.num_waypoints, 2)
+        
+        return route
+
+
 class TrajectoryRefinementHead(nn.Module):
     """
     Trajectory Head with GRU Temporal Processing.
@@ -852,6 +912,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # trajectory head block (with Residual Refinement and Temporal Smoothing)
         self.trajectory_head = TrajectoryRefinementHead(n_emb, output_dim, p_drop_emb)
         
+        # Route prediction head (predicts route waypoints from encoder memory)
+        self.route_head = RouteHead(n_emb, num_waypoints=20, p_drop=p_drop_emb)
+        
         # constants
         self.T = T
         self.T_cond = T_cond
@@ -894,6 +957,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             CustomTransformerDecoder,
             TrajectoryHead,
             TrajectoryRefinementHead,
+            RouteHead,
             nn.ModuleList
         )  #
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -1337,6 +1401,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # Slice output if history was added (keep only future)
         if hist_features is not None:
             x = x[:, -t:, :]
+        
+        # 8. Route prediction from encoder memory (optional auxiliary task)
+        # Route prediction is independent of diffusion timestep
+        predict_route = kwargs.get('predict_route', False)
+        if predict_route:
+            route_pred = self.route_head(memory)  # (B, num_waypoints, 2)
+            return x, route_pred
             
         return x
 
