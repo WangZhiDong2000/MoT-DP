@@ -552,7 +552,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
-		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best_200.pt")
+		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
 		self.net = self.net.to(torch.bfloat16)
 		if hasattr(self.net, 'obs_encoder'):
@@ -689,6 +689,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_pred_traj = None  # Store the last predicted trajectory (in ego frame)
 		self.last_dp_pred_traj = None  # Store the last DP refined trajectory (in ego frame)
 		self.last_target_point = None  # Store the last target point (in ego frame)
+		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
 
 	def _init(self):
 		# Use _global_plan_world_coord directly (already in CARLA coordinates)
@@ -1257,13 +1258,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			print("dp_pred_traj:", dp_pred_traj)
 
-
-
 			# ================== control_pid method ==================
-			# route_waypoints = pred_traj.float()  # (1, 6, 2) - use as route_waypoints
-			# speed_waypoints = pred_traj.float()  # (1, 6, 2) - use as speed_waypoints (same for MoT)
-			route_waypoints = torch.from_numpy(dp_pred_traj['action']).float()
-			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float()
+			# Following agent_simlingo convention:
+			# - speed_waypoints: 'action' - used for speed control (throttle/brake)
+			# - route_waypoints: 'route_pred' - used for lateral angle control (steering)
+			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float()  # (1, 6, 2) for speed control
+			
+			# route_pred is 20 waypoints with equal intervals for lateral control
+			if 'route_pred' in dp_pred_traj and dp_pred_traj['route_pred'] is not None:
+				route_pred = dp_pred_traj['route_pred']  # tensor (B, 20, 2)
+				if isinstance(route_pred, torch.Tensor):
+					route_waypoints = route_pred.float().cpu()  # (1, 20, 2) for steering control
+				else:
+					route_waypoints = torch.from_numpy(route_pred).float()
+				self.last_route_pred = route_waypoints.squeeze(0).numpy().copy()  # (20, 2) for visualization
+			else:
+				# Fallback: use action if route_pred not available
+				route_waypoints = speed_waypoints.clone()
+				self.last_route_pred = None
+			
 			gt_velocity = tick_data['speed']
 			
 			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints)
@@ -1388,7 +1401,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Draw trajectory on BEV image if available
 		bev_img = tick_data['bev'].copy()
 		if self.last_pred_traj is not None:
-			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point, self.last_dp_pred_traj)
+			# Pass last_route_pred for visualization (20 waypoints for lateral control, blue points)
+			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point, self.last_dp_pred_traj, self.last_route_pred)
 		tick_data['bev_traj'] = bev_img
 		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		
@@ -1408,7 +1422,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		json.dump(self.metric_info, outfile, indent=4)
 		outfile.close()
 
-	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, dp_traj=None):
+	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, dp_traj=None, route_pred=None):
 		"""
 		Draw predicted trajectory on BEV image.
 		
@@ -1426,6 +1440,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			traj: numpy array (6, 2) trajectory points in ego frame [x_forward, y_left]
 			target_point: numpy array (2,) target point in ego frame [x_forward, y_left], optional
 			dp_traj: numpy array (6, 2) DP refined trajectory points in ego frame, optional
+			route_pred: numpy array (20, 2) route waypoints for lateral control, optional
 		
 		Returns:
 			bev_img: numpy array with trajectory drawn
@@ -1499,6 +1514,29 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					# Color gradient: start (red) -> end (orange)
 					color_g = int(128 * (i / (len(dp_pixels) - 1))) if len(dp_pixels) > 1 else 0
 					cv2.circle(bev_img, (col, row), 4, (255, color_g, 0), -1)
+		
+		# Draw route_pred waypoints if provided (blue color) - used for lateral/steering control
+		if route_pred is not None:
+			route_pixels = []
+			for i in range(len(route_pred)):
+				x, y = route_pred[i]  # x: forward, y: left (model convention)
+				pixel_col = int(cx + y / meters_per_pixel)
+				pixel_row = int(cy - x / meters_per_pixel)
+				route_pixels.append((pixel_col, pixel_row))
+			
+			# Draw route_pred trajectory lines (blue)
+			for i in range(len(route_pixels) - 1):
+				pt1 = route_pixels[i]
+				pt2 = route_pixels[i + 1]
+				if (0 <= pt1[0] < img_w and 0 <= pt1[1] < img_h and
+					0 <= pt2[0] < img_w and 0 <= pt2[1] < img_h):
+					cv2.line(bev_img, pt1, pt2, (255, 165, 0), 1)  # Orange line (thinner)
+			
+			# Draw route_pred waypoints as circles (blue)
+			for i, (col, row) in enumerate(route_pixels):
+				if 0 <= col < img_w and 0 <= row < img_h:
+					# Solid blue points for route_pred
+					cv2.circle(bev_img, (col, row), 3, (0, 0, 255), -1)  # Blue circles (smaller)
 		
 		# Draw target point if provided (cyan/aqua color with larger circle)
 		if target_point is not None:

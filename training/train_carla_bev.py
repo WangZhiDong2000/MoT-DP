@@ -182,8 +182,8 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 target_actions = batch['agent_pos']  
                 
                 try:
-                    # predict_route=True to also get route prediction in one forward pass
-                    result = model_for_inference.predict_action(obs_dict, predict_route=False)
+                    # Model always returns route prediction
+                    result = model_for_inference.predict_action(obs_dict)
                     predicted_actions = torch.from_numpy(result['action']).to(device)
                     
                     if target_actions.dim() == 3:  # (B, T, 2)

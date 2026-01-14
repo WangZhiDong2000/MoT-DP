@@ -693,62 +693,197 @@ class TrajectoryHead(nn.Module):
         return x
 
 
-class RouteHead(nn.Module):
+class AdaLNRouteBlock(nn.Module):
     """
-    Route prediction head that decodes route waypoints from encoder memory.
-    Uses attention pooling to aggregate memory into a single representation,
-    then projects to route waypoints.
-    
-    Route shape: (num_waypoints, 2) where num_waypoints=20 by default
+    Single Transformer block with AdaLN modulation for route prediction.
+    Similar to DiT blocks, uses conditioning (target point) to modulate the features.
     """
-    def __init__(self, n_emb, num_waypoints=20, p_drop=0.1):
+    def __init__(self, n_emb, n_head, p_drop=0.1):
         super().__init__()
-        self.num_waypoints = num_waypoints
-        self.output_dim = num_waypoints * 2  # x, y for each waypoint
+        self.n_emb = n_emb
         
-        # Attention pooling to aggregate memory features
-        self.pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
-        self.pool_attn = nn.MultiheadAttention(
+        # Self-attention among route queries
+        self.self_attn = nn.MultiheadAttention(
             embed_dim=n_emb,
-            num_heads=8,
+            num_heads=n_head,
             dropout=p_drop,
             batch_first=True
         )
         
-        # MLP to decode route from pooled features
-        self.ln_f = nn.LayerNorm(n_emb)
-        self.drop = nn.Dropout(p_drop)
-        self.mlp = nn.Sequential(
-            nn.Linear(n_emb, n_emb * 2),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(n_emb * 2, n_emb),
-            nn.GELU(),
-            nn.Dropout(p_drop),
-            nn.Linear(n_emb, self.output_dim)
+        # Cross-attention to memory
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=n_emb,
+            num_heads=n_head,
+            dropout=p_drop,
+            batch_first=True
+        )
+        
+        # Feed-forward network
+        self.linear1 = nn.Linear(n_emb, n_emb * 4)
+        self.linear2 = nn.Linear(n_emb * 4, n_emb)
+        self.dropout = nn.Dropout(p_drop)
+        
+        # Layer norms
+        self.norm1 = nn.LayerNorm(n_emb)
+        self.norm2 = nn.LayerNorm(n_emb)
+        self.norm3 = nn.LayerNorm(n_emb)
+        
+        self.activation = nn.GELU()
+        
+        # AdaLN modulation: 9 parameters (3 groups of shift, scale, gate)
+        # For: self_attn, cross_attn, ffn
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(n_emb, 9 * n_emb, bias=True)
         )
     
-    def forward(self, memory: torch.Tensor) -> torch.Tensor:
+    def modulate(self, x, shift, scale):
+        """AdaLN modulation: x * (1 + scale) + shift"""
+        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    
+    def forward(self, x, memory, conditioning):
+        """
+        Args:
+            x: (B, num_queries, n_emb) - route query tokens
+            memory: (B, T_cond, n_emb) - encoder memory
+            conditioning: (B, n_emb) - conditioning from target point
+        Returns:
+            x: (B, num_queries, n_emb) - updated route queries
+        """
+        # Generate modulation parameters from conditioning
+        mod_params = self.adaLN_modulation(conditioning)
+        shift_sa, scale_sa, gate_sa, \
+        shift_ca, scale_ca, gate_ca, \
+        shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(9, dim=1)
+        
+        # 1. Self-attention with AdaLN modulation
+        x2 = self.norm1(x)
+        x2 = self.modulate(x2, shift_sa, scale_sa)
+        x2, _ = self.self_attn(x2, x2, x2)
+        x = x + gate_sa.unsqueeze(1) * x2
+        
+        # 2. Cross-attention to memory with AdaLN modulation
+        x2 = self.norm2(x)
+        x2 = self.modulate(x2, shift_ca, scale_ca)
+        x2, _ = self.cross_attn(x2, memory, memory)
+        x = x + gate_ca.unsqueeze(1) * x2
+        
+        # 3. Feed-forward with AdaLN modulation
+        x2 = self.norm3(x)
+        x2 = self.modulate(x2, shift_ffn, scale_ffn)
+        x2 = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        x = x + gate_ffn.unsqueeze(1) * x2
+        
+        return x
+
+
+class AdaLNRouteHead(nn.Module):
+    """
+    Route prediction head with AdaLN modulation (DiT-style).
+    
+    Key insight: Route prediction strongly depends on target point and other low-dim
+    features in ego_status. By using AdaLN modulation with these features as conditioning,
+    we ensure the route prediction explicitly relies on target point information.
+    
+    Architecture:
+    1. Project ego_status (containing target point) to conditioning embedding
+    2. Learnable route query tokens (one per waypoint)
+    3. Multiple AdaLN transformer blocks:
+       - Self-attention among route queries (with AdaLN)
+       - Cross-attention to encoder memory (with AdaLN)
+       - Feed-forward network (with AdaLN)
+    4. Project to waypoint coordinates
+    
+    This design ensures target point information is directly injected into every layer
+    through AdaLN modulation, preventing it from being diluted by pooling operations.
+    """
+    def __init__(self, n_emb, num_waypoints=20, status_dim=12, n_layers=2, n_head=8, p_drop=0.1):
+        super().__init__()
+        self.num_waypoints = num_waypoints
+        self.n_emb = n_emb
+        self.status_dim = status_dim
+        
+        # Project ego_status (containing target point, command, speed, etc.) to conditioning
+        # ego_status typically contains: speed(1), theta(1), command(6), target_point(2), waypoints(2) = 12
+        self.status_proj = nn.Sequential(
+            nn.Linear(status_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb)
+        )
+        
+        # Learnable route query tokens (one per waypoint)
+        self.route_queries = nn.Parameter(torch.randn(1, num_waypoints, n_emb))
+        
+        # Position embedding for route queries (to encode waypoint order)
+        self.route_pos_emb = nn.Parameter(torch.randn(1, num_waypoints, n_emb))
+        
+        # AdaLN Transformer blocks
+        self.blocks = nn.ModuleList([
+            AdaLNRouteBlock(n_emb, n_head, p_drop)
+            for _ in range(n_layers)
+        ])
+        
+        # Final normalization and output projection
+        self.final_norm = nn.LayerNorm(n_emb)
+        
+        # Final AdaLN modulation before output
+        self.final_adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(n_emb, 2 * n_emb, bias=True)  # shift, scale
+        )
+        
+        self.output_proj = nn.Linear(n_emb, 2)  # Project to (x, y) coordinates
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights, especially zero-init for AdaLN modulation."""
+        # Initialize route queries and position embeddings
+        nn.init.normal_(self.route_queries, mean=0.0, std=0.02)
+        nn.init.normal_(self.route_pos_emb, mean=0.0, std=0.02)
+        
+        # Zero-initialize AdaLN modulation outputs (like DiT)
+        for block in self.blocks:
+            nn.init.zeros_(block.adaLN_modulation[-1].weight)
+            nn.init.zeros_(block.adaLN_modulation[-1].bias)
+        
+        nn.init.zeros_(self.final_adaLN[-1].weight)
+        nn.init.zeros_(self.final_adaLN[-1].bias)
+    
+    def forward(self, memory: torch.Tensor, ego_status: torch.Tensor) -> torch.Tensor:
         """
         Args:
             memory: (B, T_cond, n_emb) - encoder memory output
+            ego_status: (B, [T], status_dim) - ego status containing target point
+                        If 3D (B, T, status_dim), uses the last timestep
         Returns:
             route: (B, num_waypoints, 2) - predicted route waypoints
         """
         B = memory.shape[0]
         
-        # Attention pooling: query attends to memory
-        query = self.pool_query.expand(B, -1, -1)  # (B, 1, n_emb)
-        pooled, _ = self.pool_attn(query, memory, memory)  # (B, 1, n_emb)
-        pooled = pooled.squeeze(1)  # (B, n_emb)
+        # Handle 3D ego_status (use last timestep)
+        if ego_status.dim() == 3:
+            ego_status = ego_status[:, -1, :]  # (B, status_dim)
         
-        # Decode route
-        pooled = self.ln_f(pooled)
-        pooled = self.drop(pooled)
-        route_flat = self.mlp(pooled)  # (B, num_waypoints * 2)
+        # 1. Generate conditioning from ego_status (which contains target point)
+        conditioning = self.status_proj(ego_status)  # (B, n_emb)
         
-        # Reshape to (B, num_waypoints, 2)
-        route = route_flat.view(B, self.num_waypoints, 2)
+        # 2. Initialize route queries with position embedding
+        route_queries = self.route_queries.expand(B, -1, -1) + self.route_pos_emb
+        
+        # 3. Process through AdaLN transformer blocks
+        x = route_queries
+        for block in self.blocks:
+            x = block(x, memory, conditioning)
+        
+        # 4. Final normalization with AdaLN modulation
+        x = self.final_norm(x)
+        final_mod = self.final_adaLN(conditioning)
+        shift, scale = final_mod.chunk(2, dim=1)
+        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        
+        # 5. Project to waypoint coordinates
+        route = self.output_proj(x)  # (B, num_waypoints, 2)
         
         return route
 
@@ -912,8 +1047,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # trajectory head block (with Residual Refinement and Temporal Smoothing)
         self.trajectory_head = TrajectoryRefinementHead(n_emb, output_dim, p_drop_emb)
         
-        # Route prediction head (predicts route waypoints from encoder memory)
-        self.route_head = RouteHead(n_emb, num_waypoints=20, p_drop=p_drop_emb)
+        # Route prediction head with AdaLN modulation (DiT-style)
+        # Uses ego_status (containing target point) as conditioning for better route prediction
+        self.route_head = AdaLNRouteHead(
+            n_emb=n_emb, 
+            num_waypoints=20, 
+            status_dim=status_dim,
+            n_layers=2, 
+            n_head=n_head, 
+            p_drop=p_drop_emb
+        )
         
         # constants
         self.T = T
@@ -957,7 +1100,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             CustomTransformerDecoder,
             TrajectoryHead,
             TrajectoryRefinementHead,
-            RouteHead,
+            AdaLNRouteBlock,
+            AdaLNRouteHead,
             nn.ModuleList
         )  #
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -1070,6 +1214,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
             elif 'vl_pool_query' in name or 'cond_pos_emb' in name:
                 no_decay.add(name)
             elif 'hist_pos_emb' in name or 'segment_emb' in name:
+                no_decay.add(name)
+            elif 'pool_query' in name or 'route_queries' in name:
+                # Route head learnable queries should not be decayed
                 no_decay.add(name)
 
         # validate that we considered every parameter
@@ -1390,7 +1537,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             tgt_mask=tgt_mask,
             vl_key_padding_mask=vl_padding_mask,
             reasoning_key_padding_mask=reasoning_padding_mask,
-            conditioning=conditioning  # 传递 conditioning
+            conditioning=conditioning
         )        
         
         # 7. trajectory head 
@@ -1402,14 +1549,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if hist_features is not None:
             x = x[:, -t:, :]
         
-        # 8. Route prediction from encoder memory (optional auxiliary task)
-        # Route prediction is independent of diffusion timestep
-        predict_route = kwargs.get('predict_route', False)
-        if predict_route:
-            route_pred = self.route_head(memory)  # (B, num_waypoints, 2)
-            return x, route_pred
+        # 8. Route prediction from encoder memory with AdaLN modulation
+        # Route prediction uses ego_status (containing target point) as conditioning
+        # This ensures route strongly depends on target point through AdaLN modulation
+        route_pred = self.route_head(memory, ego_status)  # (B, num_waypoints, 2)
             
-        return x
+        return x, route_pred
 
 
 
@@ -1433,59 +1578,49 @@ def test():
     sample = torch.zeros((4,8,2)) # Changed to 2
     cond = torch.zeros((4,4,10))
     vl_embeds = torch.ones((4,36,1536))
+    reasoning_tokens = torch.ones((4, 10, 1536))  # Add reasoning tokens
     
-    # Test 1: Without ego_status_history (backward compatibility)
-    print("Test 1: Without ego_status_history")
-    out = transformer(sample, timestep, cond, vl_embeds)
-    print(f"Output shape: {out.shape}")
+    # Test 1: Basic forward pass (now always returns trajectory and route)
+    print("Test 1: Basic forward pass")
+    ego_status_3d = torch.randn((4, 4, 13))  # (B, To, status_dim=13)
+    out, route_pred = transformer(sample, timestep, cond, vl_embeds, 
+                                  reasoning_query_tokens=reasoning_tokens,
+                                  ego_status=ego_status_3d)
+    print(f"Trajectory output shape: {out.shape}")
+    print(f"Route prediction shape: {route_pred.shape}")
     
-    # Test 2: With ego_status (AdaLN modulation)
-    print("\nTest 2: With ego_status (AdaLN modulation)")
-    ego_status = torch.randn((4, 13))  # (B, status_dim=13) - 2D for simple modulation
-    out_with_status = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status)
-    print(f"Output shape with status: {out_with_status.shape}")
+    # Test 2: With different ego_status (AdaLN modulation)
+    print("\nTest 2: Verify AdaLN modulation effect")
+    ego_status_diff = torch.randn((4, 4, 13))  # Different ego status
+    out_with_diff_status, route_diff_status = transformer(sample, timestep, cond, vl_embeds, 
+                                                          reasoning_query_tokens=reasoning_tokens,
+                                                          ego_status=ego_status_diff)
+    print(f"Output shape with different status: {out_with_diff_status.shape}")
     
-    # Test 3: Verify outputs are different with/without status
+    # Test 3: Verify outputs are different with different status
     print("\nTest 3: Verify modulation effect")
-    diff = torch.abs(out - out_with_status).mean()
+    diff = torch.abs(out - out_with_diff_status).mean()
     print(f"Mean difference between outputs: {diff:.6f}")
     if diff > 0:
         print("✓ AdaLN modulation is working!")
     else:
         print("⚠ Warning: Outputs are identical (modulation may not be working)")
 
-    # Test 4: With 3D ego_status (History concatenation + AdaLN)
-    print("\nTest 4: With 3D ego_status (History concatenation)")
-    # ego_status with history: (B, To=4, status_dim=13)
-    ego_status_3d = torch.randn((4, 4, 13)) 
-    out_with_hist = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status_3d)
-    print(f"Output shape with history: {out_with_hist.shape}")
-    
-    diff_hist = torch.abs(out_with_status - out_with_hist).mean()
-    print(f"Mean difference between 2D and 3D status: {diff_hist:.6f}")
-    if diff_hist > 0:
-        print("✓ History concatenation is affecting output!")
-    
-    # Test 5: Verify GRU Continuity and Conditioning
-    print("\nTest 5: Verify GRU Continuity and Conditioning")
-    # We expect the output to change slightly because of GRU initialization with conditioning
-    # and because the GRU now sees the history sequence.
-    
-    # Run with same inputs as Test 4 but check if output is different from what we would expect 
-    # if we sliced BEFORE the head (which we can't easily simulate without changing code back, 
-    # but we can check if conditioning affects output).
-    
+    # Test 4: Verify GRU Continuity and Conditioning
+    print("\nTest 4: Verify GRU Continuity and Conditioning")
     # Run with different conditioning (different timestep)
     timestep2 = torch.tensor(10)
-    out_diff_time = transformer(sample, timestep2, cond, vl_embeds, ego_status=ego_status_3d)
+    out_diff_time, _ = transformer(sample, timestep2, cond, vl_embeds, 
+                                   reasoning_query_tokens=reasoning_tokens,
+                                   ego_status=ego_status_3d)
     
-    diff_time = torch.abs(out_with_hist - out_diff_time).mean()
+    diff_time = torch.abs(out - out_diff_time).mean()
     print(f"Mean difference with different timestep (Global Context Injection): {diff_time:.6f}")
     if diff_time > 0:
         print("✓ Global Context Injection (Conditioning) is working!")
 
-    # Test 6: Verify Global History Modulation
-    print("\nTest 6: Verify Global History Modulation")
+    # Test 5: Verify Global History Modulation
+    print("\nTest 5: Verify Global History Modulation")
     # We check if changing the history (but keeping current status same) affects the output
     # via the modulation pathway.
     
@@ -1496,42 +1631,38 @@ def test():
     ego_status_B[:, :3, :] = torch.randn((4, 3, 13))
     
     # Run model
-    out_A = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status_A)
-    out_B = transformer(sample, timestep, cond, vl_embeds, ego_status=ego_status_B)
+    out_A, _ = transformer(sample, timestep, cond, vl_embeds, 
+                           reasoning_query_tokens=reasoning_tokens,
+                           ego_status=ego_status_A)
+    out_B, _ = transformer(sample, timestep, cond, vl_embeds, 
+                           reasoning_query_tokens=reasoning_tokens,
+                           ego_status=ego_status_B)
     
     diff_hist_mod = torch.abs(out_A - out_B).mean()
     print(f"Mean difference with different history (same current): {diff_hist_mod:.6f}")
     if diff_hist_mod > 0:
         print("✓ Global History Modulation is working!")
 
-    # Test 7: Verify Reasoning Tokens Integration
-    print("\nTest 7: Verify Reasoning Tokens Integration")
-    reasoning_tokens = torch.randn((4, 10, 1536)) # (B, seq_len, dim)
+    # Test 6: Verify AdaLN Route Head sensitivity to target point
+    print("\nTest 6: Verify AdaLN Route Head")
+    # Verify route prediction depends on target point (part of ego_status)
+    ego_status_diff_target = ego_status_3d.clone()
+    # Modify target_point in ego_status (assuming target_point is at index 8:10 based on data structure)
+    # ego_status: speed(1), theta(1), command(6), target_point(2), waypoints(2)
+    ego_status_diff_target[:, :, 8:10] = torch.randn((4, 4, 2)) * 10  # Large change in target point
     
-    # Initialize with reasoning dim
-    transformer_reasoning = TransformerForDiffusion(
-        input_dim=2,
-        output_dim=2,
-        horizon=8,
-        n_obs_steps=4,
-        cond_dim=10,
-        causal_attn=True,
-        n_cond_layers=4,
-        vl_emb_dim=1536,
-        reasoning_emb_dim=1536, # Enable reasoning
-        status_dim=13,
-        ego_status_seq_len=4
+    _, route_pred_diff = transformer(
+        sample, timestep, cond, vl_embeds, 
+        reasoning_query_tokens=reasoning_tokens, 
+        ego_status=ego_status_diff_target
     )
     
-    out_no_reasoning = transformer_reasoning(sample, timestep, cond, vl_embeds, ego_status=ego_status_3d)
-    out_with_reasoning = transformer_reasoning(sample, timestep, cond, vl_embeds, 
-                                             reasoning_query_tokens=reasoning_tokens, 
-                                             ego_status=ego_status_3d)
-    
-    diff_reasoning = torch.abs(out_no_reasoning - out_with_reasoning).mean()
-    print(f"Mean difference with reasoning tokens: {diff_reasoning:.6f}")
-    if diff_reasoning > 0:
-        print("✓ Reasoning Tokens Integration is working!")
+    route_diff = torch.abs(route_pred - route_pred_diff).mean()
+    print(f"Route prediction difference with different target point: {route_diff:.6f}")
+    if route_diff > 0:
+        print("✓ AdaLN Route Head is sensitive to target point changes!")
+    else:
+        print("⚠ Warning: Route prediction not affected by target point")
 
     print("\n✓ All tests passed!")
 
