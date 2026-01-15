@@ -35,6 +35,7 @@ sys.path = [str(p) for p in sys.path]
 from leaderboard.autoagents import autonomous_agent
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from team_code.simlingo.nav_planner import RoutePlanner, LateralPIDController  
+from agents.navigation.local_planner import RoadOption
 import team_code.simlingo.transfuser_utils as t_u  
 from team_code.render import render, render_self_car, render_waypoints
 from dataset.generate_lidar_bev_b2d import generate_lidar_bev_images
@@ -587,7 +588,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
     	)
 		print("✓ MoT model loaded.")
 
-		self.turn_controller = LateralPIDController(inference_mode=True)  # Set inference_mode=True for model predictions
+		# route_pred有20个稀疏点(~20m, 1m间距)，插值后约200点(0.1m间距)
+		# inference_mode=False: lookahead范围24-105个点，对应2.4m-10.5m前方
+		self.turn_controller = LateralPIDController(inference_mode=False)
 		self.speed_controller = t_u.PIDController(k_p=1.75, k_i=1.0, k_d=2.0, n=20)  
 		
 		# Control config 
@@ -680,6 +683,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.throttle_history = deque(maxlen=obs_horizon*10)
 		self.next_command_history = deque(maxlen=obs_horizon*10)
 		self.target_point_history = deque(maxlen=obs_horizon*10)
+		self.next_target_point_history = deque(maxlen=obs_horizon*10)  # For DP model input
 		self.waypoint_history = deque(maxlen=obs_horizon*10)
 		self.throttle_history = deque(maxlen=obs_horizon*10) 
 		self.brake_history = deque(maxlen=obs_horizon*10) 
@@ -759,19 +763,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.metric_info = {}
 		self._hic = DisplayInterface()
 
-	def _build_obs_dict(self, tick_data, lidar, rgb_front, speed, theta, target_point, cmd_one_hot, waypoint):
+	def _build_obs_dict(self, tick_data, lidar, rgb_front, speed, theta, target_point, next_target_point, cmd_one_hot, waypoint):
 		"""
 		Build observation dictionaries from historical data.
 		
+		Args:
+			target_point: Used for MOT model history (kept for compatibility)
+			next_target_point: Used for DP model input in ego_status_stacked
+		
 		Returns:
 			lidar_stacked: (1, obs_horizon, C, H, W) stacked lidar BEV images
-			ego_status_stacked: (1, obs_horizon, 14) concatenated ego status features
+			ego_status_stacked: (1, obs_horizon, 14) concatenated ego status features (uses next_target_point)
 			rgb_stacked: (1, 5, C, H, W) stacked RGB images
 		"""
 		# Build obs_dict from historical observations
 		lidar_history_list = list(self.lidar_bev_history)
 		speed_history_list = list(self.speed_history)
 		target_point_history_list = list(self.target_point_history)
+		next_target_point_history_list = list(self.next_target_point_history)  # For DP model input
 		cmd_history_list = list(self.next_command_history)
 		theta_history_list = list(self.theta_history)
 		throttle_history_list = list(self.throttle_history)
@@ -782,6 +791,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		lidar_list = [lidar_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(lidar_history_list)]
 		speed_list = [speed_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(speed_history_list)]
 		target_point_list = [target_point_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(target_point_history_list)]
+		next_target_point_list = [next_target_point_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(next_target_point_history_list)]  # For DP model input
 		cmd_list = [cmd_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(cmd_history_list)]
 		theta_list = [theta_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(theta_history_list)]
 		throttle_list = [throttle_history_list[-1 - i*10] for i in range(self.obs_horizon) if -1 - i*10 >= -len(throttle_history_list)]
@@ -792,6 +802,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		lidar_list = lidar_list[::-1]
 		speed_list = speed_list[::-1]
 		target_point_list = target_point_list[::-1]
+		next_target_point_list = next_target_point_list[::-1]  # For DP model input
 		cmd_list = cmd_list[::-1]
 		theta_list = theta_list[::-1]
 		throttle_list = throttle_list[::-1]
@@ -838,11 +849,12 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		waypoint_relative_stacked = torch.stack(waypoint_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
-		target_point_transformed_list = []
+		# Use next_target_point for DP model input (transformed to current ego frame)
+		next_target_point_transformed_list = []
 		for i in range(self.obs_horizon):
 			past_world_pos = waypoint_list[i].cpu().numpy()  # [x, y] in world coordinates
 			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame (already preprocessed)
-			target_in_past_ego = target_point_list[i].squeeze().cpu().numpy()  # [x, y] in past ego frame
+			next_target_in_past_ego = next_target_point_list[i].squeeze().cpu().numpy()  # [x, y] in past ego frame (next_target_point for DP)
 			
 			# Build past ego-to-world rotation matrix
 			cos_past = np.cos(past_theta)
@@ -852,25 +864,26 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				[sin_past, cos_past]
 			])  # This is R, for ego-to-world transformation
 			
-			# Step 1: Transform target point from past ego frame to world frame
-			target_world = past_R_ego_to_world @ target_in_past_ego + past_world_pos
+			# Step 1: Transform next_target_point from past ego frame to world frame
+			next_target_world = past_R_ego_to_world @ next_target_in_past_ego + past_world_pos
 			
 			# Step 2: Transform from world frame to current ego frame
-			target_in_current_ego = current_R @ (target_world - current_pos)
+			next_target_in_current_ego = current_R @ (next_target_world - current_pos)
 			
-			target_point_transformed_list.append(torch.from_numpy(target_in_current_ego).float().to('cuda'))
+			next_target_point_transformed_list.append(torch.from_numpy(next_target_in_current_ego).float().to('cuda'))
 		
-		target_point_transformed_stacked = torch.stack(target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		next_target_point_transformed_stacked = torch.stack(next_target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
 		
-		# Concatenate all ego status features: speed + theta + cmd + target_point + waypoint_relative
-		# ego_status_stacked: (1, obs_horizon, 1+1+1+1+6+2+2) = (1, obs_horizon, 14)
+		# Concatenate all ego status features: speed + theta + cmd + next_target_point + waypoint_relative
+		# ego_status_stacked: (1, obs_horizon, 1+1+6+2+2) = (1, obs_horizon, 12)
+		# Note: DP model uses next_target_point while MOT model uses target_point
 		ego_status_stacked = torch.cat([
-			speed_stacked,                        # (1, obs_horizon, 1)
-			theta_stacked,                        # (1, obs_horizon, 1)
-			cmd_stacked,                          # (1, obs_horizon, 6)
-			target_point_transformed_stacked,     # (1, obs_horizon, 2) - target points transformed to current ego frame
-			waypoint_relative_stacked             # (1, obs_horizon, 2) - ego positions in current frame
+			speed_stacked,                            # (1, obs_horizon, 1)
+			theta_stacked,                            # (1, obs_horizon, 1)
+			cmd_stacked,                              # (1, obs_horizon, 6)
+			next_target_point_transformed_stacked,    # (1, obs_horizon, 2) - next_target_points transformed to current ego frame (for DP)
+			waypoint_relative_stacked                 # (1, obs_horizon, 2) - ego positions in current frame
 		], dim=-1)  # Concatenate along feature dimension
 		
 		return lidar_stacked, ego_status_stacked, rgb_stacked
@@ -1026,9 +1039,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		elif len(waypoint_route) > 1:
 			target_point, far_command = waypoint_route[1]
 			next_target_point, next_far_command = waypoint_route[1]
-		else:
+		elif len(waypoint_route) > 0:
 			target_point, far_command = waypoint_route[0]
 			next_target_point, next_far_command = waypoint_route[0]
+		else:
+			# waypoint_route 为空的极端情况，使用当前位置
+			target_point, far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
+			next_target_point, next_far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
 
 		if self.last_command_tmp != far_command:
 			self.last_command = self.last_command_tmp
@@ -1093,6 +1110,21 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 
 		route_interp = self.interpolate_waypoints(route_waypoints_np)
+		
+		# 低速时增加前视距离：跳过路径开头的直线部分
+		# route_pred 的特点是 直行-转弯-直行，开头一小段没有曲率
+		# 低速时跳过开头的点，让控制器看到更远处的转弯点
+		low_speed_threshold = 5.0  # m/s，低于此速度时增加前视
+		skip_distance = 0.0  # 默认不跳过
+		if speed < low_speed_threshold and len(route_interp) > 30:
+			# 低速时跳过开头的直线段，跳过距离与速度成反比
+			# 速度越低，跳过越多（最多跳过2m = 20个点，因为0.1m间隔）
+			skip_ratio = 1.0 - (speed / low_speed_threshold)  # 0~1
+			max_skip_points = 20  # 最多跳过2m
+			skip_points = int(skip_ratio * max_skip_points)
+			skip_points = min(skip_points, len(route_interp) - 20)  # 确保剩余足够的点
+			if skip_points > 0:
+				route_interp = route_interp[skip_points:]
 		
 		steer = self.turn_controller.step(route_interp, speed)
 		steer = np.clip(steer, -1.0, 1.0)
@@ -1166,6 +1198,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.rgb_history.append(rgb_front)
 		self.speed_history.append(speed)
 		self.target_point_history.append(target_point)
+		self.next_target_point_history.append(next_target_point)  # For DP model input
 		self.next_command_history.append(cmd_one_hot)
 		self.theta_history.append(theta)
 		self.waypoint_history.append(waypoint)
@@ -1192,8 +1225,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['step'] = self.step
 		else:
 			# Build observation dict
+			# Note: target_point is for MOT model (kept for compatibility), next_target_point is used for DP model in ego_status_stacked
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
-				tick_data, lidar, rgb_front, speed, theta, target_point, 
+				tick_data, lidar, rgb_front, speed, theta, target_point, next_target_point,
 				cmd_one_hot, waypoint
 			)
 			
@@ -1254,45 +1288,52 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
                     'reasoning_query_tokens': reason_feat[:7],
                     'anchor': predicted_answer['traj']  # Pass anchor for truncated diffusion
                 }
-			dp_pred_traj = self.net.predict_action(dp_obs_dict)
-			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
-			print("dp_pred_traj:", dp_pred_traj)
+			# dp_pred_traj = self.net.predict_action(dp_obs_dict)
+			# self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
+			# print("dp_pred_traj:", dp_pred_traj)
 
 			# ================== control_pid method ==================
 			# Following agent_simlingo convention:
-			# - speed_waypoints: 'action' - used for speed control (throttle/brake)
-			# - route_waypoints: 'route_pred' - used for lateral angle control (steering)
-			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float()  # (1, 6, 2) for speed control
+			# - speed_waypoints: use pred_traj from MoT model for speed control (throttle/brake)
+			# - route_waypoints: use 'route_pred' from DP model for lateral angle control (steering)
+			speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
+			
+			# Get DP prediction for route_pred
+			dp_pred_traj = self.net.predict_action(dp_obs_dict)
+			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			
 			# route_pred is 20 waypoints with equal intervals for lateral control
-			if 'route_pred' in dp_pred_traj and dp_pred_traj['route_pred'] is not None:
-				route_pred = dp_pred_traj['route_pred']  # tensor (B, 20, 2)
-				if isinstance(route_pred, torch.Tensor):
-					route_waypoints = route_pred.float().cpu()  # (1, 20, 2) for steering control
-				else:
-					route_waypoints = torch.from_numpy(route_pred).float()
-				self.last_route_pred = route_waypoints.squeeze(0).numpy().copy()  # (20, 2) for visualization
+			route_pred = dp_pred_traj['route_pred']  # tensor (B, 20, 2)
+			if isinstance(route_pred, torch.Tensor):
+				route_waypoints = route_pred.float().cpu()  # (1, 20, 2) for steering control
 			else:
-				# Fallback: use action if route_pred not available
-				route_waypoints = speed_waypoints.clone()
-				self.last_route_pred = None
+				route_waypoints = torch.from_numpy(route_pred).float()
+			self.last_route_pred = route_waypoints.squeeze(0).numpy().copy()  # (20, 2) for visualization
+
 			
 			gt_velocity = tick_data['speed']
 			
 			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints)
 			
-			# Restart mechanism in case the car got stuck 
+			# Restart mechanism in case the car got stuck (following simlingo logic)
+			# 0.1 is just an arbitrary low number to threshold when the car is stopped
 			if gt_velocity < 0.1:
-				if self.stuck_detector > self.stuck_threshold:
-					self.stuck_helper += 1
 				self.stuck_detector += 1
 			
-			if self.stuck_helper > self.stuck_helper_threshold or gt_velocity > 3.0:
-					self.stuck_helper = 0
-					self.stuck_detector = 0
+			elif gt_velocity >= 1.0:
+				self.stuck_detector = 0
 			
+			# If stuck for too long, trigger force_move
+			if self.stuck_detector > self.stuck_threshold:
+				self.force_move = self.creep_duration
+			
+			# Force move: override throttle and brake to get unstuck
+			if self.force_move > 0:
+				throttle = max(self.creep_throttle, throttle)
+				brake = False
+				self.force_move -= 1
+				print(f"force_move: {self.force_move}")
 
-			print(f"stuck_helper: {self.stuck_helper}")
 			print(f"stuck_detector: {self.stuck_detector}")
 
 			
@@ -1702,4 +1743,3 @@ def residual_measurement_h(a, b):
 	y = a - b
 	y[2] = t_u.normalize_angle(y[2])
 	return y
-
