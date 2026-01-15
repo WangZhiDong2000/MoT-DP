@@ -439,6 +439,89 @@ def attach_debugger():
     debugpy.wait_for_client()
     print("Attached!")
 
+
+def select_dp_target_point(target_point, next_target_point, lateral_threshold_turn=3.0, lateral_threshold_straight=1.0):
+    """
+    Select the appropriate target point for DP model input based on path geometry.
+    
+    The key insight is:
+    1. Straight driving: target_point and next_target_point are roughly collinear with ego
+       -> Use next_target_point (farther) for better planning horizon
+    2. Intersection turning: Large lateral offset indicates a turn
+       -> Use target_point (closer) to prevent cutting corners early
+    3. Curved roads: Intermediate case
+       -> Use weighted interpolation based on lateral deviation
+    
+    The lateral deviation is computed as the perpendicular distance from next_target_point
+    to the line from ego (origin) to target_point.
+    
+    Args:
+        target_point: numpy array (2,) in ego frame [x_forward, y_left], closer waypoint
+        next_target_point: numpy array (2,) in ego frame [x_forward, y_left], farther waypoint
+        lateral_threshold_turn: float, lateral deviation threshold for intersection turn (meters)
+        lateral_threshold_straight: float, lateral deviation threshold for straight driving (meters)
+    
+    Returns:
+        selected_target_point: numpy array (2,) the selected target point for DP
+        selection_type: str, one of 'straight', 'turn', 'curve' for debugging
+    """
+    # Convert to numpy if needed
+    if isinstance(target_point, torch.Tensor):
+        target_point = target_point.detach().cpu().numpy().squeeze()
+    if isinstance(next_target_point, torch.Tensor):
+        next_target_point = next_target_point.detach().cpu().numpy().squeeze()
+    
+    # Ego is at origin (0, 0)
+    ego = np.array([0.0, 0.0])
+    
+    # Vector from ego to target_point
+    v_ego_to_tp = target_point - ego  # direction to first waypoint
+    tp_dist = np.linalg.norm(v_ego_to_tp)
+    
+    if tp_dist < 1e-6:
+        # target_point is at ego position, use next_target_point
+        return next_target_point.copy(), 'straight'
+    
+    # Unit vector in the direction of target_point
+    v_unit = v_ego_to_tp / tp_dist
+    
+    # Vector from ego to next_target_point
+    v_ego_to_ntp = next_target_point - ego
+    
+    # Project next_target_point onto the line from ego to target_point
+    # Longitudinal component (along the path direction)
+    longitudinal = np.dot(v_ego_to_ntp, v_unit)
+    
+    # Lateral component (perpendicular to the path direction)
+    # This is the signed distance: positive = left of path, negative = right of path
+    # For detecting turns, we care about absolute value
+    lateral = v_ego_to_ntp - longitudinal * v_unit
+    lateral_deviation = np.linalg.norm(lateral)
+    
+    # Decision logic based on lateral deviation
+    if lateral_deviation < lateral_threshold_straight:
+        # Small lateral deviation: straight driving
+        # Use next_target_point for farther planning horizon
+        selected_point = next_target_point.copy()
+        selection_type = 'straight'
+    elif lateral_deviation > lateral_threshold_turn:
+        # Large lateral deviation: intersection turn
+        # Use target_point to prevent cutting corners
+        selected_point = target_point.copy()
+        selection_type = 'turn'
+    else:
+        # Intermediate: curved road
+        # Smooth interpolation based on lateral deviation
+        # When lateral_deviation = lateral_threshold_straight, alpha = 1 (use next_target_point)
+        # When lateral_deviation = lateral_threshold_turn, alpha = 0 (use target_point)
+        alpha = (lateral_threshold_turn - lateral_deviation) / (lateral_threshold_turn - lateral_threshold_straight)
+        alpha = np.clip(alpha, 0.0, 1.0)
+        selected_point = alpha * next_target_point + (1 - alpha) * target_point
+        selection_type = 'curve'
+    
+    return selected_point, selection_type
+
+
 def build_cleaned_prompt_and_modes(target_point_speed):
 
     if isinstance(target_point_speed, torch.Tensor):
@@ -1188,17 +1271,32 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_front = rgb_front.to('cuda', dtype=torch.float32)
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
 		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
-		next_target_point = torch.from_numpy(tick_data['next_target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
-		# tg = tick_data['target_point']
-		# tg[1] = 0.05
-		# target_point = torch.from_numpy(tg).unsqueeze(0).float().to('cuda', dtype=torch.float32)
+		next_target_point_raw = torch.from_numpy(tick_data['next_target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
+		
+		# Select appropriate target point for DP model based on path geometry
+		# This handles: straight driving (use next_target_point), intersection turns (use target_point),
+		# and curved roads (smooth interpolation)
+		dp_target_point_np, selection_type = select_dp_target_point(
+			tick_data['target_point'], 
+			tick_data['next_target_point'],
+			lateral_threshold_turn=3.0,    # Large lateral offset = intersection turn
+			lateral_threshold_straight=1.0  # Small lateral offset = straight road
+		)
+		dp_target_point = torch.from_numpy(dp_target_point_np).unsqueeze(0).float().to('cuda', dtype=torch.float32)
+		
+		# For debugging: print selection info occasionally
+		if self.step % 20 == 0:
+			print(f"[DP Target Selection] type={selection_type}, "
+				  f"target_point={tick_data['target_point']}, "
+				  f"next_target_point={tick_data['next_target_point']}, "
+				  f"selected={dp_target_point_np}")
 
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
 		self.rgb_history.append(rgb_front)
 		self.speed_history.append(speed)
 		self.target_point_history.append(target_point)
-		self.next_target_point_history.append(next_target_point)  # For DP model input
+		self.next_target_point_history.append(dp_target_point)  # For DP model input (selected based on path geometry)
 		self.next_command_history.append(cmd_one_hot)
 		self.theta_history.append(theta)
 		self.waypoint_history.append(waypoint)
@@ -1225,9 +1323,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['step'] = self.step
 		else:
 			# Build observation dict
-			# Note: target_point is for MOT model (kept for compatibility), next_target_point is used for DP model in ego_status_stacked
+			# Note: target_point is for MOT model (kept for compatibility), dp_target_point is used for DP model in ego_status_stacked
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
-				tick_data, lidar, rgb_front, speed, theta, target_point, next_target_point,
+				tick_data, lidar, rgb_front, speed, theta, target_point, dp_target_point,
 				cmd_one_hot, waypoint
 			)
 			
@@ -1245,7 +1343,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			lidar_pil_list = [lidar_pil]  
 			
 			if self.stuck_helper > 0:
-				target_point_speed=torch.cat([speed, next_target_point], dim=-1)
+				# When stuck, always use next_target_point (farther) to help get unstuck
+				target_point_speed=torch.cat([speed, next_target_point_raw], dim=-1)
 				print("Get stucked! Trigger the stuck helper!")
 			else:
 				target_point_speed=torch.cat([speed, target_point], dim=-1)  # (1, 3)
@@ -1288,7 +1387,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
                     'reasoning_query_tokens': reason_feat[:7],
                     'anchor': predicted_answer['traj']  # Pass anchor for truncated diffusion
                 }
-			# dp_pred_traj = self.net.predict_action(dp_obs_dict)
+			dp_pred_traj = self.net.predict_action(dp_obs_dict)
 			# self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			# print("dp_pred_traj:", dp_pred_traj)
 
@@ -1296,10 +1395,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Following agent_simlingo convention:
 			# - speed_waypoints: use pred_traj from MoT model for speed control (throttle/brake)
 			# - route_waypoints: use 'route_pred' from DP model for lateral angle control (steering)
-			speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
-			
+			# speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
+			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() 
 			# Get DP prediction for route_pred
-			dp_pred_traj = self.net.predict_action(dp_obs_dict)
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			
 			# route_pred is 20 waypoints with equal intervals for lateral control
