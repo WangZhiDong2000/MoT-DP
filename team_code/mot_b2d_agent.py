@@ -440,30 +440,46 @@ def attach_debugger():
     print("Attached!")
 
 
-def select_dp_target_point(target_point, next_target_point, lateral_threshold_turn=3.0, lateral_threshold_straight=1.0):
+def select_dp_target_point(target_point, next_target_point, 
+                           lateral_threshold_turn=3.0, 
+                           lateral_threshold_straight=1.0,
+                           angle_threshold_turn=30.0,      # degrees
+                           angle_threshold_straight=10.0): # degrees
     """
     Select the appropriate target point for DP model input based on path geometry.
     
-    The key insight is:
-    1. Straight driving: target_point and next_target_point are roughly collinear with ego
-       -> Use next_target_point (farther) for better planning horizon
-    2. Intersection turning: Large lateral offset indicates a turn
-       -> Use target_point (closer) to prevent cutting corners early
-    3. Curved roads: Intermediate case
-       -> Use weighted interpolation based on lateral deviation
+    The decision is based on multiple factors:
+    1. Ego-to-TP alignment: How aligned is the ego vehicle's forward direction with target_point?
+       - Large lateral offset of TP from ego's forward axis means ego needs to turn first
+       - Example: On-ramp merging - ego is still on ramp, needs to turn into main road
     
-    The lateral deviation is computed as the perpendicular distance from next_target_point
-    to the line from ego (origin) to target_point.
+    2. TP-to-NTP alignment: How aligned is the path from target_point to next_target_point?
+       - Large angle change indicates intersection turn or sharp curve
+       - Example: T-junction - need to turn at the intersection
+    
+    3. Navigation jitter detection: If TP and NTP have opposite lateral offsets (one left, one right),
+       this may indicate the planner incorrectly routed to another lane and back.
+       - Example: Straight road but TP is right of ego, NTP is left of TP
+       - In this case, use NTP as it better represents the actual straight path
+    
+    Decision logic:
+    - If navigation jitter detected (opposite lateral directions): use NTP
+    - If ego needs significant turning to reach TP (large ego-to-TP lateral offset): use TP
+    - If path turns sharply from TP to NTP (large angle change): use TP  
+    - If both segments are relatively straight: use NTP for better horizon
+    - Intermediate cases: use weighted interpolation
     
     Args:
         target_point: numpy array (2,) in ego frame [x_forward, y_left], closer waypoint
         next_target_point: numpy array (2,) in ego frame [x_forward, y_left], farther waypoint
-        lateral_threshold_turn: float, lateral deviation threshold for intersection turn (meters)
-        lateral_threshold_straight: float, lateral deviation threshold for straight driving (meters)
+        lateral_threshold_turn: float, lateral deviation threshold for turn detection (meters)
+        lateral_threshold_straight: float, lateral deviation threshold for straight detection (meters)
+        angle_threshold_turn: float, angle change threshold for turn detection (degrees)
+        angle_threshold_straight: float, angle change threshold for straight detection (degrees)
     
     Returns:
         selected_target_point: numpy array (2,) the selected target point for DP
-        selection_type: str, one of 'straight', 'turn', 'curve' for debugging
+        selection_type: str, one of 'straight', 'turn', 'curve', 'ramp', 'nav_jitter' for debugging
     """
     # Convert to numpy if needed
     if isinstance(target_point, torch.Tensor):
@@ -471,53 +487,135 @@ def select_dp_target_point(target_point, next_target_point, lateral_threshold_tu
     if isinstance(next_target_point, torch.Tensor):
         next_target_point = next_target_point.detach().cpu().numpy().squeeze()
     
-    # Ego is at origin (0, 0)
+    # Ego is at origin (0, 0), facing forward along x-axis (ego frame convention)
     ego = np.array([0.0, 0.0])
+    ego_forward = np.array([1.0, 0.0])  # Ego's forward direction in ego frame
     
-    # Vector from ego to target_point
-    v_ego_to_tp = target_point - ego  # direction to first waypoint
+    # ==================== Factor 0: Navigation Jitter Detection ====================
+    # Check if TP and the vector from TP to NTP have opposite lateral directions
+    # This indicates the planner may have incorrectly routed to another lane and back
+    # 
+    # Example: Straight road, but planner puts TP in right lane, NTP back in ego's lane
+    #   - target_point[1] < 0 (TP is to the right of ego)
+    #   - (next_target_point[1] - target_point[1]) > 0 (NTP is to the left of TP)
+    #   - This is navigation jitter, should use NTP
+    
+    tp_lateral = target_point[1]  # Signed lateral offset of TP (positive = left, negative = right)
+    tp_to_ntp_lateral = next_target_point[1] - target_point[1]  # Signed lateral change from TP to NTP
+    
+    # Check for opposite directions (one positive, one negative) and both significant
+    lateral_jitter_threshold = 0.5  # Minimum lateral offset to consider as jitter (meters)
+    
+    is_navigation_jitter = (
+        # TP and TP->NTP have opposite lateral directions
+        (tp_lateral * tp_to_ntp_lateral < 0) and
+        # Both offsets are significant (not just noise)
+        (abs(tp_lateral) > lateral_jitter_threshold) and
+        (abs(tp_to_ntp_lateral) > lateral_jitter_threshold) and
+        # NTP is closer to ego's forward axis than TP (the path is "correcting" back)
+        (abs(next_target_point[1]) < abs(target_point[1]))
+    )
+    
+    if is_navigation_jitter:
+        # Navigation jitter detected - the path goes away and comes back
+        # Use next_target_point as it represents the actual intended path
+        return next_target_point.copy(), 'nav_jitter'
+    
+    # ==================== Factor 1: Ego-to-TP alignment ====================
+    # Check how much the ego needs to turn to face target_point
+    v_ego_to_tp = target_point - ego
     tp_dist = np.linalg.norm(v_ego_to_tp)
     
     if tp_dist < 1e-6:
         # target_point is at ego position, use next_target_point
         return next_target_point.copy(), 'straight'
     
-    # Unit vector in the direction of target_point
-    v_unit = v_ego_to_tp / tp_dist
+    # Lateral offset of target_point from ego's forward axis
+    # In ego frame: x is forward, y is left
+    # So the lateral offset is simply the y-component of target_point
+    ego_to_tp_lateral = abs(target_point[1])  # Absolute lateral offset
     
-    # Vector from ego to next_target_point
-    v_ego_to_ntp = next_target_point - ego
+    # Angle between ego forward and direction to target_point
+    v_ego_to_tp_unit = v_ego_to_tp / tp_dist
+    cos_angle_ego_tp = np.clip(np.dot(ego_forward, v_ego_to_tp_unit), -1.0, 1.0)
+    angle_ego_to_tp = np.rad2deg(np.arccos(cos_angle_ego_tp))  # degrees
     
-    # Project next_target_point onto the line from ego to target_point
-    # Longitudinal component (along the path direction)
-    longitudinal = np.dot(v_ego_to_ntp, v_unit)
+    # ==================== Factor 2: TP-to-NTP alignment ====================
+    # Check the angle change from ego->TP direction to TP->NTP direction
+    v_tp_to_ntp = next_target_point - target_point
+    ntp_dist = np.linalg.norm(v_tp_to_ntp)
     
-    # Lateral component (perpendicular to the path direction)
-    # This is the signed distance: positive = left of path, negative = right of path
-    # For detecting turns, we care about absolute value
-    lateral = v_ego_to_ntp - longitudinal * v_unit
-    lateral_deviation = np.linalg.norm(lateral)
+    if ntp_dist < 1e-6:
+        # next_target_point is same as target_point
+        return target_point.copy(), 'straight'
     
-    # Decision logic based on lateral deviation
-    if lateral_deviation < lateral_threshold_straight:
-        # Small lateral deviation: straight driving
-        # Use next_target_point for farther planning horizon
+    v_tp_to_ntp_unit = v_tp_to_ntp / ntp_dist
+    
+    # Angle between (ego->TP) and (TP->NTP) directions
+    cos_angle_turn = np.clip(np.dot(v_ego_to_tp_unit, v_tp_to_ntp_unit), -1.0, 1.0)
+    angle_tp_to_ntp = np.rad2deg(np.arccos(cos_angle_turn))  # degrees
+    
+    # Also compute lateral deviation of NTP from the ego->TP line (original method)
+    longitudinal = np.dot(next_target_point - ego, v_ego_to_tp_unit)
+    lateral_vec = (next_target_point - ego) - longitudinal * v_ego_to_tp_unit
+    lateral_deviation_ntp = np.linalg.norm(lateral_vec)
+    
+    # ==================== Decision Logic ====================
+    # Score: higher means more likely to need target_point (closer point)
+    # We consider both factors and take the more conservative choice
+    
+    # Factor 1 score: ego alignment with target_point
+    # If ego needs to turn a lot to reach TP, we should use TP (not skip to NTP)
+    if ego_to_tp_lateral > lateral_threshold_turn or angle_ego_to_tp > angle_threshold_turn:
+        ego_alignment_score = 1.0  # Need to turn significantly, use TP
+        ego_alignment_type = 'ramp'  # Like on-ramp scenario
+    elif ego_to_tp_lateral < lateral_threshold_straight and angle_ego_to_tp < angle_threshold_straight:
+        ego_alignment_score = 0.0  # Well aligned, can use NTP
+        ego_alignment_type = 'aligned'
+    else:
+        # Interpolate based on the worse of lateral offset or angle
+        lat_ratio = (ego_to_tp_lateral - lateral_threshold_straight) / (lateral_threshold_turn - lateral_threshold_straight)
+        ang_ratio = (angle_ego_to_tp - angle_threshold_straight) / (angle_threshold_turn - angle_threshold_straight)
+        ego_alignment_score = np.clip(max(lat_ratio, ang_ratio), 0.0, 1.0)
+        ego_alignment_type = 'partial_ramp'
+    
+    # Factor 2 score: path curvature from TP to NTP
+    if lateral_deviation_ntp > lateral_threshold_turn or angle_tp_to_ntp > angle_threshold_turn:
+        path_curvature_score = 1.0  # Sharp turn ahead, use TP
+        path_curvature_type = 'turn'
+    elif lateral_deviation_ntp < lateral_threshold_straight and angle_tp_to_ntp < angle_threshold_straight:
+        path_curvature_score = 0.0  # Straight path, can use NTP
+        path_curvature_type = 'straight'
+    else:
+        # Interpolate
+        lat_ratio = (lateral_deviation_ntp - lateral_threshold_straight) / (lateral_threshold_turn - lateral_threshold_straight)
+        ang_ratio = (angle_tp_to_ntp - angle_threshold_straight) / (angle_threshold_turn - angle_threshold_straight)
+        path_curvature_score = np.clip(max(lat_ratio, ang_ratio), 0.0, 1.0)
+        path_curvature_type = 'curve'
+    
+    # Final decision: take the more conservative (higher score = use TP)
+    final_score = max(ego_alignment_score, path_curvature_score)
+    
+    # Determine selection type for debugging
+    if ego_alignment_score >= path_curvature_score:
+        primary_reason = ego_alignment_type
+    else:
+        primary_reason = path_curvature_type
+    
+    # Select point based on final score
+    if final_score < 0.1:
+        # Very straight, use next_target_point
         selected_point = next_target_point.copy()
         selection_type = 'straight'
-    elif lateral_deviation > lateral_threshold_turn:
-        # Large lateral deviation: intersection turn
-        # Use target_point to prevent cutting corners
+    elif final_score > 0.9:
+        # Need to turn or not aligned, use target_point
         selected_point = target_point.copy()
-        selection_type = 'turn'
+        selection_type = primary_reason
     else:
-        # Intermediate: curved road
-        # Smooth interpolation based on lateral deviation
-        # When lateral_deviation = lateral_threshold_straight, alpha = 1 (use next_target_point)
-        # When lateral_deviation = lateral_threshold_turn, alpha = 0 (use target_point)
-        alpha = (lateral_threshold_turn - lateral_deviation) / (lateral_threshold_turn - lateral_threshold_straight)
-        alpha = np.clip(alpha, 0.0, 1.0)
+        # Interpolate: alpha=1 means use NTP, alpha=0 means use TP
+        alpha = 1.0 - final_score
         selected_point = alpha * next_target_point + (1 - alpha) * target_point
-        selection_type = 'curve'
+        selection_type = f'blend_{primary_reason}'
     
     return selected_point, selection_type
 
@@ -673,7 +771,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		# route_pred有20个稀疏点(~20m, 1m间距)，插值后约200点(0.1m间距)
 		# inference_mode=False: lookahead范围24-105个点，对应2.4m-10.5m前方
-		self.turn_controller = LateralPIDController(inference_mode=False)
+		# Increased k_p from default 3.118 to 3.5 to slightly increase sensitivity for mid-speed turns (reduce understeering)
+		self.turn_controller = LateralPIDController(inference_mode=False, k_p=3.118)
 		self.speed_controller = t_u.PIDController(k_p=1.75, k_i=1.0, k_d=2.0, n=20)  
 		
 		# Control config 
@@ -1156,7 +1255,138 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		return result
 	
-	def control_pid(self, route_waypoints, velocity, speed_waypoints):
+	def _truncate_route_by_target_point(self, route_waypoints_np, target_point_np):
+		"""
+		Truncate route_pred based on target_point projection.
+		
+		Logic:
+		- Project target_point onto the polyline formed by route_pred
+		- If projection falls inside route_pred (route is truncated by target_point),
+		  then the portion after projection is inaccurate and should not be used
+		- If projection falls beyond route_pred's end, the entire route is valid
+		
+		Protection mechanism:
+		- If truncated route has too few points (< MIN_POINTS_THRESHOLD) or
+		  is too short (< MIN_LENGTH_THRESHOLD), skip truncation and use original route
+		- This handles edge cases near the destination where target_point is very close
+		
+		Args:
+			route_waypoints_np: (N, 2) numpy array in ego frame [x_forward, y_left]
+			target_point_np: (2,) numpy array in ego frame [x_forward, y_left]
+		
+		Returns:
+			truncated_route: (M, 2) numpy array, M <= N, the valid portion of route_pred
+			truncation_idx: int, the index up to which the route is valid (-1 if no truncation)
+		"""
+		# Protection thresholds
+		MIN_POINTS_THRESHOLD = 5  # Minimum number of points needed for reliable control
+		MIN_LENGTH_THRESHOLD = 3.0  # Minimum route length in meters for reliable lookahead
+		
+		if len(route_waypoints_np) < 2:
+			return route_waypoints_np, -1
+		
+		# Find the closest segment to target_point
+		min_dist = float('inf')
+		best_segment_idx = -1
+		best_t = 0.0  # Parameter along segment [0, 1]
+		best_proj_point = None
+		
+		for i in range(len(route_waypoints_np) - 1):
+			p1 = route_waypoints_np[i]
+			p2 = route_waypoints_np[i + 1]
+			
+			# Vector from p1 to p2
+			v = p2 - p1
+			# Vector from p1 to target_point
+			w = target_point_np - p1
+			
+			# Length squared of segment
+			l2 = np.dot(v, v)
+			if l2 < 1e-10:  # Degenerate segment
+				t = 0.0
+				proj = p1
+			else:
+				# Project target_point onto the line containing the segment
+				t = np.dot(w, v) / l2
+				proj = p1 + t * v
+			
+			# Distance from target_point to projection
+			dist = np.linalg.norm(target_point_np - proj)
+			
+			# We consider projections within or beyond the segment
+			# t < 0: projection is before p1
+			# 0 <= t <= 1: projection is within segment
+			# t > 1: projection is beyond p2
+			
+			if dist < min_dist:
+				min_dist = dist
+				best_segment_idx = i
+				best_t = t
+				best_proj_point = proj
+		
+		# Determine truncation based on projection position
+		# If best_t is within [0, 1], the projection is inside the route segment
+		# If best_t > 1, check if we're on the last segment - if so, projection is beyond route
+		
+		if best_segment_idx == -1:
+			# No valid segment found, return original route
+			return route_waypoints_np, -1
+		
+		# Calculate the "arc length" position of the projection along the route
+		# If projection is beyond the last point, no truncation needed
+		is_on_last_segment = (best_segment_idx == len(route_waypoints_np) - 2)
+		
+		if best_t > 1.0 and is_on_last_segment:
+			# Projection is beyond the end of route_pred
+			# The entire route is valid for lookahead calculation
+			return route_waypoints_np, -1
+		
+		# Projection is within route_pred or before it (shouldn't happen normally)
+		# Truncate the route at the projection point
+		if best_t <= 0.0:
+			# Projection is at or before the start of this segment
+			# Keep points up to and including segment start
+			truncation_idx = best_segment_idx
+		elif best_t >= 1.0:
+			# Projection is at or beyond the end of this segment
+			# Keep points up to and including segment end
+			truncation_idx = best_segment_idx + 1
+		else:
+			# Projection is within the segment
+			# Keep points up to segment start, then add the projection point
+			truncation_idx = best_segment_idx
+		
+		# Build truncated route
+		if truncation_idx >= len(route_waypoints_np) - 1:
+			# No truncation needed
+			return route_waypoints_np, -1
+		
+		# Include points up to truncation_idx, then add projection point
+		truncated = route_waypoints_np[:truncation_idx + 1].copy()
+		
+		# Add the projection point if it's meaningfully different from the last included point
+		if best_proj_point is not None and len(truncated) > 0:
+			dist_to_last = np.linalg.norm(best_proj_point - truncated[-1])
+			if dist_to_last > 0.1:  # Only add if more than 0.1m away
+				truncated = np.vstack([truncated, best_proj_point])
+		
+		# ============ Protection mechanism ============
+		# Calculate the total length of truncated route
+		truncated_length = 0.0
+		for i in range(len(truncated) - 1):
+			truncated_length += np.linalg.norm(truncated[i + 1] - truncated[i])
+		
+		# Check if truncated route meets minimum requirements
+		if len(truncated) < MIN_POINTS_THRESHOLD or truncated_length < MIN_LENGTH_THRESHOLD:
+			# Truncated route is too short, skip truncation and use original route
+			# This handles edge cases near destination where target_point is very close
+			print(f"[Lateral] Skip truncation: points={len(truncated)}, length={truncated_length:.2f}m "
+				  f"(thresholds: {MIN_POINTS_THRESHOLD} points, {MIN_LENGTH_THRESHOLD}m)")
+			return route_waypoints_np, -1
+		
+		return truncated, truncation_idx
+	
+	def control_pid(self, route_waypoints, velocity, speed_waypoints, target_point=None):
 		"""
 		Predicts vehicle control with a PID controller.
 		
@@ -1164,11 +1394,24 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			route_waypoints: (1, N, 2) tensor in ego frame [x_forward, y_left]
 			velocity: float, current speed in m/s
 			speed_waypoints: (1, N, 2) tensor for speed calculation
+			target_point: (1, 2) tensor or (2,) numpy array, the target point used by DP model
 		"""
 		assert route_waypoints.size(0) == 1
 		route_waypoints_np = route_waypoints[0].data.cpu().numpy()  # (N, 2)
 		speed = velocity  # Already a float
 		speed_waypoints_np = speed_waypoints[0].data.cpu().numpy()  # (N, 2)
+		
+		# Truncate route_pred based on target_point projection
+		# This ensures we only use the accurate portion of route_pred for lookahead calculation
+		if target_point is not None:
+			if isinstance(target_point, torch.Tensor):
+				tp_np = target_point.squeeze().cpu().numpy()
+			else:
+				tp_np = np.asarray(target_point).squeeze()
+			
+			route_waypoints_np, truncation_idx = self._truncate_route_by_target_point(route_waypoints_np, tp_np)
+			if truncation_idx >= 0:
+				print(f"[Lateral] Route truncated at idx {truncation_idx} due to target_point projection")
 		
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
 		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
@@ -1275,21 +1518,25 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		# Select appropriate target point for DP model based on path geometry
 		# This handles: straight driving (use next_target_point), intersection turns (use target_point),
-		# and curved roads (smooth interpolation)
+		# and curved roads (smooth interpolation), and ramp scenarios (ego not aligned with path)
 		dp_target_point_np, selection_type = select_dp_target_point(
 			tick_data['target_point'], 
 			tick_data['next_target_point'],
-			lateral_threshold_turn=3.0,    # Large lateral offset = intersection turn
-			lateral_threshold_straight=1.0  # Small lateral offset = straight road
+			lateral_threshold_turn=3.0,      # Large lateral offset = intersection turn (meters)
+			lateral_threshold_straight=1.0,  # Small lateral offset = straight road (meters)
+			angle_threshold_turn=30.0,       # Large angle change = turn (degrees)
+			angle_threshold_straight=10.0    # Small angle change = straight (degrees)
 		)
 		dp_target_point = torch.from_numpy(dp_target_point_np).unsqueeze(0).float().to('cuda', dtype=torch.float32)
 		
 		# For debugging: print selection info occasionally
 		if self.step % 20 == 0:
-			print(f"[DP Target Selection] type={selection_type}, "
-				  f"target_point={tick_data['target_point']}, "
-				  f"next_target_point={tick_data['next_target_point']}, "
-				  f"selected={dp_target_point_np}")
+			tp = tick_data['target_point']
+			ntp = tick_data['next_target_point']
+			print(f"[DP Target] type={selection_type}, "
+				  f"TP=({tp[0]:.1f},{tp[1]:.1f}), "
+				  f"NTP=({ntp[0]:.1f},{ntp[1]:.1f}), "
+				  f"sel=({dp_target_point_np[0]:.1f},{dp_target_point_np[1]:.1f})")
 
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
@@ -1395,8 +1642,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Following agent_simlingo convention:
 			# - speed_waypoints: use pred_traj from MoT model for speed control (throttle/brake)
 			# - route_waypoints: use 'route_pred' from DP model for lateral angle control (steering)
-			# speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
-			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() 
+			speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
+			# speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() - use DP prediction
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			
@@ -1411,7 +1658,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			gt_velocity = tick_data['speed']
 			
-			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints)
+			# Pass dp_target_point to control_pid for route truncation based on target_point projection
+			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=dp_target_point)
 			
 			# Restart mechanism in case the car got stuck (following simlingo logic)
 			# 0.1 is just an arbitrary low number to threshold when the car is stopped
