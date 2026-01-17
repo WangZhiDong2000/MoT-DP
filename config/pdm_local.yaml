@@ -110,7 +110,7 @@ logging:
   run_name: carla_dit_optimized
   checkpoint_dir: /home/wang/Project/MoT-DP/checkpoints/carla_dit_best
   save_every: 5
-  log_freq: 10
+  log_freq: 50  # Log to wandb every 50 batches to reduce overhead
   wandb_entity: wangzhidong2000-nanyang-technological-university-singapore
   wandb_api_key: a0d403cb4dc1be3c5c7df4677a1b42d1c3e71b4f
 eval:

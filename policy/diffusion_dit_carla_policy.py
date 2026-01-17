@@ -6,7 +6,7 @@ from collections import defaultdict
 import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
+from model.transformer_for_diffusion import TransformerForDiffusion
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
@@ -53,8 +53,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         obs_encoder = InterfuserBEVEncoder(
             perception_backbone=None,
             state_dim=bev_encoder_cfg.get('state_dim', 13),  # 修改为13维以支持拼接后的ego_status
-            feature_dim=bev_encoder_cfg.get('feature_dim', 256),
-            use_group_norm=bev_encoder_cfg.get('use_group_norm', True),
             freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
             bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
         )
@@ -80,6 +78,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         # Get ego_status_seq_len from policy config (defaults to n_obs_steps)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
+        
+        # Number of waypoints for route prediction
+        num_waypoints = policy_cfg.get('num_waypoints', 20)
+        self.num_waypoints = num_waypoints
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
@@ -95,8 +97,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             causal_attn=policy_cfg.get('causal_attn', True),
             obs_as_cond=obs_as_global_cond,
             n_cond_layers=policy_cfg.get('n_cond_layers', 4),
-            status_dim=status_dim,  # 传入 ego_status 维度
-            ego_status_seq_len=ego_status_seq_len  # 传入 ego_status 序列长度
+            status_dim=status_dim,
+            ego_status_seq_len=ego_status_seq_len,
+            bev_dim=512,  # BEV token dimension from InterfuserBEVEncoder
+            state_token_dim=128,  # State token dimension from InterfuserBEVEncoder
+            num_waypoints=num_waypoints,  # Number of route waypoints
         )
 
         self.model = model
@@ -117,8 +122,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.norm_y_offset = diffusion_cfg.get('norm_y_offset', 20.0)  # y range: [-20, 36]
         self.norm_y_range = diffusion_cfg.get('norm_y_range', 56.0)
         
-        # Route prediction auxiliary loss weight
-        self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.1)
+        # Route prediction auxiliary loss weight (横向控制重要性)
+        self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
         
         # DDIMScheduler for variance computation (DiffusionDriveV2 style)
         self.diffusion_scheduler = DDIMScheduler(
@@ -126,14 +131,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             steps_offset=1,
             beta_schedule="scaled_linear",
             prediction_type="sample",  # Predict clean sample directly
-        )
-
-        self.mask_generator = LowdimMaskGenerator(
-            action_dim=action_dim,
-            obs_dim=0 if (obs_as_global_cond) else obs_feature_dim,
-            max_n_obs_steps=self.n_obs_steps,  
-            fix_obs_steps=True,
-            action_visible=False
         )
 
         self.action_dim = action_dim
@@ -338,9 +335,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     
 
-    def extract_tcp_features(self, obs_dict, return_attention=False):
+    def extract_bev_state_tokens(self, obs_dict):
         """
-        使用InterfuserBEVEncoder提取特征
+        使用InterfuserBEVEncoder提取BEV tokens和State tokens (Decoder-Only架构)
+        
         支持两种模式：
         1. 使用预处理好的BEV特征（推荐，快速）
         2. 使用原始lidar_bev图像（兼容模式，慢）
@@ -350,69 +348,43 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
                 - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
                 - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                - 'ego_status' (B, 13): [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
-                  已经拼接好的13维状态向量，直接作为state输入
-            return_attention: 是否返回attention map
-            
+                - 'ego_status' (B, state_dim): 状态向量
+                
         Returns:
-            如果return_attention=False: j_ctrl特征 (B, 256)
-            如果return_attention=True: (j_ctrl特征, attention_map) 
+            bev_tokens: (B, seq_len+1, 512) - BEV空间tokens + global token
+            state_tokens: (B, 1, 128) - 状态编码tokens
         """
         try:
             device = next(self.parameters()).device
-            # Get the dtype of the model parameters
             model_dtype = next(self.parameters()).dtype
-            state = obs_dict['ego_status'].to(device=device, dtype=model_dtype)  # Use model dtype instead of float32
+            state = obs_dict['ego_status'].to(device=device, dtype=model_dtype)
+            
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
+            
             if use_precomputed:
                 lidar_token = obs_dict['lidar_token'].to(device=device, dtype=model_dtype)
                 lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=model_dtype)
                 
-                if return_attention:
-                    j_ctrl, attention_map = self.obs_encoder(
-                        state=state,
-                        lidar_token=lidar_token,
-                        lidar_token_global=lidar_token_global,
-                        normalize=True,
-                        return_attention=True
-                    )
-                else:
-                    j_ctrl = self.obs_encoder(
-                        state=state,
-                        lidar_token=lidar_token,
-                        lidar_token_global=lidar_token_global,
-                        normalize=True,
-                        return_attention=False
-                    )
-                    attention_map = None
+                bev_tokens, state_tokens = self.obs_encoder(
+                    state=state,
+                    lidar_token=lidar_token,
+                    lidar_token_global=lidar_token_global,
+                )
             else:
                 if 'lidar_bev' not in obs_dict:
                     raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
                 
-                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=model_dtype)  # Use model dtype instead of float32
-                if return_attention:
-                    j_ctrl, attention_map = self.obs_encoder(
-                        image=lidar_bev_img,
-                        state=state,
-                        normalize=True,
-                        return_attention=True
-                    )
-                else:
-                    j_ctrl = self.obs_encoder(
-                        image=lidar_bev_img,
-                        state=state,
-                        normalize=True,
-                        return_attention=False
-                    )
-                    attention_map = None
+                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=model_dtype)
+                
+                bev_tokens, state_tokens = self.obs_encoder(
+                    image=lidar_bev_img,
+                    state=state,
+                )
             
-            if return_attention:
-                return j_ctrl, attention_map
-            else:
-                return j_ctrl
+            return bev_tokens, state_tokens
                 
         except KeyError as e:
-            raise KeyError(f"Missing required field in obs_dict for TCP feature extraction: {e}")
+            raise KeyError(f"Missing required field in obs_dict for BEV/State token extraction: {e}")
         except Exception as e:
             raise RuntimeError(f"Error in TCP feature extraction: {e}")
 
@@ -434,31 +406,29 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
             
             'agent_pos': (B, horizon, 2) - 未来轨迹点
-            'ego_status': (B, obs_horizon, 13) - 车辆状态 [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
+            'ego_status': (B, obs_horizon, state_dim) - 车辆状态
             'anchor': (B, horizon, 2) - anchor轨迹点（用于truncated diffusion）
             'route': (B, num_waypoints, 2) - 路线waypoints（可选，用于route预测辅助任务）
         }
         """
         device = next(self.parameters()).device
-        model_dtype = next(self.parameters()).dtype  # Get model dtype
+        model_dtype = next(self.parameters()).dtype
         nobs = {}
         required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 'reasoning_query_tokens', 'gen_vit_tokens', 'anchor', 'route']
         
         for field in required_fields:
             if field in batch:
                 if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
-                    nobs[field] = batch[field].to(device=device, dtype=model_dtype)  # Use model dtype
+                    nobs[field] = batch[field].to(device=device, dtype=model_dtype)
                 else:
                     nobs[field] = batch[field].to(device)
 
         raw_agent_pos = batch['agent_pos'].to(device)
 
-        # (B, horizon, 2)
         To = self.n_obs_steps
         nactions = raw_agent_pos
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
-        cond = None
         
         # Get ground truth trajectory
         trajectory = nactions.to(dtype=model_dtype)  # (B, horizon, 2)
@@ -473,10 +443,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
+        # Extract BEV tokens and State tokens (Decoder-Only架构)
+        # Flatten temporal dimension for feature extraction
         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-        feature_dim = batch_features.shape[-1]
-        cond = batch_features.reshape(batch_size, To, feature_dim)  # Already in model_dtype
+        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
+        
+        # Use only the last timestep's features (or average over time)
+        # bev_tokens: (B*To, seq_len+1, 512) -> use last timestep
+        # state_tokens: (B*To, 1, 128) -> use last timestep
+        bev_tokens = bev_tokens.reshape(batch_size, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
+        state_tokens = state_tokens.reshape(batch_size, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
 
         # Prepare VL tokens
         gen_vit_tokens = batch['gen_vit_tokens']
@@ -493,7 +469,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         loss = self._compute_truncated_diffusion_loss(
             trajectory=trajectory,
             anchor=anchor,
-            cond=cond,
+            bev_tokens=bev_tokens,
+            state_tokens=state_tokens,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
@@ -508,7 +485,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self,
         trajectory: torch.Tensor,
         anchor: torch.Tensor,
-        cond: torch.Tensor,
+        bev_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
         gen_vit_tokens: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
@@ -526,7 +504,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Args:
             trajectory: (B, horizon, 2) - ground truth trajectory
             anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
-            cond: (B, To, feature_dim) - condition features from BEV encoder
+            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens from encoder
+            state_tokens: (B, 1, 128) - state tokens from encoder
             gen_vit_tokens: (B, seq_len, dim) - VIT tokens
             reasoning_query_tokens: (B, seq_len, dim) - reasoning tokens
             ego_status: (B, To, status_dim) - ego vehicle status
@@ -547,11 +526,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         ).long()
         
         # 3. Add scheduler-based multiplicative noise to anchor (DiffusionDriveV2 style)
-        # FIXED: Use per-sample timestep for noise generation to match the timesteps passed to model
-        # This ensures consistency between the noise level and the timestep condition
         noisy_anchor = self.add_multiplicative_noise_scheduled_batch(
             anchor_norm,
-            timesteps=timesteps,  # Use per-sample timesteps
+            timesteps=timesteps,
             eta=1.0,
             std_min=0.04
         )
@@ -562,20 +539,22 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # 5. Denormalize for model input (model expects denormalized coordinates)
         noisy_trajectory_denorm = self.denorm_odo(noisy_anchor)
         
-        # 6. Predict clean sample and route
-        # Model always returns (trajectory, route_pred)
+        # 6. Create dummy cond for API compatibility (not used in decoder-only)
+        cond = torch.zeros(batch_size, ego_status.shape[1], 256, device=device, dtype=model_dtype)
+        
+        # 7. Predict clean sample and route using decoder-only model
         pred, route_pred = self.model(
-            noisy_trajectory_denorm,
-            timesteps,  # Use the sampled timesteps
-            cond,
+            sample=noisy_trajectory_denorm,
+            timestep=timesteps,
+            cond=cond,  # For API compatibility
+            bev_tokens=bev_tokens,
+            state_tokens=state_tokens,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status
         )
         
-        # 7. Compute trajectory loss - predict clean sample (not noise)
-        # Target is the ground truth trajectory (denormalized)
-        # DiffusionDrive uses L1 loss
+        # 8. Compute trajectory loss - predict clean sample (not noise)
         target = trajectory
         
         traj_loss = F.l1_loss(pred, target, reduction='none')
@@ -586,43 +565,48 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         traj_loss = reduce(traj_loss, 'b ... -> b (...)', 'mean')
         traj_loss = traj_loss.mean()
         
-        # 8. Compute route loss (auxiliary task)
+        # 9. Compute route loss (auxiliary task)
         total_loss = traj_loss
         if route_gt is not None:
             route_loss = F.l1_loss(route_pred, route_gt, reduction='none')
             route_loss = reduce(route_loss, 'b ... -> b (...)', 'mean')
             route_loss = route_loss.mean()
             
-            # Combine losses with weight factor
-            # route_loss_weight controls the contribution of route prediction
             route_loss_weight = getattr(self, 'route_loss_weight', 0.1)
             total_loss = traj_loss + route_loss_weight * route_loss
         
         return total_loss
 
     def conditional_sample(self, 
-            condition_data, condition_mask,
-            cond=None, generator=None, gen_vit_tokens=None, 
-            reasoning_query_tokens=None, ego_status=None,
-            anchor=None,  # Anchor trajectory for truncated diffusion
-            # keyword arguments to scheduler.step
+            bev_tokens: torch.Tensor,
+            state_tokens: torch.Tensor,
+            gen_vit_tokens: torch.Tensor,
+            reasoning_query_tokens: torch.Tensor,
+            ego_status: torch.Tensor,
+            anchor: torch.Tensor,
+            device: torch.device,
+            model_dtype: torch.dtype,
+            generator=None,
             **kwargs
             ):
         """
         Generate trajectory samples using truncated diffusion (DiffusionDriveV2 style).
         
+        Args:
+            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens
+            state_tokens: (B, 1, 128) - state tokens
+            gen_vit_tokens: (B, seq_len, 1536) - VL tokens
+            reasoning_query_tokens: (B, seq_len, 1536) - reasoning tokens
+            ego_status: (B, To, status_dim) - ego status history
+            anchor: (B, T, 2) - anchor trajectory
+            
         Returns:
             (trajectory, route_pred) tuple - trajectory (B, T, 2), route_pred (B, 20, 2)
         """
-        model = self.model
-        device = condition_data.device
-        bs = condition_data.shape[0]
-        model_dtype = condition_data.dtype
-        
-        # Truncated Diffusion with Anchor (DiffusionDriveV2 style)
         result = self._truncated_diffusion_sample(
             anchor=anchor,
-            cond=cond,
+            bev_tokens=bev_tokens,
+            state_tokens=state_tokens,
             ego_status=ego_status,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
@@ -636,7 +620,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def _truncated_diffusion_sample(
         self,
         anchor: torch.Tensor,
-        cond: torch.Tensor,
+        bev_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         gen_vit_tokens: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
@@ -666,11 +651,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         roll_timesteps = (np.arange(0, self.num_diffusion_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
         roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
         
+        # Create dummy cond for API compatibility
+        cond = torch.zeros(bs, ego_status.shape[1], 256, device=device, dtype=model_dtype)
+        
         # 1. Normalize anchor
         diffusion_output = self.norm_odo(anchor)  # (B, T, 2)
         
         # 2. Add initial multiplicative noise using truncated timestep (scheduler-based)
-        # Use trunc_timesteps to determine initial noise level
         diffusion_output = self.add_multiplicative_noise_scheduled(
             diffusion_output, 
             timestep=self.trunc_timesteps,
@@ -679,8 +666,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         )
         
         # 3. Denoising loop
-        pred = None  # Will hold the final model prediction
-        route_pred = None  # Will hold route prediction from last step
+        pred = None
+        route_pred = None
         for i, k in enumerate(roll_timesteps):
             # Clamp and denormalize
             x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
@@ -694,24 +681,24 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 timesteps = timesteps[None].to(device)
             timesteps = timesteps.expand(bs)
             
-            # Predict clean sample - model always returns (trajectory, route_pred)
+            # Predict clean sample using decoder-only model
             pred, route_pred = self.model(
                 sample=noisy_traj_points.to(dtype=model_dtype),
                 timestep=timesteps,
                 cond=cond,
+                bev_tokens=bev_tokens,
+                state_tokens=state_tokens,
                 gen_vit_tokens=gen_vit_tokens,
                 reasoning_query_tokens=reasoning_query_tokens,
                 ego_status=ego_status,
             )
             
             # For next iteration, use the normalized prediction as input
-            # Apply scheduler-based multiplicative noise for refinement
             x_start = self.norm_odo(pred)  # (B, T, 2)
             
             # Add noise for next iteration based on the next timestep
             if i < len(roll_timesteps) - 1:
                 next_k = roll_timesteps[i + 1]
-                # Apply multiplicative noise based on scheduler variance at next timestep
                 diffusion_output = self.add_multiplicative_noise_scheduled(
                     x_start,
                     timestep=next_k,
@@ -721,85 +708,72 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             else:
                 diffusion_output = x_start
         
-        # 4. Return the model's direct prediction (NOT denorm_odo(diffusion_output))
+        # 4. Return the model's direct prediction
         return pred, route_pred
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
-        model_dtype = next(self.parameters()).dtype  # Get model dtype
+        model_dtype = next(self.parameters()).dtype
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
         Da = self.action_dim
-        Do = self.obs_feature_dim
         To = self.n_obs_steps
 
-        # handle different ways of passing observation
-        cond = None
-        cond_data = None
-        cond_mask = None
+        # Extract BEV tokens and State tokens
         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-        feature_dim = batch_features.shape[-1]
-        cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-        cond = cond.to(dtype=model_dtype)  # Ensure cond has correct dtype
-        shape = (B, T, Da)
-       
-        cond_data = torch.zeros(size=shape, device=device, dtype=model_dtype)  # Use model dtype
-        cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
+        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
+        
+        # Use only the last timestep's features
+        bev_tokens = bev_tokens.reshape(B, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
+        state_tokens = state_tokens.reshape(B, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
 
-        # run sampling
+        # Process VL tokens
         gen_vit_tokens = nobs['gen_vit_tokens']
         reasoning_query_tokens = nobs['reasoning_query_tokens']
         
-        # Process gen_vit_tokens through feature_encoder
-        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
-        gen_vit_tokens = self.feature_encoder(gen_vit_tokens)  # Project to 1536 dim
+        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=model_dtype)
+        gen_vit_tokens = self.feature_encoder(gen_vit_tokens)
         
-        # Process reasoning_query_tokens through feature_encoder
-        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)  # Use model dtype
-        reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)  # Project to 1536 dim
+        reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)
+        reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)
         
-        # Use current ego_status instead of full history
-        ego_status = nobs['ego_status']  # (B, ego_status_dim)
-        # Ensure ego_status has the correct dtype
+        # Get ego_status
+        ego_status = nobs['ego_status']
         ego_status = ego_status.to(dtype=model_dtype)
         
-        # Get anchor for truncated diffusion (if available)
+        # Get anchor for truncated diffusion
         anchor = nobs.get('anchor', None)
         if anchor is not None:
             anchor = anchor.to(device=device, dtype=model_dtype)
-            # Ensure anchor has correct shape (B, T, 2)
             if anchor.dim() == 2:
-                anchor = anchor.unsqueeze(0)  # Add batch dim
+                anchor = anchor.unsqueeze(0)
             if anchor.shape[0] != B:
                 anchor = anchor.expand(B, -1, -1)
         
-        # Always returns (trajectory, route_pred) tuple
+        # Generate samples using truncated diffusion
         nsample, route_pred = self.conditional_sample(
-            cond_data, 
-            cond_mask,
-            cond=cond,
+            bev_tokens=bev_tokens,
+            state_tokens=state_tokens,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
             anchor=anchor,
+            device=device,
+            model_dtype=model_dtype,
         )
         
         naction_pred = nsample[...,:Da]
         
-        # For truncated diffusion, the output is already in original scale
-        # No need to unnormalize
-        
-        # Convert to float32 before numpy (numpy doesn't support bfloat16)
+        # Convert to float32 before numpy
         action_pred = naction_pred.detach().float().cpu().numpy()
         action = action_pred
         result = {
             'action': action,
             'action_pred': action_pred,
-            'route_pred': route_pred,  # Always include route prediction
+            'route_pred': route_pred,
         }
         
         return result

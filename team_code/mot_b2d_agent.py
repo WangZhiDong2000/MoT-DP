@@ -1643,7 +1643,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# - speed_waypoints: use pred_traj from MoT model for speed control (throttle/brake)
 			# - route_waypoints: use 'route_pred' from DP model for lateral angle control (steering)
 			speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
-			# speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() - use DP prediction
+			# speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() # - use DP prediction
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			

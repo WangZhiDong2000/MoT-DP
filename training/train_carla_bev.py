@@ -569,7 +569,9 @@ def train_pdm_policy(config_path):
                     'clipped': '✂' if was_clipped else ''
                 })
             
-            if batch_idx % 10 == 0 and rank == 0:
+            # Log to wandb less frequently to reduce overhead
+            log_freq = config.get('logging', {}).get('log_freq', 50)
+            if batch_idx % log_freq == 0 and rank == 0:
                 step = epoch * len(train_loader) + batch_idx
                 safe_wandb_log({
                     "train/loss_step": loss.item(),
@@ -599,7 +601,9 @@ def train_pdm_policy(config_path):
         # Get model state dict (handle DDP wrapper)
         model_to_save = policy.module if world_size > 1 else policy
         
-        if rank == 0:
+        # Save checkpoint at save_freq intervals (not every epoch to reduce I/O)
+        save_freq = config.get('training', {}).get('save_freq', 5)
+        if rank == 0 and (epoch + 1) % save_freq == 0:
             torch.save({
                         'model_state_dict': model_to_save.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
@@ -610,7 +614,9 @@ def train_pdm_policy(config_path):
                         'train_loss': avg_train_loss,
                         'val_metrics': val_metrics
                         }, os.path.join(checkpoint_dir, "carla_policy.pt"))
+            print(f"  Checkpoint saved at epoch {epoch+1}")
         
+        if rank == 0:
             safe_wandb_log({
                 "train/loss_epoch": avg_train_loss,
                 "train/epoch": epoch,
