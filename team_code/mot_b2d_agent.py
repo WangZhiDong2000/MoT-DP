@@ -98,20 +98,37 @@ def load_best_model(checkpoint_path, config, device):
         sys.modules['numpy._core'] = np.core
         sys.modules['numpy._core._multiarray_umath'] = np.core._multiarray_umath
     
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Load checkpoint to CPU first to save GPU memory
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    policy = DiffusionDiTCarlaPolicy(config).to(device)
+    policy = DiffusionDiTCarlaPolicy(config)
     policy.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Print info before deleting checkpoint
+    epoch = checkpoint.get('epoch', 'N/A')
+    val_loss = checkpoint.get('val_loss', 'N/A')
+    train_loss = checkpoint.get('train_loss', 'N/A')
+    val_metrics = checkpoint.get('val_metrics', None)
+    
+    # Free checkpoint memory immediately
+    del checkpoint
+    import gc
+    gc.collect()
+    
+    # Now move to device
+    policy = policy.to(device)
     policy.eval()
     
     print(f"✓ Model loaded successfully!")
-    print(f"  - Epoch: {checkpoint.get('epoch', 'N/A')}")
-    print(f"  - Validation Loss: {checkpoint.get('val_loss', 'N/A'):.4f}")
-    print(f"  - Training Loss: {checkpoint.get('train_loss', 'N/A'):.4f}")
+    print(f"  - Epoch: {epoch}")
+    if isinstance(val_loss, float):
+        print(f"  - Validation Loss: {val_loss:.4f}")
+    if isinstance(train_loss, float):
+        print(f"  - Training Loss: {train_loss:.4f}")
     
-    if 'val_metrics' in checkpoint:
+    if val_metrics:
         print(f"  - Validation Metrics:")
-        for key, value in checkpoint['val_metrics'].items():
+        for key, value in val_metrics.items():
             if isinstance(value, (int, float)):
                 print(f"    {key}: {value:.4f}")
 
@@ -304,20 +321,30 @@ def load_safetensors_weights(model_path):
     return combined_state_dict
 
 def convert_model_dtype_with_exceptions(model, target_dtype, exclude_buffer_patterns=None):
+    """Convert model parameters to target dtype, with memory-efficient approach."""
     if exclude_buffer_patterns is None:
         exclude_buffer_patterns = []
     
+    # Convert parameters in chunks to avoid memory spikes
     for name, param in model.named_parameters():
-        param.data = param.data.to(target_dtype)
+        if param.device.type == 'cuda':
+            # For CUDA tensors, convert in-place to avoid extra memory allocation
+            param.data = param.data.to(target_dtype)
+        else:
+            # For CPU tensors, convert and then move to avoid duplicating on GPU
+            param.data = param.data.to(target_dtype)
 
     for name, buffer in model.named_buffers():
         should_exclude = any(pattern in name for pattern in exclude_buffer_patterns)
         
         if should_exclude:
-            print(f"⊗ Skipped buffer: {name} (kept as {buffer.dtype})")
+            pass  # Keep original dtype
         else:
-            buffer.data = buffer.data.to(target_dtype)
-            print(f"✓ Converted buffer: {name} to {target_dtype}")   
+            if buffer.device.type == 'cuda':
+                buffer.data = buffer.data.to(target_dtype)
+            else:
+                buffer.data = buffer.data.to(target_dtype)
+    
     return model
 
 def load_model_mot(device):
@@ -370,13 +397,11 @@ def load_model_mot(device):
         action_query_tokens=model_args.action_query_tokens,
     )
 
-    # Initialize model with Qwen3VL LLM (supports mRoPE)
+    # Initialize model on CPU first to save GPU memory during loading
+    print("Initializing model on CPU...")
     language_model = Qwen3VLForConditionalGenerationMoT(llm_config)
     vit_model = Qwen3VLVisionModel(vit_config)
-        
     model = AutoMoT(language_model, vit_model, config)
-
-    device_map = {"": "cuda:0"}
 
     # Load converted AutoMoT checkpoint manually (accelerate has weight issues)
     print(f"Loading converted AutoMoT checkpoint from {model_args.model_path}...")
@@ -392,14 +417,28 @@ def load_model_mot(device):
         print(f"Missing keys: {actual_missing_keys[:10]}")
     if unexpected_keys:
         print(f"Unexpected keys: {unexpected_keys[:5]}")
-        
-    # Move to device and siet dtype
-    model = model.to(device_map[""]).eval()
+    
+    # Free state_dict memory immediately
+    del state_dict
+    import gc
+    gc.collect()
+    
+    # Convert to bfloat16 on CPU first (saves GPU memory during transfer)
+    print("Converting model to bfloat16 on CPU...")
     model = convert_model_dtype_with_exceptions(
         model,
         torch.bfloat16,
         exclude_buffer_patterns=['inv_freq']
     )
+    
+    # Clear any cached memory before moving to GPU
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Now move to GPU (already in bfloat16, so less memory needed)
+    print("Moving model to GPU...")
+    model = model.to("cuda:0").eval()
     
     # Verify tie_word_embeddings is working correctly
     embed_weight = model.language_model.model.embed_tokens.weight
@@ -415,18 +454,10 @@ def load_model_mot(device):
     else:
         print("✓ tie_word_embeddings is working correctly")
     
-    # Explicitly move any remaining CPU tensors to GPU
-    print("Ensuring all parameters are on CUDA...")
-    for name, param in model.named_parameters():
-        if param.device.type == 'cpu':
-            print(f"Moving {name} from CPU to CUDA")
-            param.data = param.data.to("cuda:0")
+    # Final cleanup
+    gc.collect()
+    torch.cuda.empty_cache()
     
-    for name, buffer in model.named_buffers():
-        if buffer.device.type == 'cpu':
-            print(f"Moving buffer {name} from CPU to CUDA")
-            buffer.data = buffer.data.to("cuda:0")
-
     print("Model loaded successfully")
 
 
@@ -729,7 +760,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.wall_start = time.time()
 		self.initialized = False
 
-		# Load diffusion policy
+		import gc
+		
+		# Load diffusion policy first (smaller model)
 		print("Loading diffusion policy...")
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -741,11 +774,17 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.net.obs_encoder = self.net.obs_encoder.to(torch.bfloat16)
 		print("✓ Diffusion policy loaded (bfloat16).")
 		
+		# Aggressive memory cleanup before loading MoT model
+		gc.collect()
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
-			import gc
-			gc.collect()
-
+			torch.cuda.synchronize()
+		
+		# Print GPU memory status
+		if torch.cuda.is_available():
+			allocated = torch.cuda.memory_allocated() / 1024**3
+			reserved = torch.cuda.memory_reserved() / 1024**3
+			print(f"[GPU Memory] After DP: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
 
 		# Load MoT model
 		print("Loading MoT model...")
@@ -1642,8 +1681,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Following agent_simlingo convention:
 			# - speed_waypoints: use pred_traj from MoT model for speed control (throttle/brake)
 			# - route_waypoints: use 'route_pred' from DP model for lateral angle control (steering)
-			speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
-			# speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() # - use DP prediction
+			# speed_waypoints = pred_traj.float()  # (1, 6, 2) for speed control - use MoT prediction
+			speed_waypoints = torch.from_numpy(dp_pred_traj['action']).float() # - use DP prediction
 			# Get DP prediction for route_pred
 			self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			

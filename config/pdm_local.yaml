@@ -92,7 +92,7 @@ truncated_diffusion:
   norm_y_range: 88.0 #  Extended range: x=[-16.0, 76.0], y=[-45.0, 43.0]
   route_loss_weight: 0.5  # Route is equally important (lateral control) as waypoint (longitudinal control)
 training:
-  num_epochs: 1000
+  num_epochs: 500
   max_grad_norm: 1.0
   warmup_epochs: 5
   use_lr_scheduler: true
