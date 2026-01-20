@@ -20,6 +20,10 @@ import numpy as np
 from filterpy.kalman import MerweScaledSigmaPoints
 from filterpy.kalman import UnscentedKalmanFilter as UKF
 
+# lsof -ti:2002 | xargs kill -9 2>/dev/null
+# pkill -9 -f CarlaUE4
+# pkill -9 -f "leaderboard_evaluator\|CarlaUE4"
+# 
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
 leaderboard_root = str(os.path.join(project_root, 'leaderboard'))
 scenario_runner_root = str(os.path.join(project_root, 'scenario_runner'))
@@ -148,7 +152,7 @@ class DisplayInterface(object):
             (self._width, self._height), pygame.HWSURFACE | pygame.DOUBLEBUF
         )
 
-        pygame.display.set_caption("CORL Agent")
+        pygame.display.set_caption("MoT Agent")
 
     def run_interface(self, input_data):
         rgb = input_data['rgb']
@@ -176,13 +180,13 @@ class DisplayInterface(object):
         surface = cv2.putText(surface, decision_2s, (820,510), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
         surface = cv2.putText(surface, decision_3s, (820,540), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
 
-        surface[:150,198:202]=0
-        surface[:150,323:327]=0
-        surface[:150,473:477]=0
-        surface[:150,598:602]=0
-        surface[148:152, :200] = 0
-        surface[148:152, 325:475] = 0
-        surface[148:152, 600:800] = 0
+        # surface[:150,198:202]=0
+        # surface[:150,323:327]=0
+        # surface[:150,473:477]=0
+        # surface[:150,598:602]=0
+        # surface[148:152, :200] = 0
+        # surface[148:152, 325:475] = 0
+        # surface[148:152, 600:800] = 0
         surface[430:600, 998:1000] = 255
         surface[0:600, 798:800] = 255
         surface[0:600, 1198:1200] = 255
@@ -960,7 +964,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.lat_ref, self.lon_ref = 0.0, 0.0
 		
 
-		self.route_planner_min_distance = 7.5
+		self.route_planner_min_distance = 7.5 # 7.5
 		self.route_planner_max_distance = 50.0
 		self._route_planner = RoutePlanner(self.route_planner_min_distance, self.route_planner_max_distance,
 										   self.lat_ref, self.lon_ref)

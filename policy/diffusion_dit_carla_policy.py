@@ -7,7 +7,6 @@ import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from model.transformer_for_diffusion import TransformerForDiffusion
-# from model.transformer_for_diffusion_lite import TransformerForDiffusionLite as TransformerForDiffusion
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os

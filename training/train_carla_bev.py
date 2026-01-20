@@ -604,17 +604,18 @@ def train_pdm_policy(config_path):
         # Save checkpoint at save_freq intervals (not every epoch to reduce I/O)
         save_freq = config.get('training', {}).get('save_freq', 5)
         if rank == 0 and (epoch + 1) % save_freq == 0:
-            torch.save({
-                        'model_state_dict': model_to_save.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-                        'config': config,
-                        'epoch': epoch,
-                        'val_loss': val_loss,
-                        'train_loss': avg_train_loss,
-                        'val_metrics': val_metrics
-                        }, os.path.join(checkpoint_dir, "carla_policy.pt"))
-            print(f"  Checkpoint saved at epoch {epoch+1}")
+            # torch.save({
+            #             'model_state_dict': model_to_save.state_dict(),
+            #             'optimizer_state_dict': optimizer.state_dict(),
+            #             'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+            #             'config': config,
+            #             'epoch': epoch,
+            #             'val_loss': val_loss,
+            #             'train_loss': avg_train_loss,
+            #             'val_metrics': val_metrics
+            #             }, os.path.join(checkpoint_dir, "carla_policy.pt"))
+            # print(f"  Checkpoint saved at epoch {epoch+1}")
+            pass
         
         if rank == 0:
             safe_wandb_log({
@@ -696,7 +697,7 @@ def train_pdm_policy(config_path):
                             'val_loss': val_loss,
                             'train_loss': avg_train_loss,
                             'val_metrics': val_metrics
-                            }, os.path.join(checkpoint_dir, "carla_policy_best.pt"))
+                            }, os.path.join(checkpoint_dir, "policy_best.pt"))
                     print(f"✓ New best model saved with L2_avg: {l2_avg:.4f} (val_loss: {val_loss:.4f})")
                    
                     safe_wandb_log({

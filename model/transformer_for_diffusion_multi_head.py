@@ -151,6 +151,352 @@ class MultiheadAttentionWithQKNorm(nn.Module):
                         need_weights=need_weights, attn_mask=attn_mask, average_attn_weights=average_attn_weights)
 
 
+def apply_rope_single(x, cos, sin):
+    """Apply RoPE to a single tensor (only K, not Q)."""
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+class MultiSourceAttentionBlock(nn.Module):
+    """
+    Multi-Source Attention Block with separate projections for different sources.
+    
+    Implements the architecture from MLPResNetBlock_Pro with enhancements:
+    - Multi-head self-attention + two types of cross-attention (adapter / task)
+    - RoPE encoding for Q/K
+    - QK Normalization (RMSNorm) for stable training
+    - Gating mechanism for Reasoning tokens only
+    - Separate linear layers for different feature sources
+    - AdaLN modulation preserved
+    
+    Enhancements over basic fusion:
+    1. Per-source learnable temperature scaling for attention calibration
+    2. Source-specific Q projections for modality-aware queries
+    3. Learned bias terms for attention score adjustment
+    
+    Architecture:
+        1. Self-attention on main sequence with RoPE on both Q and K
+        2. Cross-attention to adapter tokens (hist + bev + vl) with RoPE on K only
+        3. Cross-attention to task tokens (reasoning) with RoPE on K only + gating
+        4. Residual + FFN
+        
+    The attention scores from all sources are concatenated and softmaxed together,
+    but the gating factor only scales the Reasoning (task) attention scores.
+    """
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, 
+                 dropout: float = 0.1, rope_theta: float = 10000.0, max_seq_len: int = 512,
+                 norm_type: str = "rmsnorm"):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+        
+        # RoPE embedding
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len = max_seq_len
+        
+        # ========== QK Normalization ==========
+        if norm_type == "rmsnorm":
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = nn.LayerNorm(self.head_dim)
+            self.k_norm = nn.LayerNorm(self.head_dim)
+        
+        # ========== Q projections (source-specific for better modality adaptation) ==========
+        self.q_proj = nn.Linear(d_model, d_model)  # Shared base Q
+        # Small adaptation layers for cross-attention queries (low-rank for efficiency)
+        self.q_adapter_hist = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_bev = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_vl = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_reason = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_out = nn.Linear(d_model // 4, d_model)
+        
+        # ========== Self-attention K, V ==========
+        self.k_self = nn.Linear(d_model, d_model)
+        self.v_self = nn.Linear(d_model, d_model)
+        
+        # ========== Adapter cross-attention K, V (for hist, bev, vl) ==========
+        self.k_hist = nn.Linear(d_model, d_model)
+        self.v_hist = nn.Linear(d_model, d_model)
+        self.k_bev = nn.Linear(d_model, d_model)
+        self.v_bev = nn.Linear(d_model, d_model)
+        self.k_vl = nn.Linear(d_model, d_model)
+        self.v_vl = nn.Linear(d_model, d_model)
+        
+        # ========== Task cross-attention K, V (for reasoning) ==========
+        self.k_reasoning = nn.Linear(d_model, d_model)
+        self.v_reasoning = nn.Linear(d_model, d_model)
+        
+        # ========== Output projection ==========
+        self.o_proj = nn.Linear(d_model, d_model)
+        
+        # ========== Gating factor for Reasoning tokens ==========
+        self.gating_factor = nn.Parameter(torch.zeros(1))
+        
+        # ========== Per-source learnable temperature (log scale for stability) ==========
+        # Controls attention sharpness per source: exp(temp) * scores
+        self.temp_self = nn.Parameter(torch.zeros(1))      # log(1) = 0
+        self.temp_hist = nn.Parameter(torch.zeros(1))
+        self.temp_bev = nn.Parameter(torch.zeros(1))
+        self.temp_vl = nn.Parameter(torch.zeros(1))
+        self.temp_reason = nn.Parameter(torch.zeros(1))
+        
+        # ========== Per-source learnable bias (attention prior) ==========
+        # Adds a learnable bias to attention scores before softmax
+        self.bias_self = nn.Parameter(torch.zeros(1))
+        self.bias_hist = nn.Parameter(torch.zeros(1))
+        self.bias_bev = nn.Parameter(torch.zeros(1))
+        self.bias_vl = nn.Parameter(torch.zeros(1))
+        self.bias_reason = nn.Parameter(torch.zeros(1))
+        
+        # ========== FFN ==========
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        
+        # ========== Layer Norm for pre-attention ==========
+        self.norm_pre = nn.LayerNorm(d_model)
+        
+        # ========== AdaLN modulation - 6 params: shift, scale, gate ==========
+        # (shift_pre, scale_pre, gate_attn, shift_ffn, scale_ffn, gate_ffn)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model, bias=True)
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply QK normalization to query and key tensors."""
+        return self.q_norm(q), self.k_norm(k)
+    
+    def _get_rope_embed(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        """Generate RoPE cos/sin embeddings."""
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (seq_len, head_dim/2)
+        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, head_dim)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+    
+    def _reshape_heads(self, x: torch.Tensor, B: int, L: int) -> torch.Tensor:
+        """Reshape (B, L, d_model) -> (B, nhead, L, head_dim)"""
+        return x.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+    
+    def modulate(self, x, shift, scale):
+        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    
+    def forward(
+        self,
+        x: torch.Tensor,  # (B, T, d_model) - main sequence
+        hist_tokens: torch.Tensor,  # (B, T_h, d_model) - history tokens (already projected)
+        bev_tokens: torch.Tensor,   # (B, T_b, d_model) - BEV tokens (already projected)
+        vl_tokens: torch.Tensor,    # (B, T_v, d_model) - VL tokens (already projected)
+        reasoning_tokens: torch.Tensor,  # (B, T_r, d_model) - reasoning tokens (already projected)
+        conditioning: torch.Tensor,  # (B, d_model) - conditioning for AdaLN
+        self_attn_mask: Optional[torch.Tensor] = None,
+        hist_padding_mask: Optional[torch.Tensor] = None,
+        bev_padding_mask: Optional[torch.Tensor] = None,
+        vl_padding_mask: Optional[torch.Tensor] = None,
+        reasoning_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with multi-source attention.
+        
+        Attention is computed as:
+        1. Self-attention: Q(x) @ K(x)^T with RoPE on both Q and K
+        2. Adapter cross-attention: Q_adapted(x) @ [K(hist), K(bev), K(vl)]^T with RoPE on K only
+        3. Task cross-attention: Q_adapted(x) @ K(reasoning)^T with RoPE on K only, scaled by gating
+        
+        All attention scores are concatenated, temperature-scaled, bias-adjusted, and softmaxed together.
+        """
+        B, T, C = x.shape
+        T_h = hist_tokens.shape[1]
+        T_b = bev_tokens.shape[1]
+        T_v = vl_tokens.shape[1]
+        T_r = reasoning_tokens.shape[1]
+        
+        # ========== AdaLN modulation parameters ==========
+        mod_params = self.adaLN_modulation(conditioning)
+        shift_pre, scale_pre, gate_attn, shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(6, dim=1)
+        
+        # ========== Pre-LayerNorm with modulation ==========
+        x_norm = self.modulate(self.norm_pre(x), shift_pre, scale_pre)
+        
+        # ========== Gating factor for Reasoning ==========
+        g = self.gating_factor
+        ratio_g = torch.tanh(g)
+        
+        # ========== Temperature scaling factors (softplus for positive values) ==========
+        temp_self = 1.0 + torch.nn.functional.softplus(self.temp_self)
+        temp_hist = 1.0 + torch.nn.functional.softplus(self.temp_hist)
+        temp_bev = 1.0 + torch.nn.functional.softplus(self.temp_bev)
+        temp_vl = 1.0 + torch.nn.functional.softplus(self.temp_vl)
+        temp_reason = 1.0 + torch.nn.functional.softplus(self.temp_reason)
+        
+        # ========== Q projection (base + source-specific adaptations) ==========
+        q_base = self.q_proj(x_norm)  # (B, T, d_model)
+        
+        # Source-specific Q adaptations (low-rank: d -> d/4 -> d)
+        q_adapt_hist = self.q_adapter_out(torch.tanh(self.q_adapter_hist(x_norm)))
+        q_adapt_bev = self.q_adapter_out(torch.tanh(self.q_adapter_bev(x_norm)))
+        q_adapt_vl = self.q_adapter_out(torch.tanh(self.q_adapter_vl(x_norm)))
+        q_adapt_reason = self.q_adapter_out(torch.tanh(self.q_adapter_reason(x_norm)))
+        
+        # ========== Self-attention K, V ==========
+        k_self = self.k_self(x_norm)  # (B, T, d_model)
+        v_self = self.v_self(x_norm)  # (B, T, d_model)
+        
+        # ========== Adapter K, V (hist, bev, vl) ==========
+        k_hist = self.k_hist(hist_tokens)  # (B, T_h, d_model)
+        v_hist = self.v_hist(hist_tokens)
+        k_bev = self.k_bev(bev_tokens)      # (B, T_b, d_model)
+        v_bev = self.v_bev(bev_tokens)
+        k_vl = self.k_vl(vl_tokens)          # (B, T_v, d_model)
+        v_vl = self.v_vl(vl_tokens)
+        
+        # ========== Task K, V (reasoning) ==========
+        k_reason = self.k_reasoning(reasoning_tokens)  # (B, T_r, d_model)
+        v_reason = self.v_reasoning(reasoning_tokens)
+        
+        # ========== Reshape to multi-head ==========
+        q_base = self._reshape_heads(q_base, B, T)            # (B, nhead, T, head_dim)
+        # Create adapted Q for each source by adding adaptation to base Q
+        q_hist = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_hist, B, T)
+        q_bev = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_bev, B, T)
+        q_vl = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_vl, B, T)
+        q_reason = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_reason, B, T)
+        
+        k_self = self._reshape_heads(k_self, B, T)
+        v_self = self._reshape_heads(v_self, B, T)
+        k_hist = self._reshape_heads(k_hist, B, T_h)
+        v_hist = self._reshape_heads(v_hist, B, T_h)
+        k_bev = self._reshape_heads(k_bev, B, T_b)
+        v_bev = self._reshape_heads(v_bev, B, T_b)
+        k_vl = self._reshape_heads(k_vl, B, T_v)
+        v_vl = self._reshape_heads(v_vl, B, T_v)
+        k_reason = self._reshape_heads(k_reason, B, T_r)
+        v_reason = self._reshape_heads(v_reason, B, T_r)
+        
+        # ========== Apply QK Normalization ==========
+        q_base, k_self = self._apply_qk_norm(q_base, k_self)
+        q_hist, k_hist = self._apply_qk_norm(q_hist, k_hist)
+        q_bev, k_bev = self._apply_qk_norm(q_bev, k_bev)
+        q_vl, k_vl = self._apply_qk_norm(q_vl, k_vl)
+        q_reason, k_reason = self._apply_qk_norm(q_reason, k_reason)
+        
+        # ========== Apply RoPE ==========
+        # Self-attention: both Q and K
+        cos_main, sin_main = self._get_rope_embed(T, x.device, x.dtype)
+        cos_main = cos_main.unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
+        sin_main = sin_main.unsqueeze(0).unsqueeze(0)
+        q_base = apply_rope_single(q_base, cos_main, sin_main)
+        k_self = apply_rope_single(k_self, cos_main, sin_main)
+        
+        # Cross-attention Q: apply same RoPE as self-attention
+        q_hist = apply_rope_single(q_hist, cos_main, sin_main)
+        q_bev = apply_rope_single(q_bev, cos_main, sin_main)
+        q_vl = apply_rope_single(q_vl, cos_main, sin_main)
+        q_reason = apply_rope_single(q_reason, cos_main, sin_main)
+        
+        # Adapter K: only K gets RoPE
+        cos_h, sin_h = self._get_rope_embed(T_h, x.device, x.dtype)
+        cos_h = cos_h.unsqueeze(0).unsqueeze(0)
+        sin_h = sin_h.unsqueeze(0).unsqueeze(0)
+        k_hist = apply_rope_single(k_hist, cos_h, sin_h)
+        
+        cos_b, sin_b = self._get_rope_embed(T_b, x.device, x.dtype)
+        cos_b = cos_b.unsqueeze(0).unsqueeze(0)
+        sin_b = sin_b.unsqueeze(0).unsqueeze(0)
+        k_bev = apply_rope_single(k_bev, cos_b, sin_b)
+        
+        cos_v, sin_v = self._get_rope_embed(T_v, x.device, x.dtype)
+        cos_v = cos_v.unsqueeze(0).unsqueeze(0)
+        sin_v = sin_v.unsqueeze(0).unsqueeze(0)
+        k_vl = apply_rope_single(k_vl, cos_v, sin_v)
+        
+        # Task K (reasoning): only K gets RoPE
+        cos_r, sin_r = self._get_rope_embed(T_r, x.device, x.dtype)
+        cos_r = cos_r.unsqueeze(0).unsqueeze(0)
+        sin_r = sin_r.unsqueeze(0).unsqueeze(0)
+        k_reason = apply_rope_single(k_reason, cos_r, sin_r)
+        
+        # ========== Compute attention scores with temperature and bias ==========
+        scale = math.sqrt(self.head_dim)
+        
+        # Self-attention scores (with temperature and bias)
+        attn_self = torch.matmul(q_base, k_self.transpose(-2, -1)) * temp_self + self.bias_self  # (B, nhead, T, T)
+        
+        # Adapter cross-attention scores (with source-specific Q, temperature and bias)
+        attn_hist = torch.matmul(q_hist, k_hist.transpose(-2, -1)) * temp_hist + self.bias_hist  # (B, nhead, T, T_h)
+        attn_bev = torch.matmul(q_bev, k_bev.transpose(-2, -1)) * temp_bev + self.bias_bev       # (B, nhead, T, T_b)
+        attn_vl = torch.matmul(q_vl, k_vl.transpose(-2, -1)) * temp_vl + self.bias_vl           # (B, nhead, T, T_v)
+        
+        # Task cross-attention scores (with gating for Reasoning, temperature and bias)
+        attn_reason = torch.matmul(q_reason, k_reason.transpose(-2, -1)) * ratio_g * temp_reason + self.bias_reason  # (B, nhead, T, T_r)
+        
+        # ========== Build attention mask ==========
+        # Concatenate all attention scores
+        attn_scores = torch.cat([attn_self, attn_hist, attn_bev, attn_vl, attn_reason], dim=-1)
+        attn_scores = attn_scores / scale  # (B, nhead, T, T + T_h + T_b + T_v + T_r)
+        
+        # Apply self-attention mask if provided
+        if self_attn_mask is not None:
+            # self_attn_mask is for self-attention part only, need to expand
+            # Create full mask: (T, T + T_h + T_b + T_v + T_r)
+            total_kv_len = T + T_h + T_b + T_v + T_r
+            full_mask = torch.zeros(T, total_kv_len, device=x.device, dtype=x.dtype)
+            full_mask[:, :T] = self_attn_mask  # Apply causal mask to self-attention part
+            attn_scores = attn_scores + full_mask.unsqueeze(0).unsqueeze(0)
+        
+        # Apply padding masks
+        if hist_padding_mask is not None:
+            # hist_padding_mask: (B, T_h), True = padding
+            hist_mask = hist_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T_h)
+            attn_scores[:, :, :, T:T+T_h] = attn_scores[:, :, :, T:T+T_h].masked_fill(hist_mask, float('-inf'))
+        
+        if bev_padding_mask is not None:
+            bev_mask = bev_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores[:, :, :, T+T_h:T+T_h+T_b] = attn_scores[:, :, :, T+T_h:T+T_h+T_b].masked_fill(bev_mask, float('-inf'))
+        
+        if vl_padding_mask is not None:
+            vl_mask = vl_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores[:, :, :, T+T_h+T_b:T+T_h+T_b+T_v] = attn_scores[:, :, :, T+T_h+T_b:T+T_h+T_b+T_v].masked_fill(vl_mask, float('-inf'))
+        
+        if reasoning_padding_mask is not None:
+            reason_mask = reasoning_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores[:, :, :, T+T_h+T_b+T_v:] = attn_scores[:, :, :, T+T_h+T_b+T_v:].masked_fill(reason_mask, float('-inf'))
+        
+        # ========== Softmax and weighted sum ==========
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # (B, nhead, T, total_kv_len)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Concatenate all values
+        v_combined = torch.cat([v_self, v_hist, v_bev, v_vl, v_reason], dim=2)  # (B, nhead, total_kv_len, head_dim)
+        
+        # Weighted sum
+        output = torch.matmul(attn_weights, v_combined)  # (B, nhead, T, head_dim)
+        
+        # ========== Reshape and output projection ==========
+        output = output.transpose(1, 2).contiguous().view(B, T, C)
+        output = self.o_proj(output)
+        
+        # ========== Residual with gate ==========
+        x = x + gate_attn.unsqueeze(1) * output
+        
+        # ========== FFN with AdaLN ==========
+        x_norm_ffn = self.modulate(nn.functional.layer_norm(x, [C]), shift_ffn, scale_ffn)
+        x_ffn = self.ffn(x_norm_ffn)
+        x = x + gate_ffn.unsqueeze(1) * x_ffn
+        
+        return x
+
+
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal position embedding for diffusion timesteps."""
     def __init__(self, dim):
@@ -254,310 +600,6 @@ class TrajectoryMLPHead(nn.Module):
 
 
 # =============================================================================
-# Decoder-Only Block
-# =============================================================================
-
-class DecoderOnlyBlock(nn.Module):
-    """
-    Decoder-Only Block with Sequential Cross-Attention to Multiple Condition Sources.
-    
-    Architecture (per block):
-        1. Self-Attention on query (trajectory + route) with causal mask
-        2. Cross-Attention to History status tokens (complete low-dim ego status sequence)
-        3. Cross-Attention to BEV spatial tokens
-        4. Cross-Attention to VL tokens (vision-language features)
-        5. Cross-Attention to Reasoning tokens
-        6. Feed-Forward Network
-        
-    Note: State tokens from BEV encoder are NOT used here since History already
-    contains complete low-dim status information (speed, theta, command, etc.)
-        
-    All operations use AdaLN modulation conditioned on timestep + current_ego_status.
-    """
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, 
-                 dropout: float = 0.1, batch_first: bool = True):
-        super().__init__()
-        self.d_model = d_model
-        self.nhead = nhead
-        
-        # 1. Self-Attention
-        self.self_attn = MultiheadAttentionWithQKNorm(
-            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
-        )
-        
-        # 2-5. Cross-Attention layers (no State cross-attn since History contains status)
-        self.hist_cross_attn = MultiheadAttentionWithQKNorm(
-            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
-        )
-        self.bev_cross_attn = MultiheadAttentionWithQKNorm(
-            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
-        )
-        self.vl_cross_attn = MultiheadAttentionWithQKNorm(
-            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
-        )
-        self.reasoning_cross_attn = MultiheadAttentionWithQKNorm(
-            d_model, nhead, dropout=dropout, batch_first=batch_first, norm_type="rmsnorm"
-        )
-        
-        # 6. FFN
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.dropout = nn.Dropout(dropout)
-        
-        # Layer Norms (6 groups: self, hist, bev, vl, reasoning, ffn)
-        self.norm_self = nn.LayerNorm(d_model)
-        self.norm_hist = nn.LayerNorm(d_model)
-        self.norm_bev = nn.LayerNorm(d_model)
-        self.norm_vl = nn.LayerNorm(d_model)
-        self.norm_reasoning = nn.LayerNorm(d_model)
-        self.norm_ffn = nn.LayerNorm(d_model)
-        
-        self.activation = nn.GELU()
-        
-        # AdaLN modulation - 18 params: 6 groups x 3 (shift, scale, gate)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(d_model, 18 * d_model, bias=True)
-        )
-    
-    def modulate(self, x, shift, scale):
-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        hist_tokens: torch.Tensor,  # (B, To, d_model) - history status sequence
-        bev_tokens: torch.Tensor,
-        vl_tokens: torch.Tensor,
-        reasoning_tokens: torch.Tensor,
-        conditioning: torch.Tensor,
-        self_attn_mask: Optional[torch.Tensor] = None,
-        hist_padding_mask: Optional[torch.Tensor] = None,
-        bev_padding_mask: Optional[torch.Tensor] = None,
-        vl_padding_mask: Optional[torch.Tensor] = None,
-        reasoning_padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Generate modulation parameters
-        mod_params = self.adaLN_modulation(conditioning)
-        (shift_self, scale_self, gate_self,
-         shift_hist, scale_hist, gate_hist,
-         shift_bev, scale_bev, gate_bev,
-         shift_vl, scale_vl, gate_vl,
-         shift_reason, scale_reason, gate_reason,
-         shift_ffn, scale_ffn, gate_ffn) = mod_params.chunk(18, dim=1)
-        
-        # 1. Self-Attention
-        x_norm = self.modulate(self.norm_self(x), shift_self, scale_self)
-        x_self, _ = self.self_attn(x_norm, x_norm, x_norm, attn_mask=self_attn_mask)
-        x = x + gate_self.unsqueeze(1) * x_self
-        
-        # 2. Cross-Attention to History status (contains complete low-dim state info)
-        x_norm = self.modulate(self.norm_hist(x), shift_hist, scale_hist)
-        x_hist, _ = self.hist_cross_attn(x_norm, hist_tokens, hist_tokens, key_padding_mask=hist_padding_mask)
-        x = x + gate_hist.unsqueeze(1) * x_hist
-        
-        # 3. Cross-Attention to BEV
-        x_norm = self.modulate(self.norm_bev(x), shift_bev, scale_bev)
-        x_bev, _ = self.bev_cross_attn(x_norm, bev_tokens, bev_tokens, key_padding_mask=bev_padding_mask)
-        x = x + gate_bev.unsqueeze(1) * x_bev
-        
-        # 4. Cross-Attention to VL
-        x_norm = self.modulate(self.norm_vl(x), shift_vl, scale_vl)
-        x_vl, _ = self.vl_cross_attn(x_norm, vl_tokens, vl_tokens, key_padding_mask=vl_padding_mask)
-        x = x + gate_vl.unsqueeze(1) * x_vl
-        
-        # 5. Cross-Attention to Reasoning
-        x_norm = self.modulate(self.norm_reasoning(x), shift_reason, scale_reason)
-        x_reason, _ = self.reasoning_cross_attn(x_norm, reasoning_tokens, reasoning_tokens, 
-                                                 key_padding_mask=reasoning_padding_mask)
-        x = x + gate_reason.unsqueeze(1) * x_reason
-        
-        # 6. FFN
-        x_norm = self.modulate(self.norm_ffn(x), shift_ffn, scale_ffn)
-        x_ffn = self.linear2(self.dropout(self.activation(self.linear1(x_norm))))
-        x = x + gate_ffn.unsqueeze(1) * x_ffn
-        
-        return x
-
-
-# =============================================================================
-# Decoder-Only Transformer
-# =============================================================================
-
-class DecoderOnlyTransformer(nn.Module):
-    """
-    Decoder-Only Transformer with sequential cross-attention to multiple condition sources.
-    """
-    def __init__(
-        self,
-        d_model: int = 768,
-        nhead: int = 12,
-        num_layers: int = 12,
-        dim_feedforward: int = 3072,
-        dropout: float = 0.1,
-        bev_dim: int = 512,
-        state_dim: int = 128,
-        vl_dim: int = 1536,
-        reasoning_dim: int = 1536,
-        max_seq_len: int = 64,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.num_layers = num_layers
-        
-        # Projection layers
-        self.bev_proj = nn.Sequential(nn.Linear(bev_dim, d_model), nn.LayerNorm(d_model))
-        self.state_proj = nn.Sequential(nn.Linear(state_dim, d_model), nn.LayerNorm(d_model))
-        self.vl_proj = nn.Sequential(nn.Linear(vl_dim, d_model), nn.LayerNorm(d_model))
-        self.reasoning_proj = nn.Sequential(nn.Linear(reasoning_dim, d_model), nn.LayerNorm(d_model))
-        
-        # BEV position embedding
-        self.bev_pos_emb = nn.Parameter(torch.zeros(1, 256, d_model))
-        
-        # Decoder blocks
-        self.layers = nn.ModuleList([
-            DecoderOnlyBlock(d_model, nhead, dim_feedforward, dropout, batch_first=True)
-            for _ in range(num_layers)
-        ])
-        
-        self.final_norm = nn.LayerNorm(d_model)
-        self._init_weights()
-    
-    def _init_weights(self):
-        nn.init.normal_(self.bev_pos_emb, mean=0.0, std=0.02)
-        for layer in self.layers:
-            nn.init.zeros_(layer.adaLN_modulation[-1].weight)
-            nn.init.zeros_(layer.adaLN_modulation[-1].bias)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        bev_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        vl_tokens: torch.Tensor,
-        reasoning_tokens: torch.Tensor,
-        conditioning: torch.Tensor,
-        self_attn_mask: Optional[torch.Tensor] = None,
-        bev_padding_mask: Optional[torch.Tensor] = None,
-        state_padding_mask: Optional[torch.Tensor] = None,
-        vl_padding_mask: Optional[torch.Tensor] = None,
-        reasoning_padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        # Project conditions
-        bev_proj = self.bev_proj(bev_tokens)
-        bev_seq_len = bev_proj.shape[1]
-        if bev_seq_len <= self.bev_pos_emb.shape[1]:
-            bev_proj = bev_proj + self.bev_pos_emb[:, :bev_seq_len, :]
-        
-        state_proj = self.state_proj(state_tokens)
-        vl_proj = self.vl_proj(vl_tokens)
-        reasoning_proj = self.reasoning_proj(reasoning_tokens)
-        
-        # Decoder layers
-        for layer in self.layers:
-            x = layer(x, bev_proj, state_proj, vl_proj, reasoning_proj, conditioning,
-                     self_attn_mask, bev_padding_mask, state_padding_mask, 
-                     vl_padding_mask, reasoning_padding_mask)
-        
-        return self.final_norm(x)
-
-
-# =============================================================================
-# Route Head (Decoder-Only) - DEPRECATED, kept for reference
-# =============================================================================
-
-class AdaLNRouteHeadDecoderOnly(nn.Module):
-    """Route prediction head using sequential cross-attention to conditions.
-    
-    DEPRECATED: Use unified decoder with heterogeneous queries instead.
-    """
-    def __init__(
-        self,
-        n_emb: int,
-        num_waypoints: int = 20,
-        status_dim: int = 12,
-        n_layers: int = 2,
-        n_head: int = 8,
-        p_drop: float = 0.1,
-        bev_dim: int = 512,
-        state_dim: int = 128,
-        vl_dim: int = 1536,
-        reasoning_dim: int = 1536,
-    ):
-        super().__init__()
-        self.num_waypoints = num_waypoints
-        self.n_emb = n_emb
-        
-        self.status_proj = nn.Sequential(
-            nn.Linear(status_dim, n_emb), nn.SiLU(), nn.Linear(n_emb, n_emb)
-        )
-        
-        self.route_queries = nn.Parameter(torch.randn(1, num_waypoints, n_emb))
-        self.route_pos_emb = nn.Parameter(torch.randn(1, num_waypoints, n_emb))
-        
-        self.bev_proj = nn.Sequential(nn.Linear(bev_dim, n_emb), nn.LayerNorm(n_emb))
-        self.state_proj = nn.Sequential(nn.Linear(state_dim, n_emb), nn.LayerNorm(n_emb))
-        self.vl_proj = nn.Sequential(nn.Linear(vl_dim, n_emb), nn.LayerNorm(n_emb))
-        self.reasoning_proj = nn.Sequential(nn.Linear(reasoning_dim, n_emb), nn.LayerNorm(n_emb))
-        
-        self.blocks = nn.ModuleList([
-            DecoderOnlyBlock(n_emb, n_head, 4 * n_emb, p_drop, batch_first=True)
-            for _ in range(n_layers)
-        ])
-        
-        self.final_norm = nn.LayerNorm(n_emb)
-        self.final_adaLN = nn.Sequential(nn.SiLU(), nn.Linear(n_emb, 2 * n_emb, bias=True))
-        self.output_proj = nn.Linear(n_emb, 2)
-        
-        self._init_weights()
-    
-    def _init_weights(self):
-        nn.init.normal_(self.route_queries, mean=0.0, std=0.02)
-        nn.init.normal_(self.route_pos_emb, mean=0.0, std=0.02)
-        for block in self.blocks:
-            nn.init.zeros_(block.adaLN_modulation[-1].weight)
-            nn.init.zeros_(block.adaLN_modulation[-1].bias)
-        nn.init.zeros_(self.final_adaLN[-1].weight)
-        nn.init.zeros_(self.final_adaLN[-1].bias)
-    
-    def forward(
-        self,
-        bev_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        vl_tokens: torch.Tensor,
-        reasoning_tokens: torch.Tensor,
-        ego_status: torch.Tensor,
-        conditioning: torch.Tensor,
-        bev_padding_mask: Optional[torch.Tensor] = None,
-        state_padding_mask: Optional[torch.Tensor] = None,
-        vl_padding_mask: Optional[torch.Tensor] = None,
-        reasoning_padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B = bev_tokens.shape[0]
-        
-        if ego_status.dim() == 3:
-            ego_status = ego_status[:, -1, :]
-        
-        route_conditioning = self.status_proj(ego_status) + conditioning
-        x = self.route_queries.expand(B, -1, -1) + self.route_pos_emb
-        
-        bev_proj = self.bev_proj(bev_tokens)
-        state_proj = self.state_proj(state_tokens)
-        vl_proj = self.vl_proj(vl_tokens)
-        reasoning_proj = self.reasoning_proj(reasoning_tokens)
-        
-        for block in self.blocks:
-            x = block(x, bev_proj, state_proj, vl_proj, reasoning_proj, route_conditioning,
-                     None, bev_padding_mask, state_padding_mask, vl_padding_mask, reasoning_padding_mask)
-        
-        x = self.final_norm(x)
-        shift, scale = self.final_adaLN(route_conditioning).chunk(2, dim=1)
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        
-        return self.output_proj(x)
-
-
-# =============================================================================
 # Unified Decoder with Heterogeneous Queries
 # =============================================================================
 
@@ -569,11 +611,14 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
     into a single decoder, using:
     - Segment embeddings to distinguish query types (trajectory vs route)
     - History status as cross-attention source (contains complete low-dim state info)
-    - Shared cross-attention to all condition sources
+    - Multi-source attention with RoPE and gating (MLPResNetBlock_Pro style)
     - Separate output heads for trajectory and route
     
     Query structure: [trajectory (horizon) | route (num_waypoints)]
-    Cross-attention sources: History -> BEV -> VL -> Reasoning
+    Cross-attention sources: All fused in single attention operation with:
+        - Self-attention with RoPE on Q and K
+        - Adapter cross-attention (hist, bev, vl) with RoPE on K only
+        - Task cross-attention (reasoning) with RoPE on K only + gating
     
     Note: No separate State cross-attention since History already contains
     complete low-dim status (speed, theta, command, target_point, waypoints).
@@ -620,9 +665,9 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.traj_segment_emb = nn.Parameter(torch.zeros(1, 1, d_model))
         self.route_segment_emb = nn.Parameter(torch.zeros(1, 1, d_model))
         
-        # Decoder blocks
+        # Decoder blocks - using new MultiSourceAttentionBlock
         self.layers = nn.ModuleList([
-            DecoderOnlyBlock(d_model, nhead, dim_feedforward, dropout, batch_first=True)
+            MultiSourceAttentionBlock(d_model, nhead, dim_feedforward, dropout)
             for _ in range(num_layers)
         ])
         
@@ -655,7 +700,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         reasoning_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass with unified queries.
+        Forward pass with unified queries and multi-source attention.
         
         Args:
             traj_emb: (B, horizon, d_model) - trajectory query embeddings (noisy traj embedded)
@@ -696,11 +741,21 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         vl_proj = self.vl_proj(vl_tokens)
         reasoning_proj = self.reasoning_proj(reasoning_tokens)
         
-        # Decoder layers: History -> BEV -> VL -> Reasoning
+        # Decoder layers with multi-source attention
         for layer in self.layers:
-            x = layer(x, hist_proj, bev_proj, vl_proj, reasoning_proj, conditioning,
-                     self_attn_mask, hist_padding_mask, bev_padding_mask,
-                     vl_padding_mask, reasoning_padding_mask)
+            x = layer(
+                x, 
+                hist_proj, 
+                bev_proj, 
+                vl_proj, 
+                reasoning_proj, 
+                conditioning,
+                self_attn_mask, 
+                hist_padding_mask, 
+                bev_padding_mask,
+                vl_padding_mask, 
+                reasoning_padding_mask
+            )
         
         x = self.final_norm(x)
         
@@ -865,11 +920,19 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 no_decay.add(name)
             elif 'route_queries' in name or 'pool_query' in name:
                 no_decay.add(name)
+            elif 'gating_factor' in name:
+                no_decay.add(name)
+            elif 'temp_' in name or 'bias_' in name:
+                # Temperature and bias parameters - no weight decay
+                no_decay.add(name)
+            elif 'inv_freq' in name:
+                # inv_freq is a buffer, should not be in param_dict, but handle if exists
+                no_decay.add(name)
         
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0
-        assert len(param_dict.keys() - union_params) == 0
+        assert len(param_dict.keys() - union_params) == 0, f"Missing params: {param_dict.keys() - union_params}"
         
         return [
             {"params": [param_dict[pn] for pn in sorted(decay)], "weight_decay": weight_decay},
