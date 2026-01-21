@@ -10,32 +10,21 @@ from tqdm import tqdm
 import torch.nn.functional as F
 from collections import defaultdict
 import argparse
+import datetime
+from torch.distributed.elastic.multiprocessing.errors import record
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-from dataset.nusc_dataset import NUSCDataset, collate_fn
+from dataset.senna_dataset import SennaDataset
 from policy.diffusion_dit_nusc_policy import DiffusionDiTCarlaPolicy
 
 def load_config(config_path=None):
     if config_path is None:
-        config_path = os.path.join(project_root, "config", "nuscenes.yaml")
+        config_path = os.path.join(project_root, "config", "pdm_server.yaml")
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
 
-def load_action_stats(config):
-    if 'action_stats' in config:
-        action_stats = {
-            'min': torch.tensor(config['action_stats']['min'], dtype=torch.float32),
-            'max': torch.tensor(config['action_stats']['max'], dtype=torch.float32),
-            'mean': torch.tensor(config['action_stats']['mean'], dtype=torch.float32),
-            'std': torch.tensor(config['action_stats']['std'], dtype=torch.float32),
-        }
-        print("✓ Loaded action_stats from config file")
-        return action_stats
-    else:
-        print("⚠ No action_stats found in config, action normalization will be disabled")
-        return None
 
 
 def safe_wandb_log(data, use_wandb=True):
@@ -91,91 +80,6 @@ def safe_wandb_finish(use_wandb=True):
     wandb.finish(quiet=True, exit_code=0)
 
 
-def check_box_collision_2d(boxes1, boxes2):
-    """
-    使用分离轴定理(SAT)检测2D边界框碰撞
-    
-    Args:
-        boxes1: (N, 5) 或 (1, 5) [x, y, w, l, yaw] 边界框
-        boxes2: (N, 5) 或 (M, 5) [x, y, w, l, yaw] 边界框
-    
-    Returns:
-        collision: bool数组 (N,)，True表示发生碰撞
-    """
-    N1, N2 = boxes1.shape[0], boxes2.shape[0]
-    
-    if N1 == 0 or N2 == 0:
-        return np.zeros(max(N1, N2), dtype=bool)
-    
-    def get_box_corners(x, y, w, l, yaw):
-        corners_local = np.array([
-            [-l/2, -w/2],  
-            [l/2, -w/2],   
-            [l/2, w/2],    
-            [-l/2, w/2]    
-        ])
-        
-        cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
-        rot_mat = np.array([[cos_yaw, -sin_yaw],
-                           [sin_yaw, cos_yaw]])
-        corners_global = corners_local @ rot_mat.T + np.array([x, y])
-        return corners_global
-    
-    def get_axes(corners):
-        edges = np.array([
-            corners[1] - corners[0],  
-            corners[2] - corners[1],  
-        ])
-        axes = np.array([
-            [-edges[0, 1], edges[0, 0]],  
-            [-edges[1, 1], edges[1, 0]],  
-        ])
-        norm = np.linalg.norm(axes, axis=1, keepdims=True)
-        norm = np.where(norm < 1e-10, 1.0, norm)
-        axes = axes / norm
-        return axes
-    
-    def project_onto_axis(corners, axis):
-        projections = corners @ axis
-        return np.min(projections), np.max(projections)
-    
-    def check_overlap_on_axis(corners1, corners2, axis):
-        min1, max1 = project_onto_axis(corners1, axis)
-        min2, max2 = project_onto_axis(corners2, axis)
-        return max1 >= min2 and max2 >= min1
-    
-    def check_collision_single_pair(box1, box2):
-        x1, y1, w1, l1, yaw1 = box1
-        x2, y2, w2, l2, yaw2 = box2
-        
-        corners1 = get_box_corners(x1, y1, w1, l1, yaw1)
-        corners2 = get_box_corners(x2, y2, w2, l2, yaw2)
-
-        axes1 = get_axes(corners1)
-        axes2 = get_axes(corners2)
-        all_axes = np.vstack([axes1, axes2])
-
-        for axis in all_axes:
-            if not check_overlap_on_axis(corners1, corners2, axis):
-                return False
-        
-        return True
-    
-    if N1 == 1 and N2 > 1:
-        collision_mask = np.zeros(N2, dtype=bool)
-        for i in range(N2):
-            collision_mask[i] = check_collision_single_pair(boxes1[0], boxes2[i])
-        return collision_mask
-    
-    elif N1 == N2:
-        collision_mask = np.zeros(N1, dtype=bool)
-        for i in range(N1):
-            collision_mask[i] = check_collision_single_pair(boxes1[i], boxes2[i])
-        return collision_mask
-    
-    else:
-        raise ValueError(f"Unsupported box shapes: boxes1 {boxes1.shape}, boxes2 {boxes2.shape}. "
-                        f"Expected either same shape (N, 5) or boxes1=(1, 5), boxes2=(M, 5)")
 
 
 def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obstacles=None):
@@ -205,114 +109,34 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     metrics = {}
     
     # === L2 误差指标 ===
+    # ST-P3/VAD metric: prefix mean (2Hz & future starts at 0.5s)
+    idx_1s, idx_2s, idx_3s = 1, 3, 5
 
     if T >= 2:  
-        metrics['L2_1s'] = np.mean(l2_errors[:, 1])
+        # L2_1s: mean of errors from index 0 to idx_1s (inclusive)
+        metrics['L2_1s'] = np.mean(l2_errors[:, :idx_1s+1])
     
     if T >= 4:  
-        metrics['L2_2s'] = np.mean(l2_errors[:, 3])
+        # L2_2s: mean of errors from index 0 to idx_2s (inclusive)
+        metrics['L2_2s'] = np.mean(l2_errors[:, :idx_2s+1])
     
     if T >= 6: 
-        metrics['L2_3s'] = np.mean(l2_errors[:, 5])
+        # L2_3s: mean of errors from index 0 to idx_3s (inclusive)
+        metrics['L2_3s'] = np.mean(l2_errors[:, :idx_3s+1])
     
-    # L2_avg: 只计算1s, 2s, 3s时间步的平均
+    # L2_avg: average of L2_1s, L2_2s, L2_3s
     l2_avg_values = []
-    if T >= 2:
-        l2_avg_values.append(l2_errors[:, 1])
-    if T >= 4:
-        l2_avg_values.append(l2_errors[:, 3])
-    if T >= 6:
-        l2_avg_values.append(l2_errors[:, 5])
+    if 'L2_1s' in metrics:
+        l2_avg_values.append(metrics['L2_1s'])
+    if 'L2_2s' in metrics:
+        l2_avg_values.append(metrics['L2_2s'])
+    if 'L2_3s' in metrics:
+        l2_avg_values.append(metrics['L2_3s'])
     
     if len(l2_avg_values) > 0:
-        metrics['L2_avg'] = np.mean(np.concatenate(l2_avg_values))
+        metrics['L2_avg'] = np.mean(l2_avg_values)
     else:
         metrics['L2_avg'] = 0.0
-    
-    # === 碰撞率指标（基于边界框重叠检测）===
-    if fut_obstacles is not None:
-        ego_length = 4.084  
-        ego_width = 1.730   
-        collisions = np.zeros((B, T), dtype=np.float32)
-        
-        for b in range(B):
-            for t in range(T):
-                pred_x = predicted_trajectories[b, t, 0]
-                pred_y = predicted_trajectories[b, t, 1]
-                
-                if t > 0:
-                    dx = predicted_trajectories[b, t, 0] - predicted_trajectories[b, t-1, 0]
-                    dy = predicted_trajectories[b, t, 1] - predicted_trajectories[b, t-1, 1]
-
-                    if np.sqrt(dx**2 + dy**2) > 0.01:  
-                        pred_yaw = np.arctan2(dy, dx)
-                    elif t > 1:
-                        dx_prev = predicted_trajectories[b, t-1, 0] - predicted_trajectories[b, t-2, 0]
-                        dy_prev = predicted_trajectories[b, t-1, 1] - predicted_trajectories[b, t-2, 1]
-                        pred_yaw = np.arctan2(dy_prev, dx_prev)
-                    else:
-                        pred_yaw = 0.0
-                else:
-                    if T > 1:
-                        dx = predicted_trajectories[b, 1, 0] - predicted_trajectories[b, 0, 0]
-                        dy = predicted_trajectories[b, 1, 1] - predicted_trajectories[b, 0, 1]
-                        if np.sqrt(dx**2 + dy**2) > 0.01:
-                            pred_yaw = np.arctan2(dy, dx)
-                        else:
-                            pred_yaw = 0.0  
-                    else:
-                        pred_yaw = 0.0  
-                
-                pred_box = np.array([[pred_x, pred_y, ego_width, ego_length, pred_yaw]])
-                
-                # 获取该时刻的障碍物边界框
-                obstacles_at_t = fut_obstacles[b][t]
-                
-                if isinstance(obstacles_at_t['gt_boxes'], torch.Tensor):
-                    obs_boxes = obstacles_at_t['gt_boxes'].cpu().numpy()  # (N, 7)
-                else:
-                    obs_boxes = obstacles_at_t['gt_boxes']
-                
-                if len(obs_boxes) == 0:
-                    collisions[b, t] = 0.0
-                    continue
-                
-                obs_boxes_2d = np.zeros((len(obs_boxes), 5))
-                obs_boxes_2d[:, 0] = obs_boxes[:, 0]  # x
-                obs_boxes_2d[:, 1] = obs_boxes[:, 1]  # y
-                obs_boxes_2d[:, 2] = obs_boxes[:, 4]  # w (width, y方向)
-                obs_boxes_2d[:, 3] = obs_boxes[:, 3]  # l (length, x方向)
-                obs_boxes_2d[:, 4] = obs_boxes[:, 6]  # yaw
-                
-                collision_mask = check_box_collision_2d(
-                    pred_box,  # (1, 5)
-                    obs_boxes_2d  # (N, 5)
-                )  # (1, N)
-                
-                collisions[b, t] = 1.0 if np.any(collision_mask) else 0.0
-        
-        if T >= 2:
-            metrics['collision_1s'] = np.mean(collisions[:, 1])
-        
-        if T >= 4:
-            metrics['collision_2s'] = np.mean(collisions[:, 3])
-        
-        if T >= 6:
-            metrics['collision_3s'] = np.mean(collisions[:, 5])
-        
-        # collision_avg: 只计算1s, 2s, 3s时间步的平均
-        collision_avg_values = []
-        if T >= 2:
-            collision_avg_values.append(collisions[:, 1])
-        if T >= 4:
-            collision_avg_values.append(collisions[:, 3])
-        if T >= 6:
-            collision_avg_values.append(collisions[:, 5])
-        
-        if len(collision_avg_values) > 0:
-            metrics['collision_avg'] = np.mean(np.concatenate(collision_avg_values))
-        else:
-            metrics['collision_avg'] = 0.0
     
     safe_metrics = {}
     for key, value in metrics.items():
@@ -327,84 +151,137 @@ def compute_driving_metrics(predicted_trajectories, target_trajectories, fut_obs
     
     return safe_metrics
 
-def validate_model(policy, val_loader, device):
-
-    policy.eval()
-    val_metrics = defaultdict(list)
-    with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Validating", leave=False)
-        for batch_idx, batch in enumerate(pbar):
-            for key in batch:
-                if isinstance(batch[key], torch.Tensor):
-                    batch[key] = batch[key].to(device)
-
-            loss = policy.compute_loss(batch)
-            val_metrics['loss'].append(loss.item())
-            
-            obs_dict = {
-                'lidar_token': batch['lidar_token'][:, :policy.n_obs_steps],
-                'lidar_token_global': batch['lidar_token_global'][:, :policy.n_obs_steps],
-                'ego_status': batch['ego_status'][:, :policy.n_obs_steps],  # (B, obs_horizon, 13)
-            }
-            target_actions = batch['agent_pos']  
-            
-            try:
-                result = policy.predict_action(obs_dict)
-                predicted_actions = torch.from_numpy(result['action']).to(device)
-                
-                if target_actions.dim() == 3:  # (B, T, 2)
-                    target_actions = target_actions[:, :predicted_actions.shape[1]]
-                elif target_actions.dim() == 2:  # (B, 2) 
-                    target_actions = target_actions.unsqueeze(1)  # (B, 1, 2)
-                
-                fut_obstacles = batch.get('fut_obstacles', None)
-
-                driving_metrics = compute_driving_metrics(
-                    predicted_actions, 
-                    target_actions, 
-                    fut_obstacles=fut_obstacles 
-                )
-                for key, value in driving_metrics.items():
-                    val_metrics[key].append(value)
-                    
-                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
-            except Exception as e:
-                print(f"Warning: Error in action prediction during validation: {e}")
-                continue
-    
-    pbar.close() 
-    
-    averaged_metrics = {}
-    for key, values in val_metrics.items():
-        if values:  
-            mean_value = np.mean(values)
-            if np.isnan(mean_value):
-                print(f"Warning: computed NaN for metric 'val_{key}'")
-                averaged_metrics[f'val_{key}'] = 0.0  
-            elif np.isinf(mean_value):
-                print(f"Warning: computed Inf for metric 'val_{key}'")
-                averaged_metrics[f'val_{key}'] = 1e10 if mean_value > 0 else -1e10 
-            else:
-                averaged_metrics[f'val_{key}'] = mean_value
-        
-    return averaged_metrics
-
-def train_nusc_policy(config_path):
+def validate_model(policy, val_loader, device, rank=0, world_size=1):
     """
-    训练nuScenes驾驶策略模型
+    Validation function for distributed training
+    Only rank 0 will compute and log metrics
+    """
+    policy.eval()
+    
+    # Get the actual model (unwrap DDP if needed)
+    model_for_inference = policy.module if world_size > 1 else policy
+    
+    val_metrics = defaultdict(list)
+    
+    # Only rank 0 performs validation
+    if rank == 0:
+        with torch.no_grad():
+            pbar = tqdm(val_loader, desc="Validating", leave=False)
+            
+            for batch_idx, batch in enumerate(pbar):
+                for key in batch:
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(device)
+
+                loss = model_for_inference.compute_loss(batch)
+                val_metrics['loss'].append(loss.item())
+                
+                obs_dict = {
+                    'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
+                    'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
+                    'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
+                    'vit_hidden_states': batch['vit_hidden_states'],
+                    'reasoning_hidden_states': batch['reasoning_hidden_states'],
+                    'action_hidden_states': batch['action_hidden_states'],
+                    'anchor_trajectory': batch['anchor_trajectory']  # Pass anchor for truncated diffusion
+                }
+                target_actions = batch['agent_pos']  
+                
+                try:
+                    # Model always returns route prediction
+                    result = model_for_inference.predict_action(obs_dict)
+                    predicted_actions = torch.from_numpy(result['action']).to(device)
+                    
+                    if target_actions.dim() == 3:  # (B, T, 2)
+                        target_actions = target_actions[:, :predicted_actions.shape[1]]
+                    elif target_actions.dim() == 2:  # (B, 2) 
+                        target_actions = target_actions.unsqueeze(1)  # (B, 1, 2)
+                    
+                    # Note: fut_obstacles removed from dataset to avoid collate issues
+                    driving_metrics = compute_driving_metrics(
+                        predicted_actions, 
+                        target_actions, 
+                        fut_obstacles=None
+                    )
+                    for key, value in driving_metrics.items():
+                        val_metrics[key].append(value)
+                        
+                    pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+                except Exception as e:
+                    print(f"Warning: Error in action prediction during validation: {e}")
+                    continue
+        
+            pbar.close() 
+    
+        # Compute averaged metrics
+        averaged_metrics = {}
+        for key, values in val_metrics.items():
+            if values:  
+                mean_value = np.mean(values)
+                if np.isnan(mean_value):
+                    print(f"Warning: computed NaN for metric 'val_{key}'")
+                    averaged_metrics[f'val_{key}'] = 0.0  
+                elif np.isinf(mean_value):
+                    print(f"Warning: computed Inf for metric 'val_{key}'")
+                    averaged_metrics[f'val_{key}'] = 1e10 if mean_value > 0 else -1e10 
+                else:
+                    averaged_metrics[f'val_{key}'] = mean_value
+        
+        return averaged_metrics
+    else:
+        return {}
+
+@record  # Records error and tracebacks in case of failure
+def train_pdm_policy(config_path):
+    """
+    Multi-GPU distributed training for PDM policy
     
     Args:
         config_path: 配置文件路径
     """
-    print("Initializing nuScenes driving policy training...")
+    torch.cuda.empty_cache()
+    
+    print("Initializing pdm driving policy training...")
     config = load_config(config_path=config_path)
 
+    # Initialize distributed training
+    rank = int(os.environ.get('RANK', 0))  # Rank across all processes
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))  # Rank on Node
+    world_size = int(os.environ.get('WORLD_SIZE', 1))  # Number of processes
+    
+    # Single GPU fallback
+    if world_size == 1:
+        print("Running in single GPU mode")
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    else:
+        print(f'RANK, LOCAL_RANK and WORLD_SIZE: {rank}/{local_rank}/{world_size}')
+        device = torch.device(f'cuda:{local_rank}')
+        
+        # Initialize process group
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank,
+            timeout=datetime.timedelta(minutes=15)
+        )
+        
+        torch.cuda.set_device(device)
+    
+    # Enable performance optimizations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.allow_tf32 = True
+    
+    print(f'Rank: {rank}, Device: {device}, World size: {world_size}')
+    
+    # Only rank 0 should initialize wandb
     wandb_mode = os.environ.get('WANDB_MODE', 'online') 
-    use_wandb = config.get('logging', {}).get('use_wandb', True)
+    use_wandb = config.get('logging', {}).get('use_wandb', True) and (rank == 0)
     
     if use_wandb:
         try:
-            # 支持从config动态读取wandb账号信息并自动登录（谨慎：不要把真实api key提交到仓库）
             logging_cfg = config.get('logging', {})
             wandb_entity = logging_cfg.get('wandb_entity')
             wandb_api_key = logging_cfg.get('wandb_api_key')
@@ -447,224 +324,412 @@ def train_nusc_policy(config_path):
         except Exception as e:
             print(f"⚠ WandB initialization failed: {e}")
             use_wandb = False
-    else:
-        use_wandb = False
-    
-    # 从config读取GPU ID配置
-    device_config = config.get('device', {})
-    gpu_ids = device_config.get('gpu_ids', [0])
-    
-    # 设置GPU和CUDA相关环境变量
-    if torch.cuda.is_available() and gpu_ids:
-        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
-        device = torch.device(f'cuda:{gpu_ids[0]}')
-        print(f"✓ Using GPU(s): {gpu_ids}")
-    else:
-        device = torch.device('cpu')
-        print("✓ Using CPU")
 
-    # 加载nuScenes数据集
-    print("\n=== Loading nuScenes Dataset ===")
-    nuscenes_config = config.get('nuscenes', {})
-    processed_data_root = nuscenes_config.get('processed_data_root', '/home/wang/Dataset/v1.0-mini/processed_data')
-    dataset_root = nuscenes_config.get('dataset_root', '/home/wang/Dataset/v1.0-mini')
+    # dataset
+    # For SennaDataset: processed_data_path is the pkl file, dataset_root is nuScenes root
+    processed_data_dir = config.get('training', {}).get('dataset_path')
+    train_processed_path = os.path.join(processed_data_dir, 'senna_train_4obs_with_features.pkl')
+    val_processed_path = os.path.join(processed_data_dir, 'senna_val_4obs_with_features.pkl')
+    dataset_root = config.get('training', {}).get('image_data_root')
     
-    train_pkl = os.path.join(processed_data_root, 'nuscenes_processed_train.pkl')
-    val_pkl = os.path.join(processed_data_root, 'nuscenes_processed_val.pkl')
-    
-    print(f"Train data: {train_pkl}")
-    print(f"Val data: {val_pkl}")
-    
-    train_dataset = NUSCDataset(
-        processed_data_path=train_pkl,
+    train_dataset = SennaDataset(
+        processed_data_path=train_processed_path, 
         dataset_root=dataset_root,
         mode='train',
-        load_bev_images=False 
+        load_bev_images=False,
+        load_hidden_states=True
     )
-    
-    val_dataset = NUSCDataset(
-        processed_data_path=val_pkl,
+    val_dataset = SennaDataset(
+        processed_data_path=val_processed_path, 
         dataset_root=dataset_root,
         mode='val',
-        load_bev_images=False  
+        load_bev_images=False,
+        load_hidden_states=True
     )
-    action_stats = load_action_stats(config)
+
+    if rank == 0:
+        print(f"\nTraining samples: {len(train_dataset)}")
+        print(f"Validation samples: {len(val_dataset)}")
+    
+
     
     batch_size = config.get('dataloader', {}).get('batch_size', 32)
     num_workers = config.get('dataloader', {}).get('num_workers', 4)
     persistent_workers = config.get('dataloader', {}).get('persistent_workers', True)
     prefetch_factor = config.get('dataloader', {}).get('prefetch_factor', 2)
     
+    # Use DistributedSampler for multi-GPU training
+    if world_size > 1:
+        sampler_train = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            shuffle=True,
+            num_replicas=world_size,
+            rank=rank,
+            drop_last=True
+        )
+        # For validation, only rank 0 needs the full dataset
+        # Other ranks don't participate in validation
+        sampler_val = None
+    else:
+        sampler_train = None
+        sampler_val = None
+    
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=persistent_workers if num_workers > 0 else False,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        collate_fn=collate_fn  
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        sampler=sampler_train,
+        shuffle=(sampler_train is None),  # Only shuffle if not using sampler
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=persistent_workers if num_workers > 0 else False,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        collate_fn=collate_fn  
+        drop_last=True
     )
     
-    print("Initializing policy model...")
-    policy = DiffusionDiTCarlaPolicy(config, action_stats=action_stats).to(device)  
+    # Validation loader: only create meaningful loader for rank 0
+    # Other ranks get an empty loader since they don't validate
+    if world_size > 1 and rank != 0:
+        # Create empty validation loader for non-rank 0 processes
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            sampler=torch.utils.data.distributed.DistributedSampler(
+                val_dataset,
+                shuffle=False,
+                num_replicas=world_size,
+                rank=rank,
+                drop_last=True
+            ),
+            shuffle=False,
+            num_workers=0,  # No workers needed for empty validation
+            pin_memory=False,
+            drop_last=True
+        )
+    else:
+        # Rank 0 or single GPU: use full validation dataset
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            sampler=sampler_val,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=persistent_workers if num_workers > 0 else False,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            drop_last=True
+        )
+    
+    if rank == 0:
+        print("Initializing policy model...")
+    policy = DiffusionDiTCarlaPolicy(config).to(device)
+    
+    # Wrap model with DistributedDataParallel for multi-GPU training
+    if world_size > 1:
+        policy = torch.nn.parallel.DistributedDataParallel(
+            policy,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True  # Required: some parameters in obs_encoder may not be used in all forward passes
+        )
+        if rank == 0:
+            print(f"✓ Model wrapped with DistributedDataParallel (find_unused_parameters=True)")
+            print(f"Policy action steps (n_action_steps): {policy.module.n_action_steps}")
+    else:
+        if rank == 0:
+            print(f"Policy action steps (n_action_steps): {policy.n_action_steps}")
+    
     lr = config.get('optimizer', {}).get('lr', 5e-5)
     weight_decay = config.get('optimizer', {}).get('weight_decay', 1e-5)
+    
+    # Linear learning rate scaling for distributed training
+    # With N GPUs and same batch_size per GPU, effective batch_size = N * batch_size
+    # Scale learning rate linearly: lr_scaled = lr * world_size
+    scale_lr = config.get('optimizer', {}).get('scale_lr', True)  # Default to True
+    if scale_lr and world_size > 1:
+        lr_scaled = lr * world_size
+        if rank == 0:
+            print(f"✓ Learning rate scaled for {world_size} GPUs: {lr} -> {lr_scaled}")
+        lr = lr_scaled
+    
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    # Learning rate scheduler with warmup for multi-GPU training stability
+    # Warmup prevents large gradient updates in early training when model parameters are random
+    warmup_epochs = int(config.get('training', {}).get('warmup_epochs', 5))
+    lr_final = float(config.get('training', {}).get('lr_final', 1e-7))
+    use_lr_scheduler = config.get('training', {}).get('use_lr_scheduler', True)
+    
+    if use_lr_scheduler:
+        from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+        
+        # Calculate total training steps
+        total_epochs = int(config.get('training', {}).get('num_epochs', 50))
+        
+        # Warmup scheduler: linearly increase LR from lr/10 to lr over warmup_epochs
+        warmup_scheduler = LinearLR(
+            optimizer, 
+            start_factor=0.1, 
+            end_factor=1.0, 
+            total_iters=warmup_epochs
+        )
+        
+        # Cosine annealing scheduler: decay LR from lr to lr_final
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer, 
+            T_max=total_epochs - warmup_epochs, 
+            eta_min=lr_final
+        )
+        
+        # Combine warmup and cosine annealing
+        scheduler = SequentialLR(
+            optimizer, 
+            schedulers=[warmup_scheduler, cosine_scheduler], 
+            milestones=[warmup_epochs]
+        )
+        
+        if rank == 0:
+            print(f"✓ Learning rate scheduler: {warmup_epochs} epochs warmup + cosine annealing to {lr_final}")
+    else:
+        scheduler = None
+        if rank == 0:
+            print("✓ No learning rate scheduler used")
+
+    # 设置 checkpoint 目录
     checkpoint_dir = config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit")
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"✓ Checkpoint directory: {checkpoint_dir}")
     
     num_epochs = config.get('training', {}).get('num_epochs', 50)
     best_val_loss = float('inf')
-    best_l2_3s = float('inf')  # Track best L2_3s for model selection
-    val_loss = None  
-    val_metrics = {}  
+    best_l2_avg = float('inf')  # Use average L2 error as best metric
+    val_loss = None  # 初始化验证损失
+    val_metrics = {}  # 初始化验证指标  
     
     for epoch in range(num_epochs):
+        # Update the seed depending on the epoch for distributed sampler
+        if world_size > 1:
+            sampler_train.set_epoch(epoch)
+        
         policy.train()
         train_losses = []
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+        
+        if rank == 0:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+        else:
+            pbar = train_loader
+            
         for batch_idx, batch in enumerate(pbar):
             for key in batch:
                 if isinstance(batch[key], torch.Tensor):
                     batch[key] = batch[key].to(device)
             
-            loss = policy.compute_loss(batch)
+            # IMPORTANT: zero_grad BEFORE forward pass, not after
+            # This is the standard PyTorch training pattern
             optimizer.zero_grad()
+            
+            # Call policy(batch) which invokes forward() method
+            # DDP only synchronizes gradients when forward() is called
+            # This ensures proper gradient synchronization across all GPUs
+            loss = policy(batch)
+            
+            # Check for NaN/Inf loss to prevent gradient explosion
+            if torch.isnan(loss) or torch.isinf(loss):
+                if rank == 0:
+                    print(f"Warning: NaN/Inf loss detected at batch {batch_idx}, skipping this batch")
+                optimizer.zero_grad()
+                continue
+            
             loss.backward()
+            
+            # Gradient clipping for training stability (CRITICAL for multi-GPU training)
+            # This prevents gradient explosion which can cause val_loss to spike
+            max_grad_norm = config.get('training', {}).get('max_grad_norm', 1.0)
+            if world_size > 1:
+                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(policy.module.parameters(), max_norm=max_grad_norm)
+            else:
+                grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_grad_norm)
+            
+            # Skip optimizer step if gradients are invalid
+            if torch.isnan(grad_norm_before_clip) or torch.isinf(grad_norm_before_clip):
+                if rank == 0:
+                    print(f"Warning: NaN/Inf gradient norm detected at batch {batch_idx}, skipping optimizer step")
+                optimizer.zero_grad()
+                continue
+            
             optimizer.step()
             train_losses.append(loss.item())
             
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{np.mean(train_losses):.4f}'
-            })
+            # Calculate if clipping occurred
+            grad_norm_value = grad_norm_before_clip.item() if isinstance(grad_norm_before_clip, torch.Tensor) else grad_norm_before_clip
+            was_clipped = grad_norm_value > max_grad_norm
             
-            if batch_idx % 10 == 0:
+            if rank == 0:
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg_loss': f'{np.mean(train_losses):.4f}',
+                    'grad_norm': f'{grad_norm_value:.4f}',
+                    'clipped': '✂' if was_clipped else ''
+                })
+            
+            # Log to wandb less frequently to reduce overhead
+            log_freq = config.get('logging', {}).get('log_freq', 50)
+            if batch_idx % log_freq == 0 and rank == 0:
                 step = epoch * len(train_loader) + batch_idx
                 safe_wandb_log({
                     "train/loss_step": loss.item(),
                     "train/epoch":  epoch ,
                     "train/step": step,
                     "train/learning_rate": optimizer.param_groups[0]['lr'],
-                    "train/batch_idx": batch_idx
+                    "train/batch_idx": batch_idx,
+                    "train/grad_norm_before_clip": grad_norm_value,
+                    "train/grad_norm_clipped": min(grad_norm_value, max_grad_norm),
+                    "train/grad_clipping_ratio": grad_norm_value / max_grad_norm if max_grad_norm > 0 else 0
                 }, use_wandb)
         
-        pbar.close() 
+        if rank == 0:
+            pbar.close() 
         
         avg_train_loss = np.mean(train_losses)
-        print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
-        torch.save({
-                    'model_state_dict': policy.state_dict(),
-                    'config': config,
-                    'epoch': epoch,
-                    'val_loss': val_loss,
-                    'train_loss': avg_train_loss,
-                    'val_metrics': val_metrics
-                    }, os.path.join(checkpoint_dir, "carla_policy.pt"))
+        if rank == 0:
+            print(f"Epoch {epoch+1}/{num_epochs} - Average training loss: {avg_train_loss:.4f}")
         
-        safe_wandb_log({
-            "train/loss_epoch": avg_train_loss,
-            "train/epoch": 0.0,
-            "train/samples_processed": (epoch + 1) * len(train_dataset)
-        }, use_wandb)
+        # Update learning rate scheduler after each epoch
+        if scheduler is not None:
+            scheduler.step()
+            if rank == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"  Learning rate: {current_lr:.2e}")
+        
+        # Get model state dict (handle DDP wrapper)
+        model_to_save = policy.module if world_size > 1 else policy
+        
+        # Save checkpoint at save_freq intervals (not every epoch to reduce I/O)
+        save_freq = config.get('training', {}).get('save_freq', 5)
+        if rank == 0 and (epoch + 1) % save_freq == 0:
+            # torch.save({
+            #             'model_state_dict': model_to_save.state_dict(),
+            #             'optimizer_state_dict': optimizer.state_dict(),
+            #             'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+            #             'config': config,
+            #             'epoch': epoch,
+            #             'val_loss': val_loss,
+            #             'train_loss': avg_train_loss,
+            #             'val_metrics': val_metrics
+            #             }, os.path.join(checkpoint_dir, "carla_policy.pt"))
+            # print(f"  Checkpoint saved at epoch {epoch+1}")
+            pass
+        
+        if rank == 0:
+            safe_wandb_log({
+                "train/loss_epoch": avg_train_loss,
+                "train/epoch": epoch,
+                "train/samples_processed": (epoch + 1) * len(train_dataset)
+            }, use_wandb)
 
         validation_freq = config.get('training', {}).get('validation_freq', 1)
         if (epoch + 1) % validation_freq == 0:
-            print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
-            sys.stdout.flush()
+            if rank == 0:
+                print(f"Validating (Epoch {epoch+1}/{num_epochs})...")
+                sys.stdout.flush()
             try:
-                val_metrics = validate_model(policy, val_loader, device)
-                print(f"✓ Validation completed")
-                sys.stdout.flush()
+                val_metrics = validate_model(policy, val_loader, device, rank=rank, world_size=world_size)
+                if rank == 0:
+                    print(f"✓ Validation completed")
+                    sys.stdout.flush()
             except Exception as e:
-                print(f"✗ Error during validation: {e}")
-                import traceback
-                traceback.print_exc()
-                sys.stdout.flush()
+                if rank == 0:
+                    print(f"✗ Error during validation: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
                 continue
 
-            sys.stdout.flush()
-                
-            log_dict = {
-                    "epoch": epoch,
-                    "train/loss": avg_train_loss,
-                }
-        
-            if 'val_loss' in val_metrics:
-                log_dict["val/loss"] = val_metrics['val_loss']
-        
-            for key, value in val_metrics.items():
-                if key == 'val_loss':
-                    continue  
-                elif 'L2' in key:
-                    metric_name = key.replace('val_', '')
-                    log_dict[f"val/L2/{metric_name}"] = value
-                elif 'collision' in key:
-                    metric_name = key.replace('val_', '')
-                    log_dict[f"val/collision/{metric_name}"] = value
-                else:
-                    log_dict[f"val/{key.replace('val_', '')}"] = value
-        
-            print("Logging to wandb...")
-            sys.stdout.flush()
-            safe_wandb_log(log_dict, use_wandb)
-            sys.stdout.flush()
-
-        
-            print(f"Validation metrics:")
-            for key, value in val_metrics.items():
-                print(f"  {key}: {value:.4f}")
-        
-            val_loss = val_metrics.get('val_loss', float('inf'))
-            l2_3s = val_metrics.get('val_L2_3s', float('inf'))
+            if rank == 0:
+                sys.stdout.flush()
+                    
+                log_dict = {
+                        "epoch": epoch,
+                        "train/loss": avg_train_loss,
+                    }
             
-            # Save best model based on L2_3s instead of val_loss
-            if l2_3s < best_l2_3s:
-                best_l2_3s = l2_3s
-                torch.save({
-                        'model_state_dict': policy.state_dict(),
-                        'config': config,
-                        'epoch': epoch,
-                        'val_loss': val_loss,
-                        'train_loss': avg_train_loss,
-                        'val_metrics': val_metrics
-                        }, os.path.join(checkpoint_dir, "carla_policy_best.pt"))
-                print(f"✓ New best model saved with L2_3s: {l2_3s:.4f} (val_loss: {val_loss:.4f})")
-               
-                safe_wandb_log({
-                        "best_model/epoch": epoch,
-                        "best_model/L2_3s": l2_3s,
-                        "best_model/val_loss": val_loss,
-                        "best_model/train_loss": avg_train_loss
-                    }, use_wandb)
+                if 'val_loss' in val_metrics:
+                    log_dict["val/loss"] = val_metrics['val_loss']
+            
+                for key, value in val_metrics.items():
+                    if key == 'val_loss':
+                        continue  
+                    elif key.startswith('val_'):
+                        # Remove 'val_' prefix
+                        metric_name = key.replace('val_', '')
+                        if 'L2' in metric_name:
+                            log_dict[f"val/driving_metrics/{metric_name}"] = value
+                        elif 'collision' in metric_name:
+                            log_dict[f"val/collision/{metric_name}"] = value
+                        else:
+                            log_dict[f"val/{metric_name}"] = value
+                    else:
+                        # Shouldn't happen, but handle it just in case
+                        if 'L2' in key:
+                            log_dict[f"val/driving_metrics/{key}"] = value
+                        else:
+                            log_dict[f"val/{key}"] = value
+            
+                print("Logging to wandb...")
+                sys.stdout.flush()
+                safe_wandb_log(log_dict, use_wandb)
+                sys.stdout.flush()
+
+            
+                print(f"Validation metrics: (total {len(val_metrics)} metrics)")
+                if len(val_metrics) == 0:
+                    print("  Warning: No validation metrics were computed!")
+                for key, value in val_metrics.items():
+                    print(f"  {key}: {value:.4f}")
+        
+                val_loss = val_metrics.get('val_loss', float('inf'))
+                l2_avg = val_metrics.get('val_L2_avg', float('inf'))
+                
+                # Save best model based on L2_avg (average L2 error across all timesteps)
+                if l2_avg < best_l2_avg:
+                    best_l2_avg = l2_avg
+                    torch.save({
+                            'model_state_dict': model_to_save.state_dict(),
+                            'config': config,
+                            'epoch': epoch,
+                            'val_loss': val_loss,
+                            'train_loss': avg_train_loss,
+                            'val_metrics': val_metrics
+                            }, os.path.join(checkpoint_dir, "policy_best.pt"))
+                    print(f"✓ New best model saved with L2_avg: {l2_avg:.4f} (val_loss: {val_loss:.4f})")
+                   
+                    safe_wandb_log({
+                            "best_model/epoch": epoch,
+                            "best_model/L2_avg": l2_avg,
+                            "best_model/val_loss": val_loss,
+                            "best_model/train_loss": avg_train_loss
+                        }, use_wandb)
     
-    print("Training completed!")
-    print(f"Best L2_3s: {best_l2_3s:.4f}")
-    safe_wandb_log({
-        "training/completed": 0.0,
-        "training/total_epochs": num_epochs,
-        "training/best_l2_3s": best_l2_3s,
-        "training/final_train_loss": avg_train_loss
-    }, use_wandb)
+    if rank == 0:
+        print("Training completed!")
+        print(f"Best L2_avg: {best_l2_avg:.4f}")
+        safe_wandb_log({
+            "training/completed": 0.0,
+            "training/total_epochs": num_epochs,
+            "training/best_l2_avg": best_l2_avg,
+            "training/final_train_loss": avg_train_loss
+        }, use_wandb)
+        
+        safe_wandb_finish(use_wandb)
+        print("✓ Training session finished")
     
-    safe_wandb_finish(use_wandb)
-    print("✓ Training session finished")
+    # Clean up distributed process group
+    if world_size > 1:
+        torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train nuScenes Driving Policy with Diffusion DiT")
+    parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
     parser.add_argument('--config_path', type=str, default="/root/z_projects/code/MoT-DP-1/config/nuscences_server.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
-    train_nusc_policy(config_path=args.config_path)
+    train_pdm_policy(config_path=args.config_path)

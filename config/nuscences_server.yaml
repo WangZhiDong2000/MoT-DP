@@ -4,7 +4,7 @@ nuscenes:
   dataset_root: /mnt/data2/nuscenes
 device:
   gpu_ids:
-  - 5
+  - 1
 dataloader:
   batch_size: 128
   num_workers: 8
@@ -12,10 +12,10 @@ dataloader:
   pin_memory: true
   prefetch_factor: 2
   shuffle: true
-obs_horizon: 4
+obs_horizon: 5
 pred_horizon: 10
 action_horizon: 6
-n_obs_steps: 4
+n_obs_steps: 5
 ema:
   inv_gamma: 1.0
   max_value: 0.9999
@@ -28,7 +28,9 @@ optimizer:
   - 0.9
   - 0.999
   eps: 1.0e-08
+  # Reduced learning rate for better generalization (was: 1e-5)
   lr: 5.0e-05
+  # Increased weight decay for regularization (was: 1e-5)
   weight_decay: 1.0e-05
 shape_meta:
   action:
@@ -60,7 +62,7 @@ shape_meta:
 enable_action_normalization: true
 bev_encoder:
   pretrained_path: /root/z_projects/code/MoT-DP-1/checkpoints/interfuser/lidar_bev_encoder_only.pth
-  state_dim: 15
+  state_dim: 14
   feature_dim: 256
   use_group_norm: true
   freeze_backbone: false
@@ -71,33 +73,39 @@ policy:
   input_dim: 2
   output_dim: 2
   horizon: 6
-  n_obs_steps: 4
+  n_obs_steps: 5
   cond_dim: 256
   obs_as_global_cond: true
-  n_layer: 12
+  # Reduced model size to prevent overfitting (was: 16 layers, 1024 dim)
+  n_layer: 16
   n_head: 16
   n_emb: 1024
+  # Increased dropout for regularization (was: 0.1)
   p_drop_emb: 0.1
   p_drop_attn: 0.1
   causal_attn: true
   time_as_cond: true
   obs_as_cond: true
-  n_cond_layers: 6
+  n_cond_layers: 4
   action_horizon: 6
-  num_inference_steps: 100
-  use_anchor: false
-noise_scheduler:
-  num_diffusion_steps: 100
-  beta_start: 0.0001
-  beta_end: 0.02
-  beta_schedule: squaredcos_cap_v2
-  clip_sample: false
-  prediction_type: epsilon
+truncated_diffusion:
+  num_train_timesteps: 1000
+  trunc_timesteps: 8
+  train_trunc_timesteps: 50
+  num_diffusion_steps: 2
+  eta: 1.0
+  norm_x_offset: 16.0
+  norm_x_range: 92.0
+  norm_y_offset: 45.0
+  norm_y_range: 88.0
+  route_loss_weight: 0.5
 training:
   num_epochs: 1000
   max_grad_norm: 1.0
-  dataset_path: /home/wang/Project/carla_garage/tmp_data
-  image_data_root: /home/wang/Project/carla_garage/data
+  warmup_epochs: 5
+  use_lr_scheduler: true
+  dataset_path: /mnt/data2/nuscenes/processed_data
+  image_data_root: /mnt/data2/nuscenes
   sample_interval: 1
   lr_final: 1e-7
   validation_freq: 5
@@ -130,14 +138,30 @@ model_optimization:
   lr_scheduler: cosine
 action_stats:
   min:
-  - -2.024064064025879
-  - -11.107964515686035
+  - -13.96517562866211
+  - -2.0172860622406006
   max:
-  - 55.828826904296875
-  - 13.316089630126953
+  - 11.766490936279297
+  - 55.78809356689453
   mean:
-  - 8.855836868286133
-  - -0.07721711695194244
+  - 0.08606313914060593
+  - 8.825980186462402
   std:
-  - 8.16093921661377
-  - 0.948141872882843
+  - 1.0812036991119385
+  - 8.156380653381348
+controller:
+  turn_KP: 0.75
+  turn_KI: 0.75
+  turn_KD: 0.3
+  turn_n: 40
+  speed_KP: 5.0
+  speed_KI: 0.5
+  speed_KD: 1.0
+  speed_n: 40
+  aim_dist: 4.0
+  angle_thresh: 0.3
+  dist_thresh: 10.0
+  brake_speed: 0.4
+  brake_ratio: 1.1
+  clip_delta: 0.25
+  max_throttle: 0.75

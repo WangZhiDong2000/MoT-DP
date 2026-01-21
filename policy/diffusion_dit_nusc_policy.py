@@ -1,17 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional, Callable
+from typing import Dict, Tuple, Optional, Callable, Union
+from collections import defaultdict
 import numpy as np
 from einops import rearrange, reduce
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-from model.transformer_for_diffusion import TransformerForDiffusion, LowdimMaskGenerator
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from model.transformer_for_diffusion import TransformerForDiffusion
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
 
-VLMDriveBackbone = None
-VLM_AVAILABLE = False
+
 
 def dict_apply(
         x: Dict[str, torch.Tensor], 
@@ -25,24 +25,16 @@ def dict_apply(
             result[key] = func(value)
     return result
 
-def normalize_data(data, stats):
-    ndata = (data - stats['min']) / (stats['max'] - stats['min'])
-    ndata = ndata * 2 - 1
-    return ndata
 
-def unnormalize_data(ndata, stats):
-    ndata = (ndata + 1) / 2
-    data = ndata * (stats['max'] - stats['min']) + stats['min']
-    return data
+
 
 class DiffusionDiTCarlaPolicy(nn.Module):
-    def __init__(self, config: Dict, action_stats: Optional[Dict[str, torch.Tensor]] = None):
+    def __init__(self, config: Dict):
         super().__init__()
         
         # config
         self.cfg = config
         policy_cfg = config['policy']
-        noise_scheduler_cfg = config['noise_scheduler']
 
         obs_as_global_cond = policy_cfg.get('obs_as_global_cond', True)
         self.obs_as_global_cond = obs_as_global_cond
@@ -51,15 +43,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         action_dim = action_shape[0]
         
         # Action normalization settings
-        self.enable_action_normalization = config.get('enable_action_normalization', False)
-        self.action_stats = action_stats
-        if self.enable_action_normalization and self.action_stats is not None:
-            print(f"✓ Action normalization enabled with stats:")
-            print(f"  Action min: {self.action_stats['min']}")
-            print(f"  Action max: {self.action_stats['max']}")
-        else:
-            print("⚠ Action normalization disabled")
-            self.action_stats = None
+        self.enable_action_normalization = config.get('enable_action_normalization', True)
         
 
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
@@ -69,8 +53,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         obs_encoder = InterfuserBEVEncoder(
             perception_backbone=None,
             state_dim=bev_encoder_cfg.get('state_dim', 13),  # 修改为13维以支持拼接后的ego_status
-            feature_dim=bev_encoder_cfg.get('feature_dim', 256),
-            use_group_norm=bev_encoder_cfg.get('use_group_norm', True),
             freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
             bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
         )
@@ -86,27 +68,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         self.obs_encoder = obs_encoder
 
-        # TODO load vlm and vlm encoder model）
-        self.vlm_backbone = None
-        self.feature_encoder = None
-        
-        if VLM_AVAILABLE and VLMDriveBackbone is not None:
-            try:
-                vlm_device = 'cpu'  
-                self.vlm_backbone = VLMDriveBackbone(
-                    model_type='qwen',
-                    checkpoint_path='Qwen/Qwen2.5-VL-3B-Instruct',
-                    device=vlm_device
-                )
-                print("✓ VLM backbone initialized successfully on CPU")
-            except Exception as e:
-                print(f"⚠ VLM backbone initialization failed: {e}")
-                self.vlm_backbone = None
-        else:
-            print("⚠ VLM backbone not available, using simulated features")
-        self._init_fixed_vlm_features()
+        vlm_feature_dim = 2560  # 隐藏层维度
+        self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
 
         obs_feature_dim = 256  
+
+        # Get status_dim from bev_encoder config
+        status_dim = bev_encoder_cfg.get('state_dim', 15)
+        
+        # Get ego_status_seq_len from policy config (defaults to n_obs_steps)
+        ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
 
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
@@ -121,86 +92,249 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             p_drop_attn=policy_cfg.get('p_drop_attn', 0.1),
             causal_attn=policy_cfg.get('causal_attn', True),
             obs_as_cond=obs_as_global_cond,
-            n_cond_layers=policy_cfg.get('n_cond_layers', 4)
+            n_cond_layers=policy_cfg.get('n_cond_layers', 4),
+            status_dim=status_dim,
+            ego_status_seq_len=ego_status_seq_len,
+            bev_dim=512,  # BEV token dimension from InterfuserBEVEncoder
+            state_token_dim=128,  # State token dimension from InterfuserBEVEncoder
+            action_emb_dim=1536,  # Action hidden states dimension (same as reasoning)
         )
 
         self.model = model
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=noise_scheduler_cfg.get('num_diffusion_steps', 100),
-            beta_start=noise_scheduler_cfg.get('beta_start', 0.0001),
-            beta_end=noise_scheduler_cfg.get('beta_end', 0.02),
-            beta_schedule=noise_scheduler_cfg.get('beta_schedule', "squaredcos_cap_v2"),
-            clip_sample=noise_scheduler_cfg.get('clip_sample', False),
-            prediction_type=noise_scheduler_cfg.get('prediction_type', "epsilon"),
-        )
-
-        self.mask_generator = LowdimMaskGenerator(
-            action_dim=action_dim,
-            obs_dim=0 if (obs_as_global_cond) else obs_feature_dim,
-            max_n_obs_steps=self.n_obs_steps,  
-            fix_obs_steps=True,
-            action_visible=False
+        
+        # ========== Truncated Diffusion Configuration (DiffusionDriveV2 style) ==========
+        diffusion_cfg = config.get('truncated_diffusion', {})
+        self.num_train_timesteps = diffusion_cfg.get('num_train_timesteps', 1000)
+        self.trunc_timesteps = diffusion_cfg.get('trunc_timesteps', 8)  # Truncated timestep for anchor during inference
+        self.train_trunc_timesteps = diffusion_cfg.get('train_trunc_timesteps', 50)  # Max timestep during training (DiffusionDrive uses 50)
+        self.num_diffusion_steps = diffusion_cfg.get('num_diffusion_steps', 2)  # Number of denoising steps
+        self.diffusion_eta = diffusion_cfg.get('eta', 1.0)  # 1.0 for stochastic multiplicative noise
+        
+        # Normalization parameters (DiffusionDrive v1 style: linear mapping to [-1, 1])
+        # x: 2*(x + x_offset)/x_range - 1
+        # y: 2*(y + y_offset)/y_range - 1
+        self.norm_x_offset = diffusion_cfg.get('norm_x_offset', 2.0)  # x range: [-2, 78]
+        self.norm_x_range = diffusion_cfg.get('norm_x_range', 80.0)
+        self.norm_y_offset = diffusion_cfg.get('norm_y_offset', 20.0)  # y range: [-20, 36]
+        self.norm_y_range = diffusion_cfg.get('norm_y_range', 56.0)
+        
+        # Route prediction auxiliary loss weight (横向控制重要性)
+        self.route_loss_weight = diffusion_cfg.get('route_loss_weight', 0.5)
+        
+        # DDIMScheduler for variance computation (DiffusionDriveV2 style)
+        self.diffusion_scheduler = DDIMScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            steps_offset=1,
+            beta_schedule="scaled_linear",
+            prediction_type="sample",  # Predict clean sample directly
         )
 
         self.action_dim = action_dim
         self.obs_feature_dim = obs_feature_dim
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
-        self.num_inference_steps = policy_cfg.get('num_inference_steps', 100)
-
-        # anchor - optional based on config
-        use_anchor = policy_cfg.get('use_anchor', False)
-        self.use_anchor = use_anchor
-        
-        if use_anchor:
-            plan_anchor_path = policy_cfg.get('plan_anchor_path', '/root/z_projects/code/MoT-DP-1/data/kmeans/kmeans_plan_vocab_6.npy')
-            if os.path.exists(plan_anchor_path):
-                plan_anchor = np.load(plan_anchor_path)  # (6, 8, 2)
-                
-                # 只保留第0条轨迹，并交换x和y坐标
-                plan_anchor = plan_anchor[0:1]  # (1, 8, 2)
-                plan_anchor = plan_anchor[..., [1, 0]]  # 交换x和y
-
-                self.plan_anchor = nn.Parameter(
-                    torch.tensor(plan_anchor, dtype=torch.float32),
-                    requires_grad=False,
-                )
-                print(f"✓ Plan anchor loaded from: {plan_anchor_path}")
-                print(f"  Anchor shape: {plan_anchor.shape}")
-            else:
-                print(f"⚠ Plan anchor path not found: {plan_anchor_path}")
-                print("  Disabling anchor-based sampling")
-                self.use_anchor = False
-                self.plan_anchor = None
-        else:
-            print("⚠ Anchor-based sampling disabled")
-            self.plan_anchor = None 
-
-    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
-        if not self.enable_action_normalization or self.action_stats is None:
-            return action
-        
-        device = action.device
-        action_min = self.action_stats['min'].to(device)
-        action_max = self.action_stats['max'].to(device)   
-        normalized = (action - action_min) / (action_max - action_min + 1e-8)
-        normalized = normalized * 2 - 1
-        return normalized
-
-    def unnormalize_action(self, normalized_action: torch.Tensor) -> torch.Tensor:
-        if not self.enable_action_normalization or self.action_stats is None:
-            return normalized_action
-        
-        device = normalized_action.device
-        action_min = self.action_stats['min'].to(device)
-        action_max = self.action_stats['max'].to(device)
-        unnormalized = (normalized_action + 1) / 2
-        unnormalized = unnormalized * (action_max - action_min) + action_min
-        return unnormalized
-
-    def extract_tcp_features(self, obs_dict, return_attention=False):
+    
+    # ========== Normalization Functions ==========
+    def norm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
         """
-        使用InterfuserBEVEncoder提取特征
+        Normalize trajectory coordinates to [-1, 1] range.
+        Following DiffusionDrive v1: 2*(x + offset)/range - 1
+        
+        For our data (x: [-0.066, 74.045], y: [-17.526, 32.736]):
+        - x: 2*(x + 1)/76 - 1, maps [-1, 75] to [-1, 1]
+        - y: 2*(y + 18)/52 - 1, maps [-18, 34] to [-1, 1]
+        """
+        odo_info_fut_x = odo_info_fut[..., 0:1]
+        odo_info_fut_y = odo_info_fut[..., 1:2]
+        
+        # Linear mapping to [-1, 1]
+        odo_info_fut_x = 2 * (odo_info_fut_x + self.norm_x_offset) / self.norm_x_range - 1
+        odo_info_fut_y = 2 * (odo_info_fut_y + self.norm_y_offset) / self.norm_y_range - 1
+        
+        return torch.cat([odo_info_fut_x, odo_info_fut_y], dim=-1)
+    
+    def denorm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize trajectory from [-1, 1] back to original scale.
+        Following DiffusionDrive v1: (x + 1)/2 * range - offset
+        """
+        odo_info_fut_x = odo_info_fut[..., 0:1]
+        odo_info_fut_y = odo_info_fut[..., 1:2]
+        
+        # Inverse linear mapping from [-1, 1]
+        odo_info_fut_x = (odo_info_fut_x + 1) / 2 * self.norm_x_range - self.norm_x_offset
+        odo_info_fut_y = (odo_info_fut_y + 1) / 2 * self.norm_y_range - self.norm_y_offset
+        
+        return torch.cat([odo_info_fut_x, odo_info_fut_y], dim=-1)
+
+    
+
+    def add_multiplicative_noise_scheduled(
+        self, 
+        sample: torch.Tensor, 
+        timestep: Union[torch.Tensor, int],
+        eta: float = 1.0,
+        std_min: float = 0.04
+    ) -> torch.Tensor:
+        """
+        Add multiplicative noise with scheduler-based variance (DiffusionDriveV2 style).
+        The noise level is determined by the diffusion scheduler's variance at the given timestep.
+        
+        DiffusionDriveV2 formula:
+            prev_sample = prev_sample_mean * variance_noise_mul + std_dev_t_add * variance_noise_add
+        
+        When eta > 0:
+            - std_dev_t_mul = clip(std_dev_t, min=0.04) for multiplicative noise
+            - std_dev_t_add = 0.0 (no additive noise)
+        
+        Multiplicative noise is applied separately to x (horizon) and y (vert) directions,
+        then combined: sample * noise_mul
+        
+        Args:
+            sample: (B, T, 2) normalized trajectory
+            timestep: current diffusion timestep (scalar or tensor)
+            eta: scaling factor for variance (0.0 = deterministic, 1.0 = full stochasticity)
+            std_min: minimum standard deviation to prevent zero noise (V2 uses 0.04)
+            
+        Returns:
+            Noisy sample with timestep-scheduled multiplicative noise applied
+        """
+        device = sample.device
+        dtype = sample.dtype
+        bs = sample.shape[0]
+        T = sample.shape[1]  # trajectory length (num_points)
+        
+        # Get timestep as integer
+        if torch.is_tensor(timestep):
+            t = timestep.item() if timestep.numel() == 1 else timestep[0].item()
+        else:
+            t = timestep
+        t = int(t)
+        
+        # Compute variance from scheduler (DDIM style)
+        # σ_t = sqrt((1 − α_t−1)/(1 − α_t)) * sqrt(1 − α_t/α_t−1)
+        prev_t = t - self.num_train_timesteps // max(self.num_diffusion_steps, 1)
+        prev_t = max(prev_t, 0)
+        
+        alpha_prod_t = self.diffusion_scheduler.alphas_cumprod[t]
+        alpha_prod_t_prev = self.diffusion_scheduler.alphas_cumprod[prev_t] if prev_t >= 0 else self.diffusion_scheduler.final_alpha_cumprod
+        
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        
+        # Variance formula from DDIM
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        variance = max(variance.item(), 1e-10)
+        
+        # std_dev_t with eta scaling
+        std_dev_t = eta * (variance ** 0.5)
+        
+        # DiffusionDriveV2 style: std_dev_t_mul = clip(std_dev_t, min=0.04)
+        std_dev_t_mul = max(std_dev_t, std_min)
+        
+        # Generate multiplicative noise for horizon (x) and vert (y) separately
+        # DiffusionDriveV2: variance_noise_horizon/vert shape is (B, G, 1, 1), then repeat
+        # Our shape: (B, 1, 1) for horizon and vert, then cat to (B, 1, 2), then repeat to (B, T, 2)
+        
+        # variance_noise_horizon = randn * std_dev_t_mul + 1.0  (for x direction)
+        variance_noise_horizon = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        # variance_noise_vert = randn * std_dev_t_mul + 1.0  (for y direction)
+        variance_noise_vert = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        
+        # Concatenate horizon and vert: (B, 1, 1) + (B, 1, 1) -> (B, 1, 2)
+        variance_noise_mul = torch.cat([variance_noise_horizon, variance_noise_vert], dim=-1)
+        
+        # Repeat across trajectory length: (B, 1, 2) -> (B, T, 2)
+        variance_noise_mul = variance_noise_mul.expand(-1, T, -1)
+        
+        # Apply multiplicative noise: sample * variance_noise_mul
+        # This matches DiffusionDriveV2: prev_sample = prev_sample_mean * variance_noise_mul
+        # (when std_dev_t_add = 0, the additive term is zero)
+        noisy_sample = sample * variance_noise_mul
+        
+        return noisy_sample
+
+    def add_multiplicative_noise_scheduled_batch(
+        self, 
+        sample: torch.Tensor, 
+        timesteps: torch.Tensor,
+        eta: float = 1.0,
+        std_min: float = 0.04
+    ) -> torch.Tensor:
+        """
+        Add multiplicative noise with per-sample timesteps (batch version).
+        Each sample in the batch gets noise corresponding to its own timestep.
+        
+        This is the correct implementation for training where each sample should have
+        noise added according to its own sampled timestep.
+        
+        Args:
+            sample: (B, T, 2) normalized trajectory
+            timesteps: (B,) tensor of timesteps, one per sample
+            eta: scaling factor for variance (0.0 = deterministic, 1.0 = full stochasticity)
+            std_min: minimum standard deviation to prevent zero noise (V2 uses 0.04)
+            
+        Returns:
+            Noisy sample with per-sample timestep-scheduled multiplicative noise applied
+        """
+        device = sample.device
+        dtype = sample.dtype
+        bs = sample.shape[0]
+        T = sample.shape[1]  # trajectory length (num_points)
+        
+        # Compute variance for each sample based on its timestep
+        # Pre-compute alpha_cumprod values on CPU then move to device
+        alphas_cumprod = self.diffusion_scheduler.alphas_cumprod
+        
+        # Get prev_t for each sample
+        step_ratio = self.num_train_timesteps // max(self.num_diffusion_steps, 1)
+        prev_timesteps = (timesteps - step_ratio).clamp(min=0)
+        
+        # Gather alpha_prod values for each sample
+        alpha_prod_t = alphas_cumprod[timesteps.cpu()].to(device=device, dtype=dtype)  # (B,)
+        alpha_prod_t_prev = alphas_cumprod[prev_timesteps.cpu()].to(device=device, dtype=dtype)  # (B,)
+        
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_t_prev = 1 - alpha_prod_t_prev
+        
+        # Variance formula from DDIM: (B,)
+        variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
+        variance = variance.clamp(min=1e-10)
+        
+        # std_dev_t with eta scaling: (B,)
+        std_dev_t = eta * (variance ** 0.5)
+        
+        # DiffusionDriveV2 style: std_dev_t_mul = clip(std_dev_t, min=0.04)
+        std_dev_t_mul = std_dev_t.clamp(min=std_min)  # (B,)
+        
+        # Reshape for broadcasting: (B,) -> (B, 1, 1)
+        std_dev_t_mul = std_dev_t_mul.view(bs, 1, 1)
+        
+        # Generate multiplicative noise for horizon (x) and vert (y) separately
+        # variance_noise_horizon = randn * std_dev_t_mul + 1.0  (for x direction)
+        variance_noise_horizon = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        # variance_noise_vert = randn * std_dev_t_mul + 1.0  (for y direction)
+        variance_noise_vert = torch.randn([bs, 1, 1], device=device, dtype=dtype) * std_dev_t_mul + 1.0
+        
+        # Concatenate horizon and vert: (B, 1, 1) + (B, 1, 1) -> (B, 1, 2)
+        variance_noise_mul = torch.cat([variance_noise_horizon, variance_noise_vert], dim=-1)
+        
+        # Repeat across trajectory length: (B, 1, 2) -> (B, T, 2)
+        variance_noise_mul = variance_noise_mul.expand(-1, T, -1)
+        
+        # Apply multiplicative noise: sample * variance_noise_mul
+        noisy_sample = sample * variance_noise_mul
+        
+        return noisy_sample
+
+
+
+    
+
+    def extract_bev_state_tokens(self, obs_dict):
+        """
+        使用InterfuserBEVEncoder提取BEV tokens和State tokens (Decoder-Only架构)
+        
         支持两种模式：
         1. 使用预处理好的BEV特征（推荐，快速）
         2. 使用原始lidar_bev图像（兼容模式，慢）
@@ -210,69 +344,54 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
                 - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
                 - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                - 'ego_status' (B, 13): [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
-                  已经拼接好的13维状态向量，直接作为state输入
-            return_attention: 是否返回attention map
-            
+                - 'ego_status' (B, state_dim): 状态向量
+                
         Returns:
-            如果return_attention=False: j_ctrl特征 (B, 256)
-            如果return_attention=True: (j_ctrl特征, attention_map) 
+            bev_tokens: (B, seq_len+1, 512) - BEV空间tokens + global token
+            state_tokens: (B, 1, 128) - 状态编码tokens
         """
         try:
             device = next(self.parameters()).device
-            state = obs_dict['ego_status'].to(device=device, dtype=torch.float32)  # (B, 13)
+            model_dtype = next(self.parameters()).dtype
+            state = obs_dict['ego_status'].to(device=device, dtype=model_dtype)
+            
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
+            
             if use_precomputed:
-                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=torch.float32)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=torch.float32)
+                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=model_dtype)
+                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=model_dtype)
                 
-                if return_attention:
-                    j_ctrl, attention_map = self.obs_encoder(
-                        state=state,
-                        lidar_token=lidar_token,
-                        lidar_token_global=lidar_token_global,
-                        normalize=True,
-                        return_attention=True
-                    )
-                else:
-                    j_ctrl = self.obs_encoder(
-                        state=state,
-                        lidar_token=lidar_token,
-                        lidar_token_global=lidar_token_global,
-                        normalize=True,
-                        return_attention=False
-                    )
-                    attention_map = None
+                bev_tokens, state_tokens = self.obs_encoder(
+                    state=state,
+                    lidar_token=lidar_token,
+                    lidar_token_global=lidar_token_global,
+                )
             else:
                 if 'lidar_bev' not in obs_dict:
                     raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
                 
-                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=torch.float32)
-                if return_attention:
-                    j_ctrl, attention_map = self.obs_encoder(
-                        image=lidar_bev_img,
-                        state=state,
-                        normalize=True,
-                        return_attention=True
-                    )
-                else:
-                    j_ctrl = self.obs_encoder(
-                        image=lidar_bev_img,
-                        state=state,
-                        normalize=True,
-                        return_attention=False
-                    )
-                    attention_map = None
+                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=model_dtype)
+                
+                bev_tokens, state_tokens = self.obs_encoder(
+                    image=lidar_bev_img,
+                    state=state,
+                )
             
-            if return_attention:
-                return j_ctrl, attention_map
-            else:
-                return j_ctrl
+            return bev_tokens, state_tokens
                 
         except KeyError as e:
-            raise KeyError(f"Missing required field in obs_dict for TCP feature extraction: {e}")
+            raise KeyError(f"Missing required field in obs_dict for BEV/State token extraction: {e}")
         except Exception as e:
             raise RuntimeError(f"Error in TCP feature extraction: {e}")
+
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Forward method for DDP compatibility.
+        DDP only synchronizes gradients when forward() is called, not for other methods.
+        This method simply calls compute_loss() to enable proper gradient synchronization
+        in distributed training.
+        """
+        return self.compute_loss(batch)
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -282,606 +401,382 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征（推荐）
             'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
             
-            # nuScenes必需字段
             'agent_pos': (B, horizon, 2) - 未来轨迹点
-            'ego_status': (B, obs_horizon, 13) - 车辆状态 [accel(3), rot_rate(3), vel(3), steer(1), command(3)]
+            'ego_status': (B, obs_horizon, state_dim) - 车辆状态
+            'anchor_trajectory': (B, horizon, 2) - anchor轨迹点（用于truncated diffusion）
+            
+            # Senna hidden states
+            'vit_hidden_states': (B, 128, 2560) - VIT hidden states
+            'action_hidden_states': (B, 4, 2560) - Action hidden states
+            'reasoning_hidden_states': (B, 20, 2560) - Reasoning hidden states
         }
         """
         device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
         nobs = {}
-        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos']
+        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 
+                          'reasoning_hidden_states', 'vit_hidden_states', 'action_hidden_states', 'anchor_trajectory']
         
         for field in required_fields:
             if field in batch:
                 if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
-                    nobs[field] = batch[field].to(device=device, dtype=torch.float32)
+                    nobs[field] = batch[field].to(device=device, dtype=model_dtype)
                 else:
                     nobs[field] = batch[field].to(device)
 
         raw_agent_pos = batch['agent_pos'].to(device)
 
-        # (B, horizon, 2)
         To = self.n_obs_steps
         nactions = raw_agent_pos
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
-        cond = None
         
-        # Normalize trajectory for training
-        trajectory = nactions.float()
-        if self.enable_action_normalization and self.action_stats is not None:
-            trajectory = self.normalize_action(trajectory)
-            if torch.isnan(trajectory).any() or torch.isinf(trajectory).any():
-                print("Warning: NaN or Inf detected in normalized trajectory")
-                trajectory = torch.nan_to_num(trajectory, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        if self.obs_as_global_cond:
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            cond = batch_features.reshape(batch_size, To, feature_dim).float()  # (B, To, feature_dim)  
-        else:
-            this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
-            nobs_features = self.extract_tcp_features(this_nobs)
-            nobs_features = nobs_features.reshape(batch_size, horizon, -1)
-
-        condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
-
-        # Sample noise that we'll add to the images
-        noise = torch.randn(trajectory.shape, device=trajectory.device)
-        bsz = trajectory.shape[0]
-        # Sample a random timestep for each image
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.get('num_train_timesteps', 100), 
-            (bsz,), device=trajectory.device
-        ).long()
-        # Add noise to the clean images according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_trajectory = self.noise_scheduler.add_noise(
-            trajectory, noise, timesteps)
+        # Get ground truth trajectory
+        trajectory = nactions.to(dtype=model_dtype)  # (B, horizon, 2)
         
-        # compute loss mask
-        loss_mask = ~condition_mask
-
-        # apply conditioning
-        noisy_trajectory[condition_mask] = trajectory[condition_mask]
+        # Get anchor trajectory for truncated diffusion
+        anchor = batch.get('anchor_trajectory', None)
+        if anchor is not None:
+            anchor = anchor.to(device=device, dtype=model_dtype)  # (B, horizon, 2)
         
-        # Predict the noise residual
-        vqa = batch.get('vqa', None)
-        if vqa is None:
-            # 如果vqa为None或不存在，使用初始化中生成的模板
-            vl_features, vl_mask = self.generate_simulated_vlm_outputs(
-                batch_size=noisy_trajectory.shape[0], 
-                device=device,
-                max_seq_len=None
-            )
-        else:
-            vl_features = vqa.to(device=device, dtype=torch.float32)  # (B, seq_len, feat_dim)
-            vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=device)
-        vl_embeds = self.feature_encoder(vl_features)
-        pred = self.model(noisy_trajectory, timesteps, vl_embeds, cond, vl_mask=vl_mask)
-
-        pred_type = self.noise_scheduler.config.prediction_type 
-        if pred_type == 'epsilon':
-            target = noise
-        elif pred_type == 'sample':
-            target = trajectory
-        else:
-            raise ValueError(f"Unsupported prediction type {pred_type}")
-
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
+        # Extract BEV tokens and State tokens (Decoder-Only架构)
+        # Flatten temporal dimension for feature extraction
+        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
+        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
         
-        if loss.shape[-1] > 2:
-            loss = loss[..., :2]  
-            
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+        # Use only the last timestep's features (or average over time)
+        # bev_tokens: (B*To, seq_len+1, 512) -> use last timestep
+        # state_tokens: (B*To, 1, 128) -> use last timestep
+        bev_tokens = bev_tokens.reshape(batch_size, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
+        state_tokens = state_tokens.reshape(batch_size, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
+
+        # Prepare VL tokens (Senna: vit_hidden_states)
+        vit_hidden_states = batch['vit_hidden_states']
+        reasoning_hidden_states = batch['reasoning_hidden_states']
+        action_hidden_states = batch['action_hidden_states']
+        
+        vit_hidden_states = vit_hidden_states.to(device=device, dtype=model_dtype)
+        vit_hidden_states = self.feature_encoder(vit_hidden_states)  # (B, 128, 1536)
+        
+        reasoning_hidden_states = reasoning_hidden_states.to(device=device, dtype=model_dtype)
+        reasoning_hidden_states = self.feature_encoder(reasoning_hidden_states)  # (B, 20, 1536)
+        
+        action_hidden_states = action_hidden_states.to(device=device, dtype=model_dtype)
+        action_hidden_states = self.feature_encoder(action_hidden_states)  # (B, 4, 1536)
+        
+        # Get ego_status
+        ego_status = nobs['ego_status'].to(dtype=model_dtype)
+
+        # ========== Compute Loss (Truncated Diffusion DiffusionDriveV2 style) ==========
+        loss = self._compute_truncated_diffusion_loss(
+            trajectory=trajectory,
+            anchor=anchor,
+            bev_tokens=bev_tokens,
+            state_tokens=state_tokens,
+            vit_hidden_states=vit_hidden_states,
+            reasoning_hidden_states=reasoning_hidden_states,
+            action_hidden_states=action_hidden_states,
+            ego_status=ego_status,
+            device=device,
+            model_dtype=model_dtype
+        )
+        
         return loss
     
+    def _compute_truncated_diffusion_loss(
+        self,
+        trajectory: torch.Tensor,
+        anchor: torch.Tensor,
+        bev_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        vit_hidden_states: torch.Tensor,
+        reasoning_hidden_states: torch.Tensor,
+        action_hidden_states: torch.Tensor,
+        ego_status: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Compute loss using truncated diffusion (DiffusionDriveV2 style).
+        Instead of starting from pure noise, we start from anchor with multiplicative noise.
+        The model predicts the clean sample directly.
+        
+        Training: Add scheduler-based multiplicative noise (noise level depends on timestep)
+        
+        Data Augmentation: Apply small random perturbations to trajectory during training
+        to improve generalization (reduce overfitting).
+        
+        Args:
+            trajectory: (B, horizon, 2) - ground truth trajectory
+            anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
+            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens from encoder
+            state_tokens: (B, 1, 128) - state tokens from encoder
+            vit_hidden_states: (B, seq_len, 1536) - VIT tokens
+            reasoning_hidden_states: (B, seq_len, 1536) - reasoning tokens
+            action_hidden_states: (B, seq_len, 1536) - action hidden states
+            ego_status: (B, To, status_dim) - ego vehicle status
+            device: torch device
+            model_dtype: model dtype (e.g., bfloat16)
+        """
+        batch_size = trajectory.shape[0]
+        
+        # 1. Normalize trajectories using DiffusionDriveV2 style normalization
+        trajectory_norm = self.norm_odo(trajectory)  # (B, T, 2)
+        anchor_norm = self.norm_odo(anchor)  # (B, T, 2)
+        
+        # 2. Sample random timesteps within truncated range (like DiffusionDrive training)
+        timesteps = torch.randint(
+            0, self.train_trunc_timesteps,  # Training uses larger range [0, 50)
+            (batch_size,), device=device
+        ).long()
+        
+        # 3. Add scheduler-based multiplicative noise to anchor (DiffusionDriveV2 style)
+        noisy_anchor = self.add_multiplicative_noise_scheduled_batch(
+            anchor_norm,
+            timesteps=timesteps,
+            eta=1.0,
+            std_min=0.04
+        )
+        
+        # 4. Clamp to valid range
+        noisy_anchor = torch.clamp(noisy_anchor, min=-1, max=1)
+        
+        # 5. Denormalize for model input (model expects denormalized coordinates)
+        noisy_trajectory_denorm = self.denorm_odo(noisy_anchor)
+        
+        # 6. Create dummy cond for API compatibility (not used in decoder-only)
+        cond = torch.zeros(batch_size, ego_status.shape[1], 256, device=device, dtype=model_dtype)
+        
+        # 7. Predict clean sample using decoder-only model
+        pred = self.model(
+            sample=noisy_trajectory_denorm,
+            timestep=timesteps,
+            cond=cond,  # For API compatibility
+            bev_tokens=bev_tokens,
+            gen_vit_tokens=vit_hidden_states,
+            reasoning_query_tokens=reasoning_hidden_states,
+            action_tokens=action_hidden_states,
+            ego_status=ego_status
+        )
+        
+        # 8. Compute trajectory loss - predict clean sample (not noise)
+        target = trajectory
+        
+        #l1 Loss for trajectory prediction
+        traj_loss = F.l1_loss(pred, target, reduction='none')
+        
+        if traj_loss.shape[-1] > 2:
+            traj_loss = traj_loss[..., :2]
+        
+        traj_loss = reduce(traj_loss, 'b ... -> b (...)', 'mean')
+        traj_loss = traj_loss.mean()
+        
+        return traj_loss
 
     def conditional_sample(self, 
-            condition_data, condition_mask,
-            cond=None, generator=None, vl_features=None,
-            # keyword arguments to scheduler.step
+            bev_tokens: torch.Tensor,
+            state_tokens: torch.Tensor,
+            vit_hidden_states: torch.Tensor,
+            reasoning_hidden_states: torch.Tensor,
+            action_hidden_states: torch.Tensor,
+            ego_status: torch.Tensor,
+            anchor: torch.Tensor,
+            device: torch.device,
+            model_dtype: torch.dtype,
+            generator=None,
             **kwargs
             ):
-        model = self.model
-        scheduler = self.noise_scheduler
-        device = condition_data.device
-        bs = condition_data.shape[0]
-
-        # Initialize trajectory based on anchor configuration
-        if self.use_anchor and self.plan_anchor is not None:
-            # 1. 准备 plan_anchor：使用anchor轨迹，加噪声到归一化后的anchor
-            plan_anchor = self.plan_anchor.to(device).repeat(bs, 1, 1)  # (bs, 8, 2)
-            odo_info_fut = self.normalize_action(plan_anchor)  # 归一化到[-1, 1]
+        """
+        Generate trajectory samples using truncated diffusion (DiffusionDriveV2 style).
+        
+        Args:
+            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens
+            state_tokens: (B, 1, 128) - state tokens
+            vit_hidden_states: (B, 128, 1536) - VIT hidden states
+            reasoning_hidden_states: (B, 20, 1536) - reasoning hidden states
+            action_hidden_states: (B, 4, 1536) - action hidden states
+            ego_status: (B, To, status_dim) - ego status history
+            anchor: (B, T, 2) - anchor trajectory
             
-            # 添加噪声到归一化后的 plan_anchor
-            noise = torch.randn(odo_info_fut.shape, device=device)
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.get('num_train_timesteps', 100),
-                (bs,), device=device
-            ).long()
-            noisy_trajectory = scheduler.add_noise(
-                original_samples=odo_info_fut,
-                noise=noise,
-                timesteps=timesteps
-            ).float()
-            trajectory = torch.clamp(noisy_trajectory, min=-1, max=1)
-        else:
-            # 直接从高斯分布采样
-            trajectory = torch.randn(
-                size=condition_data.shape, 
-                dtype=condition_data.dtype,
-                device=device,
-                generator=generator)
+        Returns:
+            trajectory: (B, T, 2) - predicted trajectory
+        """
+        result = self._truncated_diffusion_sample(
+            anchor=anchor,
+            bev_tokens=bev_tokens,
+            state_tokens=state_tokens,
+            ego_status=ego_status,
+            vit_hidden_states=vit_hidden_states,
+            reasoning_hidden_states=reasoning_hidden_states,
+            action_hidden_states=action_hidden_states,
+            device=device,
+            model_dtype=model_dtype,
+            generator=generator
+        )
+
+        return result
     
-        # set step values
-        scheduler.set_timesteps(self.num_inference_steps)
+    def _truncated_diffusion_sample(
+        self,
+        anchor: torch.Tensor,
+        bev_tokens: torch.Tensor,
+        state_tokens: torch.Tensor,
+        ego_status: torch.Tensor,
+        vit_hidden_states: torch.Tensor,
+        reasoning_hidden_states: torch.Tensor,
+        action_hidden_states: torch.Tensor,
+        device: torch.device,
+        model_dtype: torch.dtype,
+        generator=None
+    ) -> torch.Tensor:
+        """
+        Truncated diffusion sampling (DiffusionDriveV2 style with multiplicative noise).
+        Start from anchor with multiplicative noise, denoise for few steps.
         
-        # Use provided vl_features or generate simulated ones
-        if vl_features is None:
-            vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0], trajectory.device)
-        else:
-            # vl_features provided, create mask for valid positions
-            vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=vl_features.device)
+        Key insight:
+        - The model predicts the CLEAN trajectory directly (not noise, not residual)
+        - Uses multiplicative noise with scheduler-based variance (timestep-dependent)
+        - Final output is the model's direct prediction
+            
+        Returns:
+            trajectory: (B, T, 2) - predicted trajectory
+        """
+        bs = anchor.shape[0]
         
-        vl_embeds = self.feature_encoder(vl_features)
-
-        for t in scheduler.timesteps:
-            # 1. apply conditioning
-            trajectory[condition_mask] = condition_data[condition_mask]
-
-            # 2. predict model output
-            model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask)
-
-
-            # 3. compute previous image: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, 
-                generator=generator,
-                **kwargs
-                ).prev_sample
+        # Set up scheduler
+        self.diffusion_scheduler.set_timesteps(self.num_train_timesteps, device)
         
-        # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
-
-        return trajectory
+        # Compute rollout timesteps
+        step_ratio = 20 / self.num_diffusion_steps
+        roll_timesteps = (np.arange(0, self.num_diffusion_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+        
+        # Create dummy cond for API compatibility
+        cond = torch.zeros(bs, ego_status.shape[1], 256, device=device, dtype=model_dtype)
+        
+        # 1. Normalize anchor
+        diffusion_output = self.norm_odo(anchor)  # (B, T, 2)
+        
+        # 2. Add initial multiplicative noise using truncated timestep (scheduler-based)
+        diffusion_output = self.add_multiplicative_noise_scheduled(
+            diffusion_output,
+            timestep=self.trunc_timesteps,
+            eta=1.0,
+            std_min=0.04
+        )
+        
+        # 3. Denoising loop
+        pred = None
+        for i, k in enumerate(roll_timesteps):
+            # Clamp and denormalize
+            x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
+            noisy_traj_points = self.denorm_odo(x_boxes)  # (B, T, 2)
+            
+            # Get timestep
+            timesteps = k
+            if not torch.is_tensor(timesteps):
+                timesteps = torch.tensor([timesteps], dtype=torch.long, device=device)
+            elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+                timesteps = timesteps[None].to(device)
+            timesteps = timesteps.expand(bs)
+            
+            # Predict clean sample using decoder-only model
+            pred = self.model(
+                sample=noisy_traj_points.to(dtype=model_dtype),
+                timestep=timesteps,
+                cond=cond,
+                bev_tokens=bev_tokens,
+                gen_vit_tokens=vit_hidden_states,
+                reasoning_query_tokens=reasoning_hidden_states,
+                action_tokens=action_hidden_states,
+                ego_status=ego_status,
+            )
+            
+            # For next iteration, use the normalized prediction as input
+            x_start = self.norm_odo(pred)  # (B, T, 2)
+            
+            # Add noise for next iteration based on the next timestep
+            if i < len(roll_timesteps) - 1:
+                next_k = roll_timesteps[i + 1]
+                diffusion_output = self.add_multiplicative_noise_scheduled(
+                    x_start,
+                    timestep=next_k,
+                    eta=1.0,
+                    std_min=0.02
+                )
+            else:
+                diffusion_output = x_start
+        
+        # 4. Return the model's direct prediction
+        return pred
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
         Da = self.action_dim
-        Do = self.obs_feature_dim
         To = self.n_obs_steps
 
-        # handle different ways of passing observation
-        cond = None
-        cond_data = None
-        cond_mask = None
-        if self.obs_as_global_cond:
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-            shape = (B, T, Da)
-           
-            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-        else:
-            # condition through impainting
-            batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-            batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-            feature_dim = batch_features.shape[-1]
-            nobs_features = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-            shape = (B, T, Da+Do)
-            cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            cond_data[:,:To,Da:] = nobs_features
-            cond_mask[:,:To,Da:] = True
-
-        # run sampling
-        # Extract VQA features from obs_dict if available
-        if 'vqa' not in nobs or nobs['vqa'] is None:
-            vl_feat, _ = self.generate_simulated_vlm_outputs(
-                batch_size=B, 
-                device=device,
-                max_seq_len=None
-            )
-        else:
-            vl_feat = nobs['vqa'].to(dtype=torch.float32)
+        # Extract BEV tokens and State tokens
+        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
+        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
         
+        # Use only the last timestep's features
+        bev_tokens = bev_tokens.reshape(B, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
+        state_tokens = state_tokens.reshape(B, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
+
+        # Process VL tokens (Senna hidden states)
+        vit_hidden_states = nobs['vit_hidden_states']
+        reasoning_hidden_states = nobs['reasoning_hidden_states']
+        action_hidden_states = nobs['action_hidden_states']
+        
+        vit_hidden_states = vit_hidden_states.to(device=device, dtype=model_dtype)
+        vit_hidden_states = self.feature_encoder(vit_hidden_states)
+        
+        reasoning_hidden_states = reasoning_hidden_states.to(device=device, dtype=model_dtype)
+        reasoning_hidden_states = self.feature_encoder(reasoning_hidden_states)
+        
+        action_hidden_states = action_hidden_states.to(device=device, dtype=model_dtype)
+        action_hidden_states = self.feature_encoder(action_hidden_states)
+        
+        # Get ego_status
+        ego_status = nobs['ego_status']
+        ego_status = ego_status.to(dtype=model_dtype)
+        
+        # Get anchor for truncated diffusion
+        anchor = nobs.get('anchor_trajectory', None)
+        if anchor is not None:
+            anchor = anchor.to(device=device, dtype=model_dtype)
+            if anchor.dim() == 2:
+                anchor = anchor.unsqueeze(0)
+            if anchor.shape[0] != B:
+                anchor = anchor.expand(B, -1, -1)
+        
+        # Generate samples using truncated diffusion
         nsample = self.conditional_sample(
-            cond_data, 
-            cond_mask,
-            cond=cond,
-            vl_features=vl_feat
-            )
+            bev_tokens=bev_tokens,
+            state_tokens=state_tokens,
+            vit_hidden_states=vit_hidden_states,
+            reasoning_hidden_states=reasoning_hidden_states,
+            action_hidden_states=action_hidden_states,
+            ego_status=ego_status,
+            anchor=anchor,
+            device=device,
+            model_dtype=model_dtype,
+        )
         
         naction_pred = nsample[...,:Da]
         
-        # Clamp normalized predictions to [-1, 1] to prevent extreme values
-        naction_pred = torch.clamp(naction_pred, -1.0, 1.0)
-        
-        # Unnormalize action predictions back to original range
-        if self.enable_action_normalization and self.action_stats is not None:
-            naction_pred = self.unnormalize_action(naction_pred)
-            
-            # # Additional safety clamp after unnormalization to prevent extreme outliers
-            # device = naction_pred.device
-            # action_min = self.action_stats['min'].to(device)
-            # action_max = self.action_stats['max'].to(device)
-            
-            # # Expand to reasonable bounds (20% beyond training range)
-            # safety_margin = 0.2
-            # range_size = action_max - action_min
-            # expanded_min = action_min - safety_margin * range_size
-            # expanded_max = action_max + safety_margin * range_size
-            
-            # naction_pred = torch.clamp(naction_pred, expanded_min, expanded_max)
-        
-        action_pred = naction_pred.detach().cpu().numpy()
-        # 直接返回整个预测序列，因为horizon=action_horizon
+        # Convert to float32 before numpy
+        action_pred = naction_pred.detach().float().cpu().numpy()
         action = action_pred
         result = {
             'action': action,
-            'action_pred': action_pred
+            'action_pred': action_pred,
         }
+        
         return result
-
-    def extract_attention_map(self, obs_dict: Dict[str, torch.Tensor]) -> np.ndarray:
-        device = next(self.parameters()).device
-        nobs = dict_apply(obs_dict, lambda x: x.to(device))
-        last_obs = dict_apply(nobs, lambda x: x[:, -1, ...])
-        with torch.no_grad():
-            _, attention_map = self.extract_tcp_features(last_obs, return_attention=True)
-        attention_map_np = attention_map[0].cpu().numpy()  # (H, W)
-        
-        return attention_map_np
-
-    # def predict_action_with_steps(self, obs_dict: Dict[str, torch.Tensor]):
-  
-    #     device = next(self.parameters()).device
-    #     nobs = dict_apply(obs_dict, lambda x: x.to(device))
-
-    #     value = next(iter(nobs.values()))
-    #     B, To = value.shape[:2]
-    #     T = self.horizon
-    #     Da = self.action_dim
-    #     Do = self.obs_feature_dim
-    #     To = self.n_obs_steps
-
-    #     # 准备条件
-    #     cond = None
-    #     cond_data = None
-    #     cond_mask = None
-    #     if self.obs_as_global_cond:
-    #         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-    #         batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-    #         feature_dim = batch_features.shape[-1]
-    #         cond = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-    #         shape = (B, T, Da)
-    #         cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-    #         cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-    #     else:
-    #         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-    #         batch_features = self.extract_tcp_features(batch_nobs)  # (B*To, feature_dim)
-    #         feature_dim = batch_features.shape[-1]
-    #         nobs_features = batch_features.reshape(B, To, feature_dim)  # (B, To, feature_dim)
-    #         shape = (B, T, Da+Do)
-    #         cond_data = torch.zeros(size=shape, device=device, dtype=torch.float32)
-    #         cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-    #         cond_data[:,:To,Da:] = nobs_features
-    #         cond_mask[:,:To,Da:] = True
-
-
-    #     if 'vqa' not in nobs or nobs['vqa'] is None:
-    #         vl_feat, _ = self.generate_simulated_vlm_outputs(
-    #             batch_size=B, 
-    #             device=device,
-    #             max_seq_len=None
-    #         )
-    #     else:
-    #         vl_feat = nobs['vqa'].to(dtype=torch.float32)
-        
-    #     nsample, denoising_steps = self.conditional_sample_with_steps(
-    #         cond_data, 
-    #         cond_mask,
-    #         cond=cond,
-    #         vl_features=vl_feat
-    #     )
-        
-    #     naction_pred = nsample[...,:Da]
-    #     naction_pred = torch.clamp(naction_pred, -1.0, 1.0)
-        
-
-    #     denoising_steps_unnormalized = []
-    #     if self.enable_action_normalization and self.action_stats is not None:
-    #         for step in denoising_steps:
-    #             step_actions = step[..., :Da]
-    #             step_actions_clamped = torch.clamp(step_actions, -1.0, 1.0)
-    #             step_actions_unnorm = self.unnormalize_action(step_actions_clamped)
-    #             denoising_steps_unnormalized.append(step_actions_unnorm)
-            
-    #         # 反归一化最终预测
-    #         naction_pred = self.unnormalize_action(naction_pred)
-    #         device = naction_pred.device
-    #         action_min = self.action_stats['min'].to(device)
-    #         action_max = self.action_stats['max'].to(device)
-    #         safety_margin = 0.2
-    #         range_size = action_max - action_min
-    #         expanded_min = action_min - safety_margin * range_size
-    #         expanded_max = action_max + safety_margin * range_size
-    #         naction_pred = torch.clamp(naction_pred, expanded_min, expanded_max)
-    #     else:
-    #         denoising_steps_unnormalized = [step[..., :Da] for step in denoising_steps]
-        
-    #     action_pred = naction_pred.detach().cpu().numpy()
-    #     action = action_pred
-    #     result = {
-    #         'action': action,
-    #         'action_pred': action_pred
-    #     }
-        
-    #     # 转换去噪步骤为numpy（已经反归一化）
-    #     denoising_steps_np = [step[0].detach().cpu().numpy() for step in denoising_steps_unnormalized]
-        
-    #     return result, denoising_steps_np
-
-    # def conditional_sample_with_steps(self, 
-    #         condition_data, condition_mask,
-    #         cond=None, generator=None, vl_features=None,
-    #         **kwargs):
-    #     """
-    #     条件采样并返回中间去噪步骤
-    #     噪声加在归一化后的plan_anchor上（参考transfuser_model_v2.py的forward_train方法）
-    #     """
-    #     model = self.model
-    #     scheduler = self.noise_scheduler
-    #     device = condition_data.device
-    #     bs = condition_data.shape[0]
-
-    #     # 1. 准备 plan_anchor：加噪声到归一化后的 plan_anchor
-    #     plan_anchor = self.plan_anchor.repeat(bs, 1, 1)  # (bs, 8, 2)
-    #     odo_info_fut = self.normalize_action(plan_anchor)  # 归一化到[-1, 1]
-        
-    #     # 添加噪声到归一化后的 plan_anchor
-    #     noise = torch.randn(odo_info_fut.shape, device=device)
-    #     timesteps = torch.randint(
-    #         0, self.noise_scheduler.config.get('num_train_timesteps', 100),
-    #         (bs,), device=device
-    #     ).long()
-    #     noisy_trajectory = scheduler.add_noise(
-    #         original_samples=odo_info_fut,
-    #         noise=noise,
-    #         timesteps=timesteps
-    #     ).float()
-    #     noisy_trajectory = torch.clamp(noisy_trajectory, min=-1, max=1)
-    #     trajectory = self.unnormalize_action(noisy_trajectory)  # 反归一化回原始范围
-    
-    #     scheduler.set_timesteps(self.num_inference_steps)
-        
-    #     # Use provided vl_features or generate simulated ones
-    #     if vl_features is None:
-    #         print("No VLM features provided, generating simulated features...")
-    #         vl_features, vl_mask = self.generate_simulated_vlm_outputs(trajectory.shape[0], trajectory.device)
-    #     else:
-    #         # vl_features provided, create mask for valid positions
-    #         vl_mask = torch.ones(vl_features.shape[:2], dtype=torch.bool, device=vl_features.device)
-        
-    #     vl_embeds = self.feature_encoder(vl_features)
-
-    #     # 保存去噪步骤
-    #     denoising_steps = []
-        
-    #     total_steps = len(scheduler.timesteps)
-    #     for i, t in enumerate(scheduler.timesteps):
-    #         # 1. apply conditioning
-    #         trajectory[condition_mask] = condition_data[condition_mask]
-
-    #         # 2. predict model output
-    #         model_output = model(trajectory, t, vl_embeds, cond, vl_mask=vl_mask)
-
-    #         # 3. compute previous image: x_t -> x_t-1
-    #         trajectory = scheduler.step(
-    #             model_output, t, trajectory, 
-    #             generator=generator,
-    #             **kwargs
-    #             ).prev_sample
-            
-        
-    #     # 最终结果
-    #     trajectory[condition_mask] = condition_data[condition_mask]
-
-    #     return trajectory, denoising_steps
-
-    # ========= VLM feature simulati, temporary! TODO   ============
-
-    def _init_loaded_vlm_features(self):
-        """
-        从预先保存的文件中加载VLM特征
-        """
-        print("Loading VLM features from file...")
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        template_path = os.path.join(project_root, 'fixed_vlm_template.pt')
-        if os.path.exists(template_path):
-            self.fixed_vlm_template = torch.load(template_path)
-            self.fixed_seq_len = self.fixed_vlm_template.shape[0]
-            print(f"✓ VLM features loaded: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
-            # 根据实际VLM特征维度创建特征编码器
-            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度
-            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
-            self.feature_encoder.eval()
-            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
-        else:
-            print("⚠ VLM feature file not found, using simulated features")
-            self._init_fixed_vlm_features()
-
-
-    def _init_fixed_vlm_features(self):
-        print("Initializing VLM features...")
-        
-        if self.vlm_backbone is not None:
-            try:
-                print("Attempting to use real VLM model...")
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                # 创建一个简单的图像输入来获取VLM特征
-                # 使用PIL创建一个测试图像，这是Qwen VL模型所期望的格式
-                import numpy as np
-                from PIL import Image
-                
-                # 创建一个固定的测试图像 (224x224 RGB)
-                test_image_array = np.random.RandomState(42).randint(0, 255, (224, 224, 3), dtype=np.uint8)
-                test_image = Image.fromarray(test_image_array)
-                test_text = "What actions should be taken based on this scene?"
-                
-                try:
-                    # 使用VLM的processor来正确处理图像和文本
-                    messages = [
-                        {
-                            "role": "user", 
-                            "content": [
-                                {"type": "image", "image": test_image},
-                                {"type": "text", "text": test_text}
-                            ]
-                        }
-                    ]
-                    
-                    # 应用聊天模板
-                    text_inputs = self.vlm_backbone.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
-                    
-                    # 处理输入
-                    inputs = self.vlm_backbone.tokenizer(
-                        text=[text_inputs],
-                        images=[test_image], 
-                        return_tensors="pt",
-                        padding=True
-                    )
-                    
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    if device == 'cuda' and hasattr(self.vlm_backbone, 'model'):
-                        self.vlm_backbone.model = self.vlm_backbone.model.to(device)
-                    
-                    inputs = {k: v.to(device) for k, v in inputs.items()}
-                    
-                    # 获取VLM模型的隐藏状态
-                    with torch.no_grad():
-                        outputs = self.vlm_backbone.model(
-                            **inputs,
-                            output_hidden_states=True,
-                            return_dict=True,
-                        )
-                        
-                        # 获取最后一层隐藏状态
-                        if hasattr(outputs, 'hidden_states') and outputs.hidden_states:
-                            hidden_states = outputs.hidden_states[-1]  
-                            
-                            # 移除batch维度并转换为float32
-                            self.fixed_vlm_template = hidden_states.squeeze(0).float()  # (seq_len, hidden_size)
-                            self.fixed_seq_len = self.fixed_vlm_template.shape[0]
-                            
-                            print(f"✓ Real VLM features initialized: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
-                            
-                            # 根据实际VLM特征维度创建特征编码器
-                            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度
-                            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
-                            self.feature_encoder.eval()
-                            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
-                            self.fixed_vlm_template = self.fixed_vlm_template.cpu()
-                            
-                            if device == 'cuda':
-                                self.vlm_backbone.model = self.vlm_backbone.model.cpu()
-                                del self.vlm_backbone.model
-                                self.vlm_backbone.model = None
-                                torch.cuda.empty_cache()
-                                print("✓ VLM model moved to CPU and GPU memory cleared")
-                            
-                            return
-                        else:
-                            print("⚠ VLM model output does not contain hidden_states, falling back to simulated features")
-                            
-                except Exception as inner_e:
-                    print(f"⚠ Error in VLM processing: {inner_e}")
-                    
-            except Exception as e:
-                print(f"⚠ Failed to initialize real VLM features: {e}")
-        
-        # 备用方案：使用固定的随机特征
-        print("Using simulated VLM features...")
-        F = 2560  # VLM隐藏层维度
-        self.fixed_seq_len = 8  # 固定序列长度
-        
-        generator = torch.Generator()
-        generator.manual_seed(42)  
-        
-        # 生成单个固定的VLM特征模板 (seq_len, F)
-        self.fixed_vlm_template = torch.randn(
-            self.fixed_seq_len, F, 
-            generator=generator, 
-            dtype=torch.float32
-        )
-        
-        print(f"✓ Simulated VLM features initialized: shape={self.fixed_vlm_template.shape}, seq_len={self.fixed_seq_len}")
-        
-        # 根据VLM特征维度创建特征编码器
-        if self.feature_encoder is None:
-            vlm_feature_dim = self.fixed_vlm_template.shape[1]  # 隐藏层维度 
-            self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
-            self.feature_encoder.eval()
-            print(f"✓ Feature encoder created: {vlm_feature_dim} -> 1536")
-    
-    def generate_simulated_vlm_outputs(self, batch_size, device, max_seq_len=None):
-        """
-        生成真实的VLM输出特征, 支持可变序列长度和padding
-        
-        Args:
-            batch_size: 批次大小 (B)
-            device: 设备 ('cuda' 或 'cpu')
-            max_seq_len: 最大序列长度, 用于padding (可选)
-            
-        Returns:
-            vlm_features: 形状为 (B, seq_len, F) 的张量
-            vl_mask: 形状为 (B, seq_len) 的bool张量,True表示有效位置, False表示padding
-        """
-        # 将固定模板移动到指定设备
-        template_on_device = self.fixed_vlm_template.to(device)
-        current_seq_len = template_on_device.shape[0]
-        
-        # 如果指定了最大序列长度且当前序列较短，则进行padding
-        if max_seq_len is not None and current_seq_len < max_seq_len:
-            # 创建padding
-            padding_size = max_seq_len - current_seq_len
-            feature_dim = template_on_device.shape[1]
-            padding = torch.zeros(padding_size, feature_dim, device=device, dtype=template_on_device.dtype)
-            
-            # 添加padding到模板
-            padded_template = torch.cat([template_on_device, padding], dim=0)
-            
-            # 创建mask：True为有效位置，False为padding位置
-            vl_mask = torch.ones(max_seq_len, dtype=torch.bool, device=device)
-            vl_mask[current_seq_len:] = False
-            
-            seq_len = max_seq_len
-            template_to_use = padded_template
-        else:
-            # 不需要padding，所有位置都是有效的
-            vl_mask = torch.ones(current_seq_len, dtype=torch.bool, device=device)
-            seq_len = current_seq_len
-            template_to_use = template_on_device
-        
-        # 为批次重复
-        if batch_size == 1:
-            vlm_features = template_to_use.unsqueeze(0)  # (1, seq_len, F)
-            vl_mask_batch = vl_mask.unsqueeze(0)  # (1, seq_len)
-        else:
-            vlm_features = template_to_use.unsqueeze(0).repeat(batch_size, 1, 1)  # (B, seq_len, F)
-            vl_mask_batch = vl_mask.unsqueeze(0).repeat(batch_size, 1)  # (B, seq_len)
-        
-        return vlm_features, vl_mask_batch

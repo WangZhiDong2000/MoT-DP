@@ -1,3 +1,21 @@
+"""
+Decoder-Only Transformer for Diffusion-based Trajectory Prediction.
+
+This module implements a decoder-only architecture for trajectory prediction,
+using sequential cross-attention to multiple condition sources:
+- BEV spatial tokens (from InterfuserBEVEncoder)
+- State tokens (low-dim ego status)  
+- VL tokens (vision-language features)
+- Reasoning tokens
+
+Key design choices:
+- No encoder: removes attention pooling that loses information
+- Sequential cross-attention in each decoder layer
+- All condition sources maintain full sequence information
+- Unified decoder with heterogeneous queries for trajectory (6) + route (20)
+- MLP output heads (no GRU)
+"""
+
 from typing import Union, Optional, Tuple
 import logging
 import torch
@@ -7,7 +25,519 @@ import math
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Basic Components
+# =============================================================================
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dimensions of the input tensor."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class RotaryEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE) module."""
+    def __init__(self, dim: int, max_position_embeddings: int = 2048, theta: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.theta = theta
+
+        inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self._set_cos_sin_cache(max_position_embeddings, self.inv_freq.device)
+
+    def _set_cos_sin_cache(self, seq_len: int, device: torch.device):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, x: torch.Tensor, position_ids: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_len = position_ids.max().item() + 1
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device)
+
+        B, seq_len = position_ids.shape
+        cos = self.cos_cached[:, :, position_ids[0], :].expand(B, -1, -1, -1)
+        sin = self.sin_cached[:, :, position_ids[0], :].expand(B, -1, -1, -1)
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class MultiheadAttentionWithQKNorm(nn.Module):
+    """MultiheadAttention with Query-Key Normalization and optional RoPE."""
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        batch_first: bool = True,
+        norm_type: str = "rmsnorm",
+        use_rope: bool = True,
+        rope_theta: float = 10000.0,
+        max_position_embeddings: int = 2048
+    ):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout, 
+            bias=bias, batch_first=batch_first
+        )
+        
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0
+        
+        if norm_type == "rmsnorm":
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = nn.LayerNorm(self.head_dim)
+            self.k_norm = nn.LayerNorm(self.head_dim)
+        
+        self.use_rope = use_rope
+        if use_rope:
+            self.rope = RotaryEmbedding(self.head_dim, max_position_embeddings, rope_theta)
+        
+        self.batch_first = batch_first
+    
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.q_norm(q), self.k_norm(k)
+    
+    def _apply_rope(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, seq_len_q, seq_len_k = q.shape[0], q.shape[2], k.shape[2]
+        if seq_len_q != seq_len_k:
+            return q, k
+        
+        position_ids = torch.arange(seq_len_q, device=q.device).unsqueeze(0).expand(B, -1)
+        cos, sin = self.rope(q, position_ids)
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
+        return q, k
+    
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                key_padding_mask: Optional[torch.Tensor] = None, need_weights: bool = True,
+                attn_mask: Optional[torch.Tensor] = None, average_attn_weights: bool = True):
+        if self.batch_first:
+            B, seq_len_q, embed_dim = query.shape
+            _, seq_len_k, _ = key.shape
+            
+            q = query.view(B, seq_len_q, self.num_heads, self.head_dim).transpose(1, 2)
+            k = key.view(B, seq_len_k, self.num_heads, self.head_dim).transpose(1, 2)
+            
+            q, k = self._apply_qk_norm(q, k)
+            if self.use_rope:
+                q, k = self._apply_rope(q, k)
+            
+            query = q.transpose(1, 2).reshape(B, seq_len_q, embed_dim)
+            key = k.transpose(1, 2).reshape(B, seq_len_k, embed_dim)
+        
+        return self.attn(query=query, key=key, value=value, key_padding_mask=key_padding_mask,
+                        need_weights=need_weights, attn_mask=attn_mask, average_attn_weights=average_attn_weights)
+
+
+def apply_rope_single(x, cos, sin):
+    """Apply RoPE to a single tensor (only K, not Q)."""
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+class MultiSourceAttentionBlock(nn.Module):
+    """
+    Multi-Source Attention Block with separate projections for different sources.
+    
+    Implements the architecture from MLPResNetBlock_Pro with enhancements:
+    - Multi-head self-attention + two types of cross-attention (adapter / task)
+    - RoPE encoding for Q/K
+    - QK Normalization (RMSNorm) for stable training
+    - Gating mechanism for Reasoning and Action tokens
+    - Separate linear layers for different feature sources
+    - AdaLN modulation preserved
+    
+    Enhancements over basic fusion:
+    1. Per-source learnable temperature scaling for attention calibration
+    2. Source-specific Q projections for modality-aware queries
+    3. Learned bias terms for attention score adjustment
+    
+    Architecture:
+        1. Self-attention on main sequence with RoPE on both Q and K
+        2. Cross-attention to adapter tokens (hist + bev + vl) with RoPE on K only
+        3. Cross-attention to task tokens (reasoning + action) with RoPE on K only + gating
+        4. Residual + FFN
+        
+    The attention scores from all sources are concatenated and softmaxed together,
+    but the gating factors scale the Reasoning and Action (task) attention scores.
+    """
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, 
+                 dropout: float = 0.1, rope_theta: float = 10000.0, max_seq_len: int = 512,
+                 norm_type: str = "rmsnorm"):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+        
+        # RoPE embedding
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len = max_seq_len
+        
+        # ========== QK Normalization ==========
+        if norm_type == "rmsnorm":
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+        else:
+            self.q_norm = nn.LayerNorm(self.head_dim)
+            self.k_norm = nn.LayerNorm(self.head_dim)
+        
+        # ========== Q projections (source-specific for better modality adaptation) ==========
+        self.q_proj = nn.Linear(d_model, d_model)  # Shared base Q
+        # Small adaptation layers for cross-attention queries (low-rank for efficiency)
+        self.q_adapter_hist = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_bev = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_vl = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_reason = nn.Linear(d_model, d_model // 4)
+        self.q_adapter_action = nn.Linear(d_model, d_model // 4)  # For action tokens
+        self.q_adapter_out = nn.Linear(d_model // 4, d_model)
+        
+        # ========== Self-attention K, V ==========
+        self.k_self = nn.Linear(d_model, d_model)
+        self.v_self = nn.Linear(d_model, d_model)
+        
+        # ========== Adapter cross-attention K, V (for hist, bev, vl) ==========
+        self.k_hist = nn.Linear(d_model, d_model)
+        self.v_hist = nn.Linear(d_model, d_model)
+        self.k_bev = nn.Linear(d_model, d_model)
+        self.v_bev = nn.Linear(d_model, d_model)
+        self.k_vl = nn.Linear(d_model, d_model)
+        self.v_vl = nn.Linear(d_model, d_model)
+        
+        # ========== Task cross-attention K, V (for reasoning and action) ==========
+        self.k_reasoning = nn.Linear(d_model, d_model)
+        self.v_reasoning = nn.Linear(d_model, d_model)
+        self.k_action = nn.Linear(d_model, d_model)  # For action tokens
+        self.v_action = nn.Linear(d_model, d_model)  # For action tokens
+        
+        # ========== Output projection ==========
+        self.o_proj = nn.Linear(d_model, d_model)
+        
+        # ========== Gating factors for Reasoning and Action tokens ==========
+        # Initialize to small positive value for stable training start
+        self.gating_factor = nn.Parameter(torch.tensor(0.1))  # For reasoning
+        self.gating_factor_action = nn.Parameter(torch.tensor(0.1))  # For action
+        
+        # ========== Per-source learnable temperature (log scale for stability) ==========
+        # Controls attention sharpness per source: exp(temp) * scores
+        self.temp_self = nn.Parameter(torch.zeros(1))
+        self.temp_hist = nn.Parameter(torch.zeros(1))
+        self.temp_bev = nn.Parameter(torch.zeros(1))
+        self.temp_vl = nn.Parameter(torch.zeros(1))
+        self.temp_reason = nn.Parameter(torch.zeros(1))
+        self.temp_action = nn.Parameter(torch.zeros(1))
+        
+        # ========== Per-source learnable bias (attention prior) ==========
+        # Adds a learnable bias to attention scores before softmax
+        self.bias_self = nn.Parameter(torch.zeros(1))
+        self.bias_hist = nn.Parameter(torch.zeros(1))
+        self.bias_bev = nn.Parameter(torch.zeros(1))
+        self.bias_vl = nn.Parameter(torch.zeros(1))
+        self.bias_reason = nn.Parameter(torch.zeros(1))
+        self.bias_action = nn.Parameter(torch.zeros(1))
+        
+        # ========== Dropout layers for regularization ==========
+        self.dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)  # Dropout after output projection
+        self.adapter_dropout = nn.Dropout(dropout * 0.5)  # Lighter dropout for adapters
+        
+        # ========== FFN ==========
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        
+        # ========== Layer Norm for pre-attention ==========
+        self.norm_pre = nn.LayerNorm(d_model)
+        
+        # ========== AdaLN modulation - 6 params: shift, scale, gate ==========
+        # (shift_pre, scale_pre, gate_attn, shift_ffn, scale_ffn, gate_ffn)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model, bias=True)
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply QK normalization to query and key tensors."""
+        return self.q_norm(q), self.k_norm(k)
+    
+    def _get_rope_embed(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        """Generate RoPE cos/sin embeddings."""
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)  # (seq_len, head_dim/2)
+        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, head_dim)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+    
+    def _reshape_heads(self, x: torch.Tensor, B: int, L: int) -> torch.Tensor:
+        """Reshape (B, L, d_model) -> (B, nhead, L, head_dim)"""
+        return x.view(B, L, self.nhead, self.head_dim).transpose(1, 2)
+    
+    def modulate(self, x, shift, scale):
+        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    
+    def forward(
+        self,
+        x: torch.Tensor,  # (B, T, d_model) - main sequence
+        hist_tokens: torch.Tensor,  # (B, T_h, d_model) - history tokens (already projected)
+        bev_tokens: torch.Tensor,   # (B, T_b, d_model) - BEV tokens (already projected)
+        vl_tokens: torch.Tensor,    # (B, T_v, d_model) - VL tokens (already projected)
+        reasoning_tokens: torch.Tensor,  # (B, T_r, d_model) - reasoning tokens (already projected)
+        action_tokens: torch.Tensor,  # (B, T_a, d_model) - action tokens (already projected)
+        conditioning: torch.Tensor,  # (B, d_model) - conditioning for AdaLN
+        self_attn_mask: Optional[torch.Tensor] = None,
+        hist_padding_mask: Optional[torch.Tensor] = None,
+        bev_padding_mask: Optional[torch.Tensor] = None,
+        vl_padding_mask: Optional[torch.Tensor] = None,
+        reasoning_padding_mask: Optional[torch.Tensor] = None,
+        action_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with multi-source attention.
+        
+        Attention is computed as:
+        1. Self-attention: Q(x) @ K(x)^T with RoPE on both Q and K
+        2. Adapter cross-attention: Q_adapted(x) @ [K(hist), K(bev), K(vl)]^T with RoPE on K only
+        3. Task cross-attention: Q_adapted(x) @ [K(reasoning), K(action)]^T with RoPE on K only, scaled by gating
+        
+        All attention scores are concatenated, temperature-scaled, bias-adjusted, and softmaxed together.
+        """
+        B, T, C = x.shape
+        T_h = hist_tokens.shape[1]
+        T_b = bev_tokens.shape[1]
+        T_v = vl_tokens.shape[1]
+        T_r = reasoning_tokens.shape[1]
+        T_a = action_tokens.shape[1]
+        
+        # ========== AdaLN modulation parameters ==========
+        mod_params = self.adaLN_modulation(conditioning)
+        shift_pre, scale_pre, gate_attn, shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(6, dim=1)
+        
+        # ========== Pre-LayerNorm with modulation ==========
+        x_norm = self.modulate(self.norm_pre(x), shift_pre, scale_pre)
+        
+        # ========== Gating factor for Reasoning ==========
+        g = self.gating_factor
+        ratio_g = torch.tanh(g)
+        
+        # ========== Gating factor for Action ==========
+        g_action = self.gating_factor_action
+        ratio_g_action = torch.tanh(g_action)
+        
+        # ========== Temperature scaling factors (softplus for positive values) ==========
+        temp_self = 1.0 + torch.nn.functional.softplus(self.temp_self)
+        temp_hist = 1.0 + torch.nn.functional.softplus(self.temp_hist)
+        temp_bev = 1.0 + torch.nn.functional.softplus(self.temp_bev)
+        temp_vl = 1.0 + torch.nn.functional.softplus(self.temp_vl)
+        temp_reason = 1.0 + torch.nn.functional.softplus(self.temp_reason)
+        temp_action = 1.0 + torch.nn.functional.softplus(self.temp_action)
+        
+        # ========== Q projection (base + source-specific adaptations) ==========
+        q_base = self.q_proj(x_norm)  # (B, T, d_model)
+        
+        # Source-specific Q adaptations (low-rank: d -> d/4 -> d)
+        q_adapt_hist = self.q_adapter_out(torch.tanh(self.q_adapter_hist(x_norm)))
+        q_adapt_bev = self.q_adapter_out(torch.tanh(self.q_adapter_bev(x_norm)))
+        q_adapt_vl = self.q_adapter_out(torch.tanh(self.q_adapter_vl(x_norm)))
+        q_adapt_reason = self.q_adapter_out(torch.tanh(self.q_adapter_reason(x_norm)))
+        q_adapt_action = self.q_adapter_out(torch.tanh(self.q_adapter_action(x_norm)))
+        
+        # ========== Self-attention K, V ==========
+        k_self = self.k_self(x_norm)  # (B, T, d_model)
+        v_self = self.v_self(x_norm)  # (B, T, d_model)
+        
+        # ========== Adapter K, V (hist, bev, vl) ==========
+        k_hist = self.k_hist(hist_tokens)  # (B, T_h, d_model)
+        v_hist = self.v_hist(hist_tokens)
+        k_bev = self.k_bev(bev_tokens)      # (B, T_b, d_model)
+        v_bev = self.v_bev(bev_tokens)
+        k_vl = self.k_vl(vl_tokens)          # (B, T_v, d_model)
+        v_vl = self.v_vl(vl_tokens)
+        
+        # ========== Task K, V (reasoning and action) ==========
+        k_reason = self.k_reasoning(reasoning_tokens)  # (B, T_r, d_model)
+        v_reason = self.v_reasoning(reasoning_tokens)
+        k_action = self.k_action(action_tokens)  # (B, T_a, d_model)
+        v_action = self.v_action(action_tokens)
+        
+        # ========== Reshape to multi-head ==========
+        q_base = self._reshape_heads(q_base, B, T)            # (B, nhead, T, head_dim)
+        # Create adapted Q for each source by adding adaptation to base Q
+        q_hist = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_hist, B, T)
+        q_bev = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_bev, B, T)
+        q_vl = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_vl, B, T)
+        q_reason = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_reason, B, T)
+        q_action = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_action, B, T)
+        
+        k_self = self._reshape_heads(k_self, B, T)
+        v_self = self._reshape_heads(v_self, B, T)
+        k_hist = self._reshape_heads(k_hist, B, T_h)
+        v_hist = self._reshape_heads(v_hist, B, T_h)
+        k_bev = self._reshape_heads(k_bev, B, T_b)
+        v_bev = self._reshape_heads(v_bev, B, T_b)
+        k_vl = self._reshape_heads(k_vl, B, T_v)
+        v_vl = self._reshape_heads(v_vl, B, T_v)
+        k_reason = self._reshape_heads(k_reason, B, T_r)
+        v_reason = self._reshape_heads(v_reason, B, T_r)
+        k_action = self._reshape_heads(k_action, B, T_a)
+        v_action = self._reshape_heads(v_action, B, T_a)
+        
+        # ========== Apply QK Normalization ==========
+        q_base, k_self = self._apply_qk_norm(q_base, k_self)
+        q_hist, k_hist = self._apply_qk_norm(q_hist, k_hist)
+        q_bev, k_bev = self._apply_qk_norm(q_bev, k_bev)
+        q_vl, k_vl = self._apply_qk_norm(q_vl, k_vl)
+        q_reason, k_reason = self._apply_qk_norm(q_reason, k_reason)
+        q_action, k_action = self._apply_qk_norm(q_action, k_action)
+        
+        # ========== Apply RoPE ==========
+        # Self-attention: both Q and K
+        cos_main, sin_main = self._get_rope_embed(T, x.device, x.dtype)
+        cos_main = cos_main.unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim)
+        sin_main = sin_main.unsqueeze(0).unsqueeze(0)
+        q_base = apply_rope_single(q_base, cos_main, sin_main)
+        k_self = apply_rope_single(k_self, cos_main, sin_main)
+        
+        # Cross-attention Q: apply same RoPE as self-attention
+        q_hist = apply_rope_single(q_hist, cos_main, sin_main)
+        q_bev = apply_rope_single(q_bev, cos_main, sin_main)
+        q_vl = apply_rope_single(q_vl, cos_main, sin_main)
+        q_reason = apply_rope_single(q_reason, cos_main, sin_main)
+        q_action = apply_rope_single(q_action, cos_main, sin_main)
+        
+        # Adapter K: only K gets RoPE
+        cos_h, sin_h = self._get_rope_embed(T_h, x.device, x.dtype)
+        cos_h = cos_h.unsqueeze(0).unsqueeze(0)
+        sin_h = sin_h.unsqueeze(0).unsqueeze(0)
+        k_hist = apply_rope_single(k_hist, cos_h, sin_h)
+        
+        cos_b, sin_b = self._get_rope_embed(T_b, x.device, x.dtype)
+        cos_b = cos_b.unsqueeze(0).unsqueeze(0)
+        sin_b = sin_b.unsqueeze(0).unsqueeze(0)
+        k_bev = apply_rope_single(k_bev, cos_b, sin_b)
+        
+        cos_v, sin_v = self._get_rope_embed(T_v, x.device, x.dtype)
+        cos_v = cos_v.unsqueeze(0).unsqueeze(0)
+        sin_v = sin_v.unsqueeze(0).unsqueeze(0)
+        k_vl = apply_rope_single(k_vl, cos_v, sin_v)
+        
+        # Task K (reasoning and action): only K gets RoPE
+        cos_r, sin_r = self._get_rope_embed(T_r, x.device, x.dtype)
+        cos_r = cos_r.unsqueeze(0).unsqueeze(0)
+        sin_r = sin_r.unsqueeze(0).unsqueeze(0)
+        k_reason = apply_rope_single(k_reason, cos_r, sin_r)
+        
+        cos_a, sin_a = self._get_rope_embed(T_a, x.device, x.dtype)
+        cos_a = cos_a.unsqueeze(0).unsqueeze(0)
+        sin_a = sin_a.unsqueeze(0).unsqueeze(0)
+        k_action = apply_rope_single(k_action, cos_a, sin_a)
+        
+        # ========== Compute attention scores with temperature and bias ==========
+        scale = math.sqrt(self.head_dim)
+        
+        # Self-attention scores (with temperature and bias)
+        attn_self = torch.matmul(q_base, k_self.transpose(-2, -1)) * temp_self + self.bias_self  # (B, nhead, T, T)
+        
+        # Adapter cross-attention scores (with source-specific Q, temperature and bias)
+        attn_hist = torch.matmul(q_hist, k_hist.transpose(-2, -1)) * temp_hist + self.bias_hist  # (B, nhead, T, T_h)
+        attn_bev = torch.matmul(q_bev, k_bev.transpose(-2, -1)) * temp_bev + self.bias_bev       # (B, nhead, T, T_b)
+        attn_vl = torch.matmul(q_vl, k_vl.transpose(-2, -1)) * temp_vl + self.bias_vl           # (B, nhead, T, T_v)
+        
+        # Task cross-attention scores (with gating for Reasoning and Action, temperature and bias)
+        attn_reason = torch.matmul(q_reason, k_reason.transpose(-2, -1)) * ratio_g * temp_reason + self.bias_reason  # (B, nhead, T, T_r)
+        attn_action = torch.matmul(q_action, k_action.transpose(-2, -1)) * ratio_g_action * temp_action + self.bias_action  # (B, nhead, T, T_a)
+        
+        # ========== Build attention mask ==========
+        # Concatenate all attention scores
+        attn_scores = torch.cat([attn_self, attn_hist, attn_bev, attn_vl, attn_reason, attn_action], dim=-1)
+        attn_scores = attn_scores / scale  # (B, nhead, T, T + T_h + T_b + T_v + T_r + T_a)
+        
+        # Apply self-attention mask if provided
+        if self_attn_mask is not None:
+            # self_attn_mask is for self-attention part only, need to expand
+            # Create full mask: (T, T + T_h + T_b + T_v + T_r + T_a)
+            total_kv_len = T + T_h + T_b + T_v + T_r + T_a
+            full_mask = torch.zeros(T, total_kv_len, device=x.device, dtype=x.dtype)
+            full_mask[:, :T] = self_attn_mask  # Apply causal mask to self-attention part
+            attn_scores = attn_scores + full_mask.unsqueeze(0).unsqueeze(0)
+        
+        # Apply padding masks
+        if hist_padding_mask is not None:
+            # hist_padding_mask: (B, T_h), True = padding
+            hist_mask = hist_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T_h)
+            attn_scores[:, :, :, T:T+T_h] = attn_scores[:, :, :, T:T+T_h].masked_fill(hist_mask, float('-inf'))
+        
+        if bev_padding_mask is not None:
+            bev_mask = bev_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores[:, :, :, T+T_h:T+T_h+T_b] = attn_scores[:, :, :, T+T_h:T+T_h+T_b].masked_fill(bev_mask, float('-inf'))
+        
+        if vl_padding_mask is not None:
+            vl_mask = vl_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores[:, :, :, T+T_h+T_b:T+T_h+T_b+T_v] = attn_scores[:, :, :, T+T_h+T_b:T+T_h+T_b+T_v].masked_fill(vl_mask, float('-inf'))
+        
+        if reasoning_padding_mask is not None:
+            reason_mask = reasoning_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores[:, :, :, T+T_h+T_b+T_v:T+T_h+T_b+T_v+T_r] = attn_scores[:, :, :, T+T_h+T_b+T_v:T+T_h+T_b+T_v+T_r].masked_fill(reason_mask, float('-inf'))
+        
+        if action_padding_mask is not None:
+            action_mask = action_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_scores[:, :, :, T+T_h+T_b+T_v+T_r:] = attn_scores[:, :, :, T+T_h+T_b+T_v+T_r:].masked_fill(action_mask, float('-inf'))
+        
+        # ========== Softmax and weighted sum ==========
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # (B, nhead, T, total_kv_len)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Concatenate all values
+        v_combined = torch.cat([v_self, v_hist, v_bev, v_vl, v_reason, v_action], dim=2)  # (B, nhead, total_kv_len, head_dim)
+        
+        # Weighted sum
+        output = torch.matmul(attn_weights, v_combined)  # (B, nhead, T, head_dim)
+        
+        # ========== Reshape and output projection ==========
+        output = output.transpose(1, 2).contiguous().view(B, T, C)
+        output = self.o_proj(output)
+        output = self.proj_dropout(output)  # Add dropout after output projection
+        
+        # ========== Residual with gate ==========
+        x = x + gate_attn.unsqueeze(1) * output
+        
+        # ========== FFN with AdaLN ==========
+        x_norm_ffn = self.modulate(nn.functional.layer_norm(x, [C]), shift_ffn, scale_ffn)
+        x_ffn = self.ffn(x_norm_ffn)
+        x = x + gate_ffn.unsqueeze(1) * x_ffn
+        
+        return x
+
+
 class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal position embedding for diffusion timesteps."""
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -16,15 +546,17 @@ class SinusoidalPosEmb(nn.Module):
         device = x.device
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float32) * -emb)
+        emb = x[:, None].float() * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
+
 class ModuleAttrMixin(nn.Module):
+    """Mixin for device/dtype properties."""
     def __init__(self):
         super().__init__()
-        self._dummy_variable = nn.Parameter()
+        self._dummy_variable = nn.Parameter(torch.zeros(1))
 
     @property
     def device(self):
@@ -34,613 +566,598 @@ class ModuleAttrMixin(nn.Module):
     def dtype(self):
         return next(iter(self.parameters())).dtype
 
-class LowdimMaskGenerator(ModuleAttrMixin):
-    def __init__(self,
-        action_dim, obs_dim,
-        # obs mask setup
-        max_n_obs_steps=2, 
-        fix_obs_steps=True, 
-        # action mask
-        action_visible=False
-        ):
+
+# =============================================================================
+# History Encoder
+# =============================================================================
+
+class HistoryEncoder(nn.Module):
+    """Encodes the history sequence of ego status into a single vector using GRU."""
+    def __init__(self, input_dim, hidden_dim, num_layers=1):
         super().__init__()
-        self.action_dim = action_dim
-        self.obs_dim = obs_dim
-        self.max_n_obs_steps = max_n_obs_steps
-        self.fix_obs_steps = fix_obs_steps
-        self.action_visible = action_visible
-
-    @torch.no_grad()
-    def forward(self, shape, seed=None):
-        device = self.device
-        B, T, D = shape
-        assert D == (self.action_dim + self.obs_dim)
-
-        # create all tensors on this device
-        rng = torch.Generator(device=device)
-        if seed is not None:
-            rng = rng.manual_seed(seed)
-
-        # generate dim mask
-        dim_mask = torch.zeros(size=shape, 
-            dtype=torch.bool, device=device)
-        is_action_dim = dim_mask.clone()
-        is_action_dim[...,:self.action_dim] = True
-        is_obs_dim = ~is_action_dim
-
-        # generate obs mask
-        if self.fix_obs_steps:
-            obs_steps = torch.full((B,), 
-            fill_value=self.max_n_obs_steps, device=device)
-        else:
-            obs_steps = torch.randint(
-                low=1, high=self.max_n_obs_steps+1, 
-                size=(B,), generator=rng, device=device)
-            
-        steps = torch.arange(0, T, device=device).reshape(1,T).expand(B,T)
-        obs_mask = (steps.T < obs_steps).T.reshape(B,T,1).expand(B,T,D)
-        obs_mask = obs_mask & is_obs_dim
-
-        # generate action mask
-        if self.action_visible:
-            action_steps = torch.maximum(
-                obs_steps - 1, 
-                torch.tensor(0,
-                    dtype=obs_steps.dtype, 
-                    device=obs_steps.device))
-            action_mask = (steps.T < action_steps).T.reshape(B,T,1).expand(B,T,D)
-            action_mask = action_mask & is_action_dim
-
-        mask = obs_mask
-        if self.action_visible:
-            mask = mask | action_mask
-        
-        return mask
-
-class CustomEncoderBlock(nn.Module):
-    """
-    Encoder block that handles condition embedding, VL pooling, encoding, and memory projection
-    """
-    def __init__(self, n_emb, n_head, n_cond_layers, p_drop_emb, p_drop_attn, vl_emb_dim, 
-                 obs_as_cond, cond_dim, T_cond):
-        super().__init__()
-        self.n_emb = n_emb
-        self.obs_as_cond = obs_as_cond
-        self.T_cond = T_cond
-        
-        # Time embedding
-        self.time_emb = SinusoidalPosEmb(n_emb)
-        
-        # Observation condition embedding
-        self.cond_obs_emb = None
-        if obs_as_cond:
-            self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
-        
-        # VL features processing
-        self.vl_emb_proj = nn.Linear(vl_emb_dim, n_emb)
-        self.vl_emb_norm = nn.LayerNorm(n_emb)
-        self.vl_attention_pooling = nn.MultiheadAttention(
-            embed_dim=n_emb,
-            num_heads=n_head,
-            dropout=p_drop_attn,
-            batch_first=True
-        )
-        self.vl_pool_query = nn.Parameter(torch.randn(1, 1, n_emb))
-        
-        # Position embedding and preprocessing
-        self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
-        self.drop = nn.Dropout(p_drop_emb)
-        self.pre_encoder_norm = nn.LayerNorm(n_emb)
-        
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=n_emb,
-            nhead=n_head,
-            dim_feedforward=4*n_emb,
-            dropout=p_drop_attn,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=n_cond_layers
-        )
-        
-        # Memory processing
-        self.memory_norm = nn.LayerNorm(n_emb)
-        self.memory_proj = nn.Sequential(
-            nn.Linear(n_emb, n_emb),
-            nn.GELU(),
-            nn.Dropout(p_drop_attn),
-            nn.Linear(n_emb, n_emb)
-        )
-    
-    def _attention_pool_vl_features(self, vl_features: torch.Tensor, vl_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Apply attention pooling to vl features"""
-        batch_size = vl_features.shape[0]
-        query = self.vl_pool_query.expand(batch_size, -1, -1)  # (B, 1, n_emb)
-        pooled_features, _ = self.vl_attention_pooling(
-            query=query,                    # (B, 1, n_emb)
-            key=vl_features,               # (B, T_vl, n_emb)
-            value=vl_features,             # (B, T_vl, n_emb)
-            key_padding_mask=vl_padding_mask  # (B, T_vl)
-        )
-        return pooled_features  # (B, 1, n_emb)
-    
-    def forward(self, timestep: torch.Tensor, vl_embeds: torch.Tensor, cond: Optional[torch.Tensor] = None, 
-                vl_padding_mask: Optional[torch.Tensor] = None):
-        """
-        timestep: (B,) timestep tensor
-        vl_embeds: (B, T_vl, D_vl) vision-language embeddings
-        cond: (B, T_cond, cond_dim) condition tensor
-        vl_padding_mask: (B, T_vl) padding mask for VL features
-        """
-        
-        # 1. Time embedding
-        time_emb = self.time_emb(timestep).unsqueeze(1)  # (B, 1, n_emb)
-        
-        # 2. Process VL features
-        vl_features = self.vl_emb_proj(vl_embeds)  # (B, T_vl, n_emb)
-        vl_features = self.vl_emb_norm(vl_features)
-        vl_features_processed = self._attention_pool_vl_features(vl_features, vl_padding_mask)
-        
-        # 3. Combine condition embeddings
-        cond_embeddings = time_emb
-        if self.obs_as_cond and cond is not None:
-            cond_obs_emb = self.cond_obs_emb(cond)
-            cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
-        cond_embeddings = torch.cat([cond_embeddings, vl_features_processed], dim=1)
-        
-        # 4. Add position embedding
-        tc = cond_embeddings.shape[1]
-        if tc <= self.cond_pos_emb.shape[1]:
-            position_embeddings = self.cond_pos_emb[:, :tc, :]
-        else:
-            position_embeddings = torch.zeros(1, tc, self.cond_pos_emb.shape[2], 
-                                            device=self.cond_pos_emb.device, dtype=self.cond_pos_emb.dtype)
-            position_embeddings[:, :self.cond_pos_emb.shape[1], :] = self.cond_pos_emb
-            if tc > self.cond_pos_emb.shape[1]:
-                torch.nn.init.normal_(position_embeddings[:, self.cond_pos_emb.shape[1]:, :], mean=0.0, std=0.02)
-        
-        # 5. Apply dropout and pre-norm
-        x = self.drop(cond_embeddings + position_embeddings)
-        x = self.pre_encoder_norm(x)
-        
-        # 6. Transformer encoder
-        x = self.encoder(x)
-        
-        # 7. Memory processing
-        memory = self.memory_norm(x)
-        memory = memory + self.memory_proj(memory)
-        
-        return memory, vl_features
-
-
-class CustomDecoderLayer(nn.Module):
-    """
-    DP decoder. Memory first enhanced by VL feature, than guide trajectory generation
-    """
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, batch_first=False):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        self.memory_vl_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        self.traj_memory_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
-        
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-        
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.norm4 = nn.LayerNorm(d_model)
-        
-        self.activation = torch.nn.functional.gelu
-    
-    def forward(self, tgt, memory, vl_features, tgt_mask=None, memory_mask=None, 
-                vl_key_padding_mask=None):
-        
-        # three masks are used: tgt_mask, memory_mask, vl_key_padding_mask
-        # 1. Self-attention on trajectory 
-        tgt2 = self.norm1(tgt)
-        tgt2, _ = self.self_attn(tgt2, tgt2, tgt2, attn_mask=tgt_mask, key_padding_mask=None)
-        tgt = tgt + self.dropout1(tgt2)
-        
-        # 2. Memory-VL cross attention 
-        memory2 = self.norm2(memory)
-        enhanced_memory_output, _ = self.memory_vl_cross_attn(memory2, vl_features, vl_features, 
-                                                      key_padding_mask=vl_key_padding_mask)
-        enhanced_memory = memory + self.dropout2(enhanced_memory_output)
-        
-        # 3. Trajectory-Memory cross attention 
-        tgt2 = self.norm3(tgt)
-        tgt2, _ = self.traj_memory_cross_attn(tgt2, enhanced_memory, enhanced_memory, 
-                                             attn_mask=memory_mask, key_padding_mask=None)
-        tgt = tgt + self.dropout3(tgt2)
-        
-        # 4. Feed forward
-        tgt2 = self.norm4(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout(tgt2)
-            
-        return tgt
-
-
-class CustomTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, obs_as_cond=False, causal_attn=False):
-        super().__init__()
-        self.layers = nn.ModuleList([decoder_layer for _ in range(num_layers)])
-        self.num_layers = num_layers
-        
-        # Mask generation settings
-        self.obs_as_cond = obs_as_cond
-        self.causal_attn = causal_attn
-    
-    def _generate_memory_mask(self, x, memory, cond, tgt_mask):
-        """Generate dynamic memory mask for causal attention"""
-        if not self.causal_attn or tgt_mask is None:
-            return None
-            
-        actual_memory_length = memory.shape[1]
-        T_actual = x.shape[1]  
-        S_actual = actual_memory_length 
-        time_pos = 0  
-        obs_start = 1   
-        obs_end = obs_start + (cond.shape[1] if cond is not None and self.obs_as_cond else 0)
-        
-        # VL features are pooled to 1 token
-        vl_start = obs_end
-        vl_end = vl_start + 1
-        
-        memory_mask_dynamic = torch.zeros((T_actual, S_actual), device=x.device, dtype=torch.bool)
-        
-        for t in range(T_actual):
-            # Time embedding: visible to all positions
-            memory_mask_dynamic[t, time_pos] = True
-            
-            # Vision-language features: visible to all positions (1 pooled token)
-            if vl_start < S_actual and vl_end <= S_actual:
-                memory_mask_dynamic[t, vl_start:vl_end] = True
-            
-            # Observation conditions: causal visibility
-            if self.obs_as_cond and cond is not None and obs_start < obs_end:
-                visible_obs_end = min(obs_start + t + 1, obs_end)
-                memory_mask_dynamic[t, obs_start:visible_obs_end] = True
-        
-        memory_mask = memory_mask_dynamic.float().masked_fill(
-            memory_mask_dynamic == 0, float('-inf')
-        ).masked_fill(memory_mask_dynamic == 1, float(0.0))
-        
-        return memory_mask
-        
-    def forward(self, tgt, memory, vl_features, cond=None, tgt_mask=None, 
-                vl_key_padding_mask=None):
-        # Generate dynamic memory mask
-        memory_mask = self._generate_memory_mask(tgt, memory, cond, tgt_mask)
-        
-        # Decoder layers
-        output = tgt
-        for layer in self.layers:
-            output = layer(output, memory, vl_features, tgt_mask=tgt_mask, memory_mask=memory_mask,
-                          vl_key_padding_mask=vl_key_padding_mask)
-        return output
-
-
-class TrajectoryHead(nn.Module):
-    def __init__(self, n_emb, output_dim, p_drop_emb):
-        super().__init__()
-        self.ln_f = nn.LayerNorm(n_emb)
-        self.drop = nn.Dropout(p_drop_emb)
-        self.head = nn.Linear(n_emb, output_dim)
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.SiLU()
 
     def forward(self, x):
+        _, h_n = self.gru(x)
+        h = h_n[-1]
+        return self.out_proj(self.act(h))
+
+
+# =============================================================================
+# Trajectory Head (MLP version)
+# =============================================================================
+
+class TrajectoryMLPHead(nn.Module):
+    """
+    MLP-based Trajectory Head for decoding trajectory.
+    Replaces GRU with simple MLP layers.
+    """
+    def __init__(self, n_emb: int, output_dim: int, p_drop: float = 0.1):
+        super().__init__()
+        self.ln_f = nn.LayerNorm(n_emb)
+        
+        # MLP layers with conditioning
+        self.mlp = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+            nn.Linear(n_emb, n_emb),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+        )
+        
+        # Conditioning projection
+        self.cond_proj = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.SiLU(),
+        )
+        
+        # Output projection
+        self.output_head = nn.Linear(n_emb, output_dim)
+
+    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, n_emb) - decoder output
+            conditioning: (B, n_emb) - timestep + ego_status conditioning
+        Returns:
+            (B, T, output_dim) - trajectory prediction
+        """
         x = self.ln_f(x)
-        x = self.drop(x)
-        x = self.head(x)
+        
+        # Add conditioning as bias
+        cond = self.cond_proj(conditioning).unsqueeze(1)  # (B, 1, n_emb)
+        x = x + cond
+        
+        # MLP processing
+        x = x + self.mlp(x)
+        
+        # Output projection
+        return self.output_head(x)
+
+
+# =============================================================================
+# Unified Decoder with Heterogeneous Queries
+# =============================================================================
+
+class UnifiedDecoderOnlyTransformer(nn.Module):
+    """
+    Decoder-Only Transformer for trajectory prediction.
+    
+    Uses trajectory queries with multi-source cross-attention:
+    - History status as cross-attention source (contains complete low-dim state info)
+    - Multi-source attention with RoPE and gating (MLPResNetBlock_Pro style)
+    
+    Query structure: [trajectory (horizon)]
+    Cross-attention sources: All fused in single attention operation with:
+        - Self-attention with RoPE on Q and K
+        - Adapter cross-attention (hist, bev, vl) with RoPE on K only
+        - Task cross-attention (reasoning, action) with RoPE on K only + gating
+    
+    Note: No separate State cross-attention since History already contains
+    complete low-dim status (speed, theta, command, target_point, waypoints).
+    """
+    def __init__(
+        self,
+        d_model: int = 768,
+        nhead: int = 12,
+        num_layers: int = 12,
+        dim_feedforward: int = 3072,
+        dropout: float = 0.1,
+        status_dim: int = 13,
+        bev_dim: int = 512,
+        vl_dim: int = 1536,
+        reasoning_dim: int = 1536,
+        horizon: int = 8,
+        n_obs_steps: int = 4,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.horizon = horizon
+        self.n_obs_steps = n_obs_steps
+        
+        # Projection layers for conditions
+        self.hist_proj = nn.Sequential(nn.Linear(status_dim, d_model), nn.LayerNorm(d_model))
+        self.bev_proj = nn.Sequential(nn.Linear(bev_dim, d_model), nn.LayerNorm(d_model))
+        self.vl_proj = nn.Sequential(nn.Linear(vl_dim, d_model), nn.LayerNorm(d_model))
+        self.reasoning_proj = nn.Sequential(nn.Linear(reasoning_dim, d_model), nn.LayerNorm(d_model))
+        self.action_proj = nn.Sequential(nn.Linear(reasoning_dim, d_model), nn.LayerNorm(d_model))  # Same dim as reasoning
+        
+        # Position embeddings for cross-attention sources
+        self.hist_pos_emb = nn.Parameter(torch.zeros(1, n_obs_steps, d_model))
+        self.bev_pos_emb = nn.Parameter(torch.zeros(1, 256, d_model))
+        
+        # Decoder blocks - using new MultiSourceAttentionBlock
+        self.layers = nn.ModuleList([
+            MultiSourceAttentionBlock(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        self.final_norm = nn.LayerNorm(d_model)
+        self._init_weights()
+    
+    def _init_weights(self):
+        nn.init.normal_(self.hist_pos_emb, mean=0.0, std=0.02)
+        nn.init.normal_(self.bev_pos_emb, mean=0.0, std=0.02)
+        for layer in self.layers:
+            nn.init.zeros_(layer.adaLN_modulation[-1].weight)
+            nn.init.zeros_(layer.adaLN_modulation[-1].bias)
+    
+    def forward(
+        self,
+        traj_emb: torch.Tensor,  # (B, horizon, d_model) - trajectory query embeddings
+        hist_status: torch.Tensor,  # (B, To, status_dim) - raw history status for cross-attention
+        bev_tokens: torch.Tensor,
+        vl_tokens: torch.Tensor,
+        reasoning_tokens: torch.Tensor,
+        action_tokens: torch.Tensor,  # (B, T_a, action_dim) - action hidden states
+        conditioning: torch.Tensor,
+        self_attn_mask: Optional[torch.Tensor] = None,
+        hist_padding_mask: Optional[torch.Tensor] = None,
+        bev_padding_mask: Optional[torch.Tensor] = None,
+        vl_padding_mask: Optional[torch.Tensor] = None,
+        reasoning_padding_mask: Optional[torch.Tensor] = None,
+        action_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with trajectory queries and multi-source attention.
+        
+        Args:
+            traj_emb: (B, horizon, d_model) - trajectory query embeddings (noisy traj embedded)
+            hist_status: (B, To, status_dim) - raw history status sequence
+            bev_tokens: (B, seq_len, bev_dim) - BEV spatial tokens
+            vl_tokens: (B, T_vl, vl_dim) - VL tokens
+            reasoning_tokens: (B, T_r, reasoning_dim) - reasoning tokens
+            action_tokens: (B, T_a, action_dim) - action hidden states
+            conditioning: (B, d_model) - timestep + current_status conditioning
+            
+        Returns:
+            traj_out: (B, horizon, d_model) - trajectory output
+        """
+        B = traj_emb.shape[0]
+        T_traj = traj_emb.shape[1]
+        To = hist_status.shape[1]
+        
+        # Trajectory queries (no route queries anymore)
+        x = traj_emb  # (B, horizon, d_model)
+        
+        # Project history status to d_model and add position embedding
+        hist_proj = self.hist_proj(hist_status)  # (B, To, d_model)
+        hist_pos = self.hist_pos_emb[:, :To, :] if To <= self.hist_pos_emb.shape[1] else self.hist_pos_emb
+        hist_proj = hist_proj + hist_pos
+        
+        # Project other conditions
+        bev_proj = self.bev_proj(bev_tokens)
+        bev_seq_len = bev_proj.shape[1]
+        if bev_seq_len <= self.bev_pos_emb.shape[1]:
+            bev_proj = bev_proj + self.bev_pos_emb[:, :bev_seq_len, :]
+        
+        vl_proj = self.vl_proj(vl_tokens)
+        reasoning_proj = self.reasoning_proj(reasoning_tokens)
+        action_proj = self.action_proj(action_tokens)
+        
+        # Decoder layers with multi-source attention
+        for layer in self.layers:
+            x = layer(
+                x, 
+                hist_proj, 
+                bev_proj, 
+                vl_proj, 
+                reasoning_proj,
+                action_proj,
+                conditioning,
+                self_attn_mask, 
+                hist_padding_mask, 
+                bev_padding_mask,
+                vl_padding_mask, 
+                reasoning_padding_mask,
+                action_padding_mask
+            )
+        
+        x = self.final_norm(x)
+        
+        # Return trajectory output only
         return x
 
 
-class TransformerForDiffusion(ModuleAttrMixin):
-    def __init__(self,
-            input_dim: int,
-            output_dim: int,
-            horizon: int,
-            n_obs_steps: int = None,
-            cond_dim: int = 2,
-            n_layer: int = 12,
-            n_head: int = 12,
-            n_emb: int = 768,
-            p_drop_emb: float = 0.1,
-            p_drop_attn: float = 0.1,
-            causal_attn: bool=False,
-            obs_as_cond: bool=False,
-            n_cond_layers: int = 4,
-            vl_emb_dim: int = 1536
-        ) -> None:
-        super().__init__()
+# =============================================================================
+# Main Model: TransformerForDiffusion (Decoder-Only)
+# =============================================================================
 
+class TransformerForDiffusion(ModuleAttrMixin):
+    """
+    Decoder-Only Transformer for Diffusion-based Trajectory Prediction.
+    
+    Key features:
+    - Decoder with trajectory queries
+    - Sequential cross-attention to: History -> BEV -> VL -> Reasoning -> Action
+    - History status as cross-attention source (complete 4-frame sequence)
+    - No separate State cross-attention (History contains complete low-dim state)
+    - MLP output head (no GRU)
+    - AdaLN modulation based on timestep + current_ego_status
+    
+    Query structure: [trajectory (horizon)]
+    Cross-attention sources: History (4 frames) -> BEV -> VL -> Reasoning -> Action
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        horizon: int,
+        n_obs_steps: int = None,
+        cond_dim: int = 2,
+        n_layer: int = 12,
+        n_head: int = 12,
+        n_emb: int = 768,
+        p_drop_emb: float = 0.1,
+        p_drop_attn: float = 0.1,
+        causal_attn: bool = False,
+        obs_as_cond: bool = False,
+        n_cond_layers: int = 4,
+        vl_emb_dim: int = 1536,
+        reasoning_emb_dim: int = 1536,
+        action_emb_dim: int = 1536,  # Same as reasoning
+        status_dim: int = 15,
+        ego_status_seq_len: int = 1,
+        bev_dim: int = 512,
+        state_token_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        
         if n_obs_steps is None:
             n_obs_steps = horizon
         
-        T = horizon
-        T_cond = 1
-        obs_as_cond = cond_dim > 0
-        if obs_as_cond:
-            T_cond += n_obs_steps
+        self.n_obs_steps = n_obs_steps
+        self.horizon = horizon
+        self.status_dim = status_dim
+        self.vl_emb_dim = vl_emb_dim
+        self.reasoning_emb_dim = reasoning_emb_dim
+        self.action_emb_dim = action_emb_dim
+        self.bev_dim = bev_dim
+        self.T = horizon
         
-        # Compute VL tokens count for T_cond
-        self.target_vl_tokens = None
-        vl_tokens_count = 1 
-        T_cond += vl_tokens_count   
-
-        # input embedding stem
+        # Input embedding for noisy trajectory
         self.input_emb = nn.Linear(input_dim, n_emb)
-        self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
+        
+        # Position embeddings for trajectory queries
+        self.pos_emb = nn.Parameter(torch.zeros(1, horizon, n_emb))
+        
         self.drop = nn.Dropout(p_drop_emb)
         self.pre_decoder_norm = nn.LayerNorm(n_emb)
-
-        # Custom encoder block that handles all condition processing
-        self.encoder_block = CustomEncoderBlock(
-            n_emb=n_emb,
-            n_head=n_head,
-            n_cond_layers=n_cond_layers,
-            p_drop_emb=p_drop_emb,
-            p_drop_attn=p_drop_attn,
-            vl_emb_dim=vl_emb_dim,
-            obs_as_cond=obs_as_cond,
-            cond_dim=cond_dim,
-            T_cond=T_cond
-        )
-        # Custom decoder that integrates VL cross attention and pre-processing
-        custom_decoder_layer = CustomDecoderLayer(
+        
+        # Conditioning: timestep + current_status + GRU-encoded history
+        self.time_emb = SinusoidalPosEmb(n_emb)
+        self.ego_status_proj = nn.Linear(status_dim, n_emb)  # For current status only
+        self.history_encoder = HistoryEncoder(status_dim, n_emb)  # GRU for global history encoding
+        
+        # Decoder for trajectory prediction
+        # History status is cross-attention source (no separate State cross-attention)
+        self.decoder = UnifiedDecoderOnlyTransformer(
             d_model=n_emb,
             nhead=n_head,
-            dim_feedforward=4*n_emb,
-            dropout=p_drop_attn,
-            batch_first=True
-        )
-        self.decoder = CustomTransformerDecoder(
-            decoder_layer=custom_decoder_layer,
             num_layers=n_layer,
-            obs_as_cond=obs_as_cond,
-            causal_attn=causal_attn
+            dim_feedforward=4 * n_emb,
+            dropout=p_drop_attn,
+            status_dim=status_dim,  # For history projection inside decoder
+            bev_dim=bev_dim,
+            vl_dim=vl_emb_dim,
+            reasoning_dim=reasoning_emb_dim,
+            horizon=horizon,
+            n_obs_steps=n_obs_steps,
         )
-
-        # attention mask
-        if causal_attn:
-            # self-attention causal mask is computed here
-            # however, cross attention mask is moved to the forward pass
-            sz = T
-            mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-            mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-            self.register_buffer("mask", mask)
-            self.memory_mask = None
-        else:
-            self.mask = None
-            self.memory_mask = None
-
-        # trajectory head block
-        self.trajectory_head = TrajectoryHead(n_emb, output_dim, p_drop_emb)
         
-        # constants
-        self.T = T
-        self.T_cond = T_cond
-        self.horizon = horizon
-        self.obs_as_cond = obs_as_cond
-        self.vl_emb_dim = vl_emb_dim
-
+        # Causal mask for trajectory queries
+        self.causal_attn = causal_attn
+        # Note: We create mask dynamically in forward() to handle variable lengths
+        
+        # Output head for trajectory only
+        self.trajectory_head = TrajectoryMLPHead(n_emb, output_dim, p_drop_emb)
+        
         self.apply(self._init_weights)
-        logger.info(
-            "number of parameters: %e", sum(p.numel() for p in self.parameters())
-        )
-
+        
+        logger.info("TransformerForDiffusion (Decoder-Only) - parameters: %e", 
+                   sum(p.numel() for p in self.parameters()))
+    
     def _init_weights(self, module):
-        ignore_types = (
-            nn.Dropout, 
-            SinusoidalPosEmb, 
-            nn.TransformerEncoderLayer, 
-            nn.TransformerDecoderLayer,
-            nn.TransformerEncoder,
-            nn.TransformerDecoder,
-            nn.GELU,
-            nn.Sequential,
-            CustomEncoderBlock,
-            CustomDecoderLayer,
-            CustomTransformerDecoder,
-            TrajectoryHead,
-            nn.ModuleList
-        )  #
         if isinstance(module, (nn.Linear, nn.Embedding)):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.MultiheadAttention):
-            weight_names = [
-                'in_proj_weight', 'q_proj_weight', 'k_proj_weight', 'v_proj_weight']
-            for name in weight_names:
-                weight = getattr(module, name)
-                if weight is not None:
-                    torch.nn.init.normal_(weight, mean=0.0, std=0.02)
-            
-            bias_names = ['in_proj_bias', 'bias_k', 'bias_v']
-            for name in bias_names:
-                bias = getattr(module, name)
-                if bias is not None:
-                    torch.nn.init.zeros_(bias)
+        elif isinstance(module, nn.GRU):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    torch.nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    torch.nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    torch.nn.init.zeros_(param.data)
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
+        elif isinstance(module, RMSNorm):
+            torch.nn.init.ones_(module.weight)
         elif isinstance(module, TransformerForDiffusion):
             torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
-            if hasattr(module, 'vl_pool_query'):
-                torch.nn.init.normal_(module.vl_pool_query, mean=0.0, std=0.02)
-            if hasattr(module, 'cond_pos_emb') and module.cond_pos_emb is not None:
-                torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
-        elif isinstance(module, ignore_types):
-            pass
-        else:
-            raise RuntimeError("Unaccounted module {}".format(module))
     
-    def get_optim_groups(self, weight_decay: float=1e-3):
-        """
-        This long function is unfortunately doing something very simple and is being very defensive:
-        We are separating out all parameters of the model into two buckets: those that will experience
-        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
-        """
-
-        # separate out all parameters to those that will and won't experience regularizing weight decay
+    def get_optim_groups(self, weight_decay: float = 1e-3):
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention)
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        whitelist = (nn.Linear, nn.MultiheadAttention, nn.Conv1d, nn.GRU)
+        blacklist = (nn.LayerNorm, nn.Embedding, RMSNorm)
+        
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
-                fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
-
-                if pn.endswith("bias"):
-                    # all biases will not be decayed
+                fpn = f"{mn}.{pn}" if mn else pn
+                if pn.endswith("bias") or "bias" in pn:
                     no_decay.add(fpn)
-                elif pn.startswith("bias"):
-                    # MultiheadAttention bias starts with "bias"
-                    no_decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
+                elif "weight" in pn and isinstance(m, whitelist):
                     decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
+                elif pn.endswith("weight") and isinstance(m, blacklist):
                     no_decay.add(fpn)
-
-        # special case the position embedding parameter in the root module as not decayed
+        
         param_dict = {pn: p for pn, p in self.named_parameters()}
         for name in param_dict:
             if 'pos_emb' in name or '_dummy_variable' in name:
                 no_decay.add(name)
-            elif 'vl_pool_query' in name or 'cond_pos_emb' in name:
+            elif 'gating_factor' in name or 'gating_factor_action' in name:
                 no_decay.add(name)
-
-        # validate that we considered every parameter
+            elif 'temp_' in name or 'bias_' in name:
+                # Temperature and bias parameters - no weight decay
+                no_decay.add(name)
+            elif 'inv_freq' in name:
+                # inv_freq is a buffer, should not be in param_dict, but handle if exists
+                no_decay.add(name)
+        
         inter_params = decay & no_decay
         union_params = decay | no_decay
-        assert (
-            len(inter_params) == 0
-        ), "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
-        assert (
-            len(param_dict.keys() - union_params) == 0
-        ), "parameters %s were not separated into either decay/no_decay set!" % (
-            str(param_dict.keys() - union_params),
-        )
-
-        # create the pytorch optimizer object
-        optim_groups = [
-            {
-                "params": [param_dict[pn] for pn in sorted(list(decay))],
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": [param_dict[pn] for pn in sorted(list(no_decay))],
-                "weight_decay": 0.0,
-            },
+        assert len(inter_params) == 0
+        assert len(param_dict.keys() - union_params) == 0, f"Missing params: {param_dict.keys() - union_params}"
+        
+        return [
+            {"params": [param_dict[pn] for pn in sorted(decay)], "weight_decay": weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
         ]
-        return optim_groups
-
-    def configure_optimizers(self, 
-            learning_rate: float=1e-4, 
-            weight_decay: float=1e-3,
-            betas: Tuple[float, float]=(0.9,0.95)):
-        optim_groups = self.get_optim_groups(weight_decay=weight_decay)
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas
+    
+    def configure_optimizers(self, learning_rate: float = 1e-4, weight_decay: float = 1e-3,
+                            betas: Tuple[float, float] = (0.9, 0.95)):
+        return torch.optim.AdamW(self.get_optim_groups(weight_decay), lr=learning_rate, betas=betas)
+    
+    def _create_causal_attn_mask(self, T_traj: int, device: torch.device, dtype: torch.dtype):
+        """
+        Create causal attention mask for trajectory queries.
+        
+        Mask rules:
+        - Trajectory tokens: causal within trajectory (can only attend to past)
+        """
+        
+        if not self.causal_attn:
+            return None
+        
+        # Start with full attention allowed
+        mask = torch.zeros(T_traj, T_traj, device=device, dtype=dtype)
+        
+        # Trajectory: causal within trajectory
+        for i in range(T_traj):
+            mask[i, i+1:T_traj] = float('-inf')  # Can't attend to future trajectory
+        
+        return mask
+    
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        cond: torch.Tensor,
+        bev_tokens: torch.Tensor,
+        gen_vit_tokens: torch.Tensor,
+        reasoning_query_tokens: torch.Tensor,
+        action_tokens: torch.Tensor,  # action hidden states
+        ego_status: torch.Tensor,
+        bev_padding_mask: Optional[torch.Tensor] = None,
+        vl_mask: Optional[torch.Tensor] = None,
+        reasoning_mask: Optional[torch.Tensor] = None,
+        action_mask: Optional[torch.Tensor] = None,  # action mask
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Forward pass with decoder.
+        
+        Args:
+            sample: (B, T, input_dim) - noisy trajectory
+            timestep: diffusion timestep
+            cond: (B, T_obs, cond_dim) - for API compatibility (not used)
+            bev_tokens: (B, seq_len, bev_dim) - BEV spatial tokens (last frame only)
+            gen_vit_tokens: (B, T_vl, vl_dim) - VL tokens
+            reasoning_query_tokens: (B, T_r, reasoning_dim) - reasoning tokens
+            action_tokens: (B, T_a, action_dim) - action hidden states
+            ego_status: (B, T_obs, status_dim) - ego status history (complete 4 frames)
+            
+        Returns:
+            trajectory: (B, T, output_dim) - predicted trajectory
+            trajectory: (B, T, output_dim) - for longitudinal control
+        History status utilization:
+            1. AdaLN conditioning: current_status (last frame) + GRU-encoded global history
+            2. Cross-attention: complete history sequence as first cross-attention source
+            
+        Note: state_tokens from BEV encoder are NOT used since ego_status
+        already contains complete low-dim state info (speed, theta, command, etc.)
+        """
+        model_dtype = next(self.parameters()).dtype
+        
+        sample = sample.contiguous().to(dtype=model_dtype)
+        bev_tokens = bev_tokens.contiguous().to(dtype=model_dtype)
+        vl_tokens = gen_vit_tokens.contiguous().to(dtype=model_dtype)
+        reasoning_tokens = reasoning_query_tokens.contiguous().to(dtype=model_dtype)
+        action_tokens = action_tokens.contiguous().to(dtype=model_dtype)
+        ego_status = ego_status.to(dtype=model_dtype)
+        
+        B = sample.shape[0]
+        T_traj = sample.shape[1]
+        
+        # Timestep handling
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif len(timestep.shape) == 0:
+            timestep = timestep[None].to(sample.device)
+        timesteps = timestep.expand(B)
+        
+        # ========== Conditioning ==========
+        # 1. Timestep embedding
+        time_emb = self.time_emb(timesteps).to(dtype=model_dtype)
+        
+        # 2. Current status embedding (last frame only for AdaLN)
+        current_status = ego_status[:, -1, :]  # (B, status_dim)
+        status_emb = self.ego_status_proj(current_status)
+        
+        # 3. GRU-encoded global history for AdaLN
+        hist_global_emb = self.history_encoder(ego_status)  # (B, n_emb)
+        
+        # Combined conditioning for AdaLN modulation
+        conditioning = time_emb + status_emb + hist_global_emb
+        
+        # ========== Trajectory Query Embedding ==========
+        traj_emb = self.input_emb(sample)  # (B, T_traj, n_emb)
+        pos_emb = self.pos_emb[:, :T_traj, :]
+        traj_emb = traj_emb + pos_emb
+        traj_emb = self.drop(traj_emb)
+        traj_emb = self.pre_decoder_norm(traj_emb)
+        
+        # ========== Create Attention Mask ==========
+        self_attn_mask = self._create_causal_attn_mask(T_traj, sample.device, model_dtype)
+        
+        # ========== Padding Masks ==========
+        vl_padding_mask = ~vl_mask if vl_mask is not None else (torch.norm(vl_tokens, dim=-1) == 0)
+        reasoning_padding_mask = ~reasoning_mask if reasoning_mask is not None else (torch.norm(reasoning_tokens, dim=-1) == 0)
+        action_padding_mask = ~action_mask if action_mask is not None else (torch.norm(action_tokens, dim=-1) == 0)
+        
+        # ========== Decoder ==========
+        # Cross-attention order: History -> BEV -> VL -> Reasoning -> Action
+        traj_out = self.decoder(
+            traj_emb,
+            ego_status,  # Complete history for cross-attention (B, T_obs, status_dim)
+            bev_tokens, vl_tokens, reasoning_tokens, action_tokens, conditioning,
+            self_attn_mask, None, bev_padding_mask, vl_padding_mask, reasoning_padding_mask, action_padding_mask
         )
-        return optimizer
-
-    def forward(self, 
-        sample: torch.Tensor, 
-        timestep: Union[torch.Tensor, float, int], 
-        vl_embeds: torch.Tensor,
-        cond: torch.Tensor, **kwargs):
-        """
-        x: (B,T,input_dim)
-        timestep: (B,) or int, diffusion step
-        cond: (B,T',cond_dim)
-        vl_embeds: (B, T_vl, D_vl) 
-        output: (B,T,input_dim)
-        """
-        sample = sample.contiguous()
-        cond = cond.contiguous() 
-        vl_embeds = vl_embeds.contiguous()
         
-        # 1. Prepare timesteps
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-        timesteps = timesteps.expand(sample.shape[0])
+        # ========== Output Head ==========
+        trajectory = self.trajectory_head(traj_out, conditioning)
         
-        # 2. Check VL padding
-        vl_padding_mask = None
-        if 'vl_mask' in kwargs and kwargs['vl_mask'] is not None:
-            vl_padding_mask = ~kwargs['vl_mask']  
-        else:
-            vl_norm = torch.norm(vl_embeds, dim=-1)  # (B, T_vl)
-            vl_padding_mask = (vl_norm == 0) 
-        
-        # 3. Process conditions through encoder block to get memory
-        memory, vl_features = self.encoder_block(
-            timestep=timesteps, 
-            vl_embeds=vl_embeds, 
-            cond=cond, 
-            vl_padding_mask=vl_padding_mask)
-        
-        # 4. Pre-decoder processing
-        token_embeddings = self.input_emb(sample)
-        t = token_embeddings.shape[1]
-        position_embeddings = self.pos_emb[:, :t, :]
-        x = self.drop(token_embeddings + position_embeddings)
-        x = self.pre_decoder_norm(x)
-        
-        # 5. Decoder with integrated memory mask handling and VL cross attention
-        x = self.decoder(
-            tgt=x,
-            memory=memory,
-            vl_features=vl_features,
-            cond=cond,
-            tgt_mask=self.mask,
-            vl_key_padding_mask=vl_padding_mask
-        )        
-        
-        # 6. trajectory head 
-        x = self.trajectory_head(x)
-        return x
+        return trajectory
 
 
+# =============================================================================
+# Test
+# =============================================================================
 
 def test():
-    # GPT with time embedding and obs cond and encoder
+    """Test the decoder-only architecture with history as cross-attention."""
+    print("=" * 60)
+    print("Testing TransformerForDiffusion (Decoder-Only)")
+    print("History as Cross-Attention Source (No State Cross-Attn)")
+    print("With Action Hidden States Support")
+    print("=" * 60)
+    
     transformer = TransformerForDiffusion(
-        input_dim=16,
-        output_dim=16,
+        input_dim=2,
+        output_dim=2,
         horizon=8,
         n_obs_steps=4,
         cond_dim=10,
+        n_layer=6,
+        n_head=8,
+        n_emb=512,
         causal_attn=True,
-        n_cond_layers=4,
-        vl_emb_dim=1536
+        vl_emb_dim=1536,
+        reasoning_emb_dim=1536,
+        action_emb_dim=1536,
+        status_dim=13,
+        bev_dim=512,
     )
-    opt = transformer.configure_optimizers()
     
+    print(f"Model parameters: {sum(p.numel() for p in transformer.parameters()):,}")
+    
+    B = 4
     timestep = torch.tensor(0)
-    sample = torch.zeros((4,8,16))
-    cond = torch.zeros((4,4,10))
-    vl_embeds = torch.ones((4,36,1536))
-    out = transformer(sample, timestep, vl_embeds, cond)
-    print(out.shape)
-
+    sample = torch.randn((B, 8, 2))
+    cond = torch.zeros((B, 4, 10))
+    bev_tokens = torch.randn((B, 197, 512))
+    vl_tokens = torch.randn((B, 36, 1536))
+    reasoning_tokens = torch.randn((B, 10, 1536))
+    action_tokens = torch.randn((B, 4, 1536))  # Action hidden states
+    ego_status = torch.randn((B, 4, 13))  # 4 frames of history
     
+    print("\nTest 1: Basic forward pass")
+    trajectory = transformer(
+        sample=sample, timestep=timestep, cond=cond,
+        bev_tokens=bev_tokens,
+        gen_vit_tokens=vl_tokens, reasoning_query_tokens=reasoning_tokens,
+        action_tokens=action_tokens,
+        ego_status=ego_status,
+    )
+    print(f"  Trajectory: {trajectory.shape}")
+    assert trajectory.shape == (B, 8, 2), f"Expected (B, 8, 2), got {trajectory.shape}"
+    
+    print("\nTest 2: Different BEV tokens affect output")
+    bev_tokens2 = torch.randn((B, 197, 512))
+    traj2 = transformer(sample=sample, timestep=timestep, cond=cond,
+                        bev_tokens=bev_tokens2,
+                        gen_vit_tokens=vl_tokens, reasoning_query_tokens=reasoning_tokens,
+                        action_tokens=action_tokens,
+                        ego_status=ego_status)
+    diff = torch.abs(trajectory - traj2).mean()
+    print(f"  Difference: {diff:.6f}")
+    assert diff > 0, "BEV should affect output"
+    
+    print("\nTest 3: Different history affects output")
+    ego_status2 = torch.randn((B, 4, 13))
+    traj3 = transformer(sample=sample, timestep=timestep, cond=cond,
+                        bev_tokens=bev_tokens,
+                        gen_vit_tokens=vl_tokens, reasoning_query_tokens=reasoning_tokens,
+                        action_tokens=action_tokens,
+                        ego_status=ego_status2)
+    diff_hist = torch.abs(trajectory - traj3).mean()
+    print(f"  Difference: {diff_hist:.6f}")
+    assert diff_hist > 0, "History should affect output"
+    
+    print("\nTest 4: Different action tokens affect output")
+    action_tokens2 = torch.randn((B, 4, 1536))
+    traj4 = transformer(sample=sample, timestep=timestep, cond=cond,
+                        bev_tokens=bev_tokens,
+                        gen_vit_tokens=vl_tokens, reasoning_query_tokens=reasoning_tokens,
+                        action_tokens=action_tokens2,
+                        ego_status=ego_status)
+    diff_action = torch.abs(trajectory - traj4).mean()
+    print(f"  Difference: {diff_action:.6f}")
+    assert diff_action > 0, "Action tokens should affect output"
+    
+    print("\nTest 5: Optimizer")
+    opt = transformer.configure_optimizers()
+    print(f"  Optimizer created: {type(opt).__name__}")
+    
+   
+
+
 if __name__ == "__main__":
     test()
