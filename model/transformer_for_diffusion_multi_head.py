@@ -161,7 +161,7 @@ class MultiSourceAttentionBlock(nn.Module):
     Multi-Source Attention Block with separate projections for different sources.
     
     Implements the architecture from MLPResNetBlock_Pro with enhancements:
-    - Multi-head self-attention + two types of cross-attention (adapter / task)
+    - Multi-head self-attention + cross-attention (adapter / task)
     - RoPE encoding for Q/K
     - QK Normalization (RMSNorm) for stable training
     - Gating mechanism for Reasoning tokens only
@@ -175,12 +175,14 @@ class MultiSourceAttentionBlock(nn.Module):
     
     Architecture:
         1. Self-attention on main sequence with RoPE on both Q and K
-        2. Cross-attention to adapter tokens (hist + bev + vl) with RoPE on K only
+        2. Cross-attention to adapter tokens (bev + vl) with RoPE on K only
         3. Cross-attention to task tokens (reasoning) with RoPE on K only + gating
         4. Residual + FFN
         
     The attention scores from all sources are concatenated and softmaxed together,
     but the gating factor only scales the Reasoning (task) attention scores.
+    
+    Note: hist_tokens removed - ego_status history is now only used for AdaLN conditioning.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, 
                  dropout: float = 0.1, rope_theta: float = 10000.0, max_seq_len: int = 512,
@@ -207,7 +209,6 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Q projections (source-specific for better modality adaptation) ==========
         self.q_proj = nn.Linear(d_model, d_model)  # Shared base Q
         # Small adaptation layers for cross-attention queries (low-rank for efficiency)
-        self.q_adapter_hist = nn.Linear(d_model, d_model // 4)
         self.q_adapter_bev = nn.Linear(d_model, d_model // 4)
         self.q_adapter_vl = nn.Linear(d_model, d_model // 4)
         self.q_adapter_reason = nn.Linear(d_model, d_model // 4)
@@ -217,9 +218,7 @@ class MultiSourceAttentionBlock(nn.Module):
         self.k_self = nn.Linear(d_model, d_model)
         self.v_self = nn.Linear(d_model, d_model)
         
-        # ========== Adapter cross-attention K, V (for hist, bev, vl) ==========
-        self.k_hist = nn.Linear(d_model, d_model)
-        self.v_hist = nn.Linear(d_model, d_model)
+        # ========== Adapter cross-attention K, V (for bev, vl) ==========
         self.k_bev = nn.Linear(d_model, d_model)
         self.v_bev = nn.Linear(d_model, d_model)
         self.k_vl = nn.Linear(d_model, d_model)
@@ -238,7 +237,6 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Per-source learnable temperature (log scale for stability) ==========
         # Controls attention sharpness per source: exp(temp) * scores
         self.temp_self = nn.Parameter(torch.zeros(1))      # log(1) = 0
-        self.temp_hist = nn.Parameter(torch.zeros(1))
         self.temp_bev = nn.Parameter(torch.zeros(1))
         self.temp_vl = nn.Parameter(torch.zeros(1))
         self.temp_reason = nn.Parameter(torch.zeros(1))
@@ -246,7 +244,6 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Per-source learnable bias (attention prior) ==========
         # Adds a learnable bias to attention scores before softmax
         self.bias_self = nn.Parameter(torch.zeros(1))
-        self.bias_hist = nn.Parameter(torch.zeros(1))
         self.bias_bev = nn.Parameter(torch.zeros(1))
         self.bias_vl = nn.Parameter(torch.zeros(1))
         self.bias_reason = nn.Parameter(torch.zeros(1))
@@ -294,13 +291,11 @@ class MultiSourceAttentionBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,  # (B, T, d_model) - main sequence
-        hist_tokens: torch.Tensor,  # (B, T_h, d_model) - history tokens (already projected)
         bev_tokens: torch.Tensor,   # (B, T_b, d_model) - BEV tokens (already projected)
         vl_tokens: torch.Tensor,    # (B, T_v, d_model) - VL tokens (already projected)
         reasoning_tokens: torch.Tensor,  # (B, T_r, d_model) - reasoning tokens (already projected)
         conditioning: torch.Tensor,  # (B, d_model) - conditioning for AdaLN
-        self_attn_mask: Optional[torch.Tensor] = None,
-        hist_padding_mask: Optional[torch.Tensor] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,  # (T, T) - block diagonal mask for segment isolation
         bev_padding_mask: Optional[torch.Tensor] = None,
         vl_padding_mask: Optional[torch.Tensor] = None,
         reasoning_padding_mask: Optional[torch.Tensor] = None,
@@ -310,13 +305,17 @@ class MultiSourceAttentionBlock(nn.Module):
         
         Attention is computed as:
         1. Self-attention: Q(x) @ K(x)^T with RoPE on both Q and K
-        2. Adapter cross-attention: Q_adapted(x) @ [K(hist), K(bev), K(vl)]^T with RoPE on K only
+           - Uses block diagonal mask to isolate trajectory and route segments
+        2. Adapter cross-attention: Q_adapted(x) @ [K(bev), K(vl)]^T with RoPE on K only
         3. Task cross-attention: Q_adapted(x) @ K(reasoning)^T with RoPE on K only, scaled by gating
         
         All attention scores are concatenated, temperature-scaled, bias-adjusted, and softmaxed together.
+        
+        Note: 
+        - hist_tokens removed - ego_status history is now only used for AdaLN conditioning.
+        - self_attn_mask should be block diagonal to isolate trajectory and route segments
         """
         B, T, C = x.shape
-        T_h = hist_tokens.shape[1]
         T_b = bev_tokens.shape[1]
         T_v = vl_tokens.shape[1]
         T_r = reasoning_tokens.shape[1]
@@ -334,7 +333,6 @@ class MultiSourceAttentionBlock(nn.Module):
         
         # ========== Temperature scaling factors (softplus for positive values) ==========
         temp_self = 1.0 + torch.nn.functional.softplus(self.temp_self)
-        temp_hist = 1.0 + torch.nn.functional.softplus(self.temp_hist)
         temp_bev = 1.0 + torch.nn.functional.softplus(self.temp_bev)
         temp_vl = 1.0 + torch.nn.functional.softplus(self.temp_vl)
         temp_reason = 1.0 + torch.nn.functional.softplus(self.temp_reason)
@@ -343,7 +341,6 @@ class MultiSourceAttentionBlock(nn.Module):
         q_base = self.q_proj(x_norm)  # (B, T, d_model)
         
         # Source-specific Q adaptations (low-rank: d -> d/4 -> d)
-        q_adapt_hist = self.q_adapter_out(torch.tanh(self.q_adapter_hist(x_norm)))
         q_adapt_bev = self.q_adapter_out(torch.tanh(self.q_adapter_bev(x_norm)))
         q_adapt_vl = self.q_adapter_out(torch.tanh(self.q_adapter_vl(x_norm)))
         q_adapt_reason = self.q_adapter_out(torch.tanh(self.q_adapter_reason(x_norm)))
@@ -352,9 +349,7 @@ class MultiSourceAttentionBlock(nn.Module):
         k_self = self.k_self(x_norm)  # (B, T, d_model)
         v_self = self.v_self(x_norm)  # (B, T, d_model)
         
-        # ========== Adapter K, V (hist, bev, vl) ==========
-        k_hist = self.k_hist(hist_tokens)  # (B, T_h, d_model)
-        v_hist = self.v_hist(hist_tokens)
+        # ========== Adapter K, V (bev, vl) ==========
         k_bev = self.k_bev(bev_tokens)      # (B, T_b, d_model)
         v_bev = self.v_bev(bev_tokens)
         k_vl = self.k_vl(vl_tokens)          # (B, T_v, d_model)
@@ -367,15 +362,12 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Reshape to multi-head ==========
         q_base = self._reshape_heads(q_base, B, T)            # (B, nhead, T, head_dim)
         # Create adapted Q for each source by adding adaptation to base Q
-        q_hist = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_hist, B, T)
         q_bev = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_bev, B, T)
         q_vl = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_vl, B, T)
         q_reason = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_reason, B, T)
         
         k_self = self._reshape_heads(k_self, B, T)
         v_self = self._reshape_heads(v_self, B, T)
-        k_hist = self._reshape_heads(k_hist, B, T_h)
-        v_hist = self._reshape_heads(v_hist, B, T_h)
         k_bev = self._reshape_heads(k_bev, B, T_b)
         v_bev = self._reshape_heads(v_bev, B, T_b)
         k_vl = self._reshape_heads(k_vl, B, T_v)
@@ -385,7 +377,6 @@ class MultiSourceAttentionBlock(nn.Module):
         
         # ========== Apply QK Normalization ==========
         q_base, k_self = self._apply_qk_norm(q_base, k_self)
-        q_hist, k_hist = self._apply_qk_norm(q_hist, k_hist)
         q_bev, k_bev = self._apply_qk_norm(q_bev, k_bev)
         q_vl, k_vl = self._apply_qk_norm(q_vl, k_vl)
         q_reason, k_reason = self._apply_qk_norm(q_reason, k_reason)
@@ -399,17 +390,11 @@ class MultiSourceAttentionBlock(nn.Module):
         k_self = apply_rope_single(k_self, cos_main, sin_main)
         
         # Cross-attention Q: apply same RoPE as self-attention
-        q_hist = apply_rope_single(q_hist, cos_main, sin_main)
         q_bev = apply_rope_single(q_bev, cos_main, sin_main)
         q_vl = apply_rope_single(q_vl, cos_main, sin_main)
         q_reason = apply_rope_single(q_reason, cos_main, sin_main)
         
         # Adapter K: only K gets RoPE
-        cos_h, sin_h = self._get_rope_embed(T_h, x.device, x.dtype)
-        cos_h = cos_h.unsqueeze(0).unsqueeze(0)
-        sin_h = sin_h.unsqueeze(0).unsqueeze(0)
-        k_hist = apply_rope_single(k_hist, cos_h, sin_h)
-        
         cos_b, sin_b = self._get_rope_embed(T_b, x.device, x.dtype)
         cos_b = cos_b.unsqueeze(0).unsqueeze(0)
         sin_b = sin_b.unsqueeze(0).unsqueeze(0)
@@ -433,7 +418,6 @@ class MultiSourceAttentionBlock(nn.Module):
         attn_self = torch.matmul(q_base, k_self.transpose(-2, -1)) * temp_self + self.bias_self  # (B, nhead, T, T)
         
         # Adapter cross-attention scores (with source-specific Q, temperature and bias)
-        attn_hist = torch.matmul(q_hist, k_hist.transpose(-2, -1)) * temp_hist + self.bias_hist  # (B, nhead, T, T_h)
         attn_bev = torch.matmul(q_bev, k_bev.transpose(-2, -1)) * temp_bev + self.bias_bev       # (B, nhead, T, T_b)
         attn_vl = torch.matmul(q_vl, k_vl.transpose(-2, -1)) * temp_vl + self.bias_vl           # (B, nhead, T, T_v)
         
@@ -442,42 +426,37 @@ class MultiSourceAttentionBlock(nn.Module):
         
         # ========== Build attention mask ==========
         # Concatenate all attention scores
-        attn_scores = torch.cat([attn_self, attn_hist, attn_bev, attn_vl, attn_reason], dim=-1)
-        attn_scores = attn_scores / scale  # (B, nhead, T, T + T_h + T_b + T_v + T_r)
+        attn_scores = torch.cat([attn_self, attn_bev, attn_vl, attn_reason], dim=-1)
+        attn_scores = attn_scores / scale  # (B, nhead, T, T + T_b + T_v + T_r)
         
         # Apply self-attention mask if provided
         if self_attn_mask is not None:
             # self_attn_mask is for self-attention part only, need to expand
-            # Create full mask: (T, T + T_h + T_b + T_v + T_r)
-            total_kv_len = T + T_h + T_b + T_v + T_r
+            # Create full mask: (T, T + T_b + T_v + T_r)
+            total_kv_len = T + T_b + T_v + T_r
             full_mask = torch.zeros(T, total_kv_len, device=x.device, dtype=x.dtype)
             full_mask[:, :T] = self_attn_mask  # Apply causal mask to self-attention part
             attn_scores = attn_scores + full_mask.unsqueeze(0).unsqueeze(0)
         
         # Apply padding masks
-        if hist_padding_mask is not None:
-            # hist_padding_mask: (B, T_h), True = padding
-            hist_mask = hist_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T_h)
-            attn_scores[:, :, :, T:T+T_h] = attn_scores[:, :, :, T:T+T_h].masked_fill(hist_mask, float('-inf'))
-        
         if bev_padding_mask is not None:
             bev_mask = bev_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores[:, :, :, T+T_h:T+T_h+T_b] = attn_scores[:, :, :, T+T_h:T+T_h+T_b].masked_fill(bev_mask, float('-inf'))
+            attn_scores[:, :, :, T:T+T_b] = attn_scores[:, :, :, T:T+T_b].masked_fill(bev_mask, float('-inf'))
         
         if vl_padding_mask is not None:
             vl_mask = vl_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores[:, :, :, T+T_h+T_b:T+T_h+T_b+T_v] = attn_scores[:, :, :, T+T_h+T_b:T+T_h+T_b+T_v].masked_fill(vl_mask, float('-inf'))
+            attn_scores[:, :, :, T+T_b:T+T_b+T_v] = attn_scores[:, :, :, T+T_b:T+T_b+T_v].masked_fill(vl_mask, float('-inf'))
         
         if reasoning_padding_mask is not None:
             reason_mask = reasoning_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores[:, :, :, T+T_h+T_b+T_v:] = attn_scores[:, :, :, T+T_h+T_b+T_v:].masked_fill(reason_mask, float('-inf'))
+            attn_scores[:, :, :, T+T_b+T_v:] = attn_scores[:, :, :, T+T_b+T_v:].masked_fill(reason_mask, float('-inf'))
         
         # ========== Softmax and weighted sum ==========
         attn_weights = torch.softmax(attn_scores, dim=-1)  # (B, nhead, T, total_kv_len)
         attn_weights = self.dropout(attn_weights)
         
         # Concatenate all values
-        v_combined = torch.cat([v_self, v_hist, v_bev, v_vl, v_reason], dim=2)  # (B, nhead, total_kv_len, head_dim)
+        v_combined = torch.cat([v_self, v_bev, v_vl, v_reason], dim=2)  # (B, nhead, total_kv_len, head_dim)
         
         # Weighted sum
         output = torch.matmul(attn_weights, v_combined)  # (B, nhead, T, head_dim)
@@ -610,18 +589,16 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
     Combines trajectory prediction (horizon points) and route prediction (20 waypoints)
     into a single decoder, using:
     - Segment embeddings to distinguish query types (trajectory vs route)
-    - History status as cross-attention source (contains complete low-dim state info)
     - Multi-source attention with RoPE and gating (MLPResNetBlock_Pro style)
     - Separate output heads for trajectory and route
     
     Query structure: [trajectory (horizon) | route (num_waypoints)]
     Cross-attention sources: All fused in single attention operation with:
         - Self-attention with RoPE on Q and K
-        - Adapter cross-attention (hist, bev, vl) with RoPE on K only
+        - Adapter cross-attention (bev, vl) with RoPE on K only
         - Task cross-attention (reasoning) with RoPE on K only + gating
     
-    Note: No separate State cross-attention since History already contains
-    complete low-dim status (speed, theta, command, target_point, waypoints).
+    Note: hist_status removed - ego_status history is now only used for AdaLN conditioning.
     """
     def __init__(
         self,
@@ -630,29 +607,24 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         num_layers: int = 12,
         dim_feedforward: int = 3072,
         dropout: float = 0.1,
-        status_dim: int = 13,
         bev_dim: int = 512,
         vl_dim: int = 1536,
         reasoning_dim: int = 1536,
         horizon: int = 8,
         num_waypoints: int = 20,
-        n_obs_steps: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_layers = num_layers
         self.horizon = horizon
         self.num_waypoints = num_waypoints
-        self.n_obs_steps = n_obs_steps
         
         # Projection layers for conditions
-        self.hist_proj = nn.Sequential(nn.Linear(status_dim, d_model), nn.LayerNorm(d_model))
         self.bev_proj = nn.Sequential(nn.Linear(bev_dim, d_model), nn.LayerNorm(d_model))
         self.vl_proj = nn.Sequential(nn.Linear(vl_dim, d_model), nn.LayerNorm(d_model))
         self.reasoning_proj = nn.Sequential(nn.Linear(reasoning_dim, d_model), nn.LayerNorm(d_model))
         
         # Position embeddings for cross-attention sources
-        self.hist_pos_emb = nn.Parameter(torch.zeros(1, n_obs_steps, d_model))
         self.bev_pos_emb = nn.Parameter(torch.zeros(1, 256, d_model))
         
         # Route queries (learnable)
@@ -675,7 +647,6 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        nn.init.normal_(self.hist_pos_emb, mean=0.0, std=0.02)
         nn.init.normal_(self.bev_pos_emb, mean=0.0, std=0.02)
         nn.init.normal_(self.route_queries, mean=0.0, std=0.02)
         nn.init.normal_(self.route_pos_emb, mean=0.0, std=0.02)
@@ -685,16 +656,42 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             nn.init.zeros_(layer.adaLN_modulation[-1].weight)
             nn.init.zeros_(layer.adaLN_modulation[-1].bias)
     
+    def _create_block_diagonal_mask(self, T_traj: int, T_route: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Create a block diagonal self-attention mask.
+        
+        This ensures:
+        - Trajectory queries (0:T_traj) can only attend to other trajectory queries
+        - Route queries (T_traj:T_traj+T_route) can only attend to other route queries
+        
+        Args:
+            T_traj: Number of trajectory queries
+            T_route: Number of route queries
+            device: Device for the mask tensor
+            dtype: Data type for the mask tensor
+            
+        Returns:
+            mask: (T_total, T_total) mask where -inf blocks cross-segment attention
+        """
+        T_total = T_traj + T_route
+        # Start with all blocked (will use additive mask, so -inf means blocked)
+        mask = torch.full((T_total, T_total), float('-inf'), device=device, dtype=dtype)
+        
+        # Allow trajectory-to-trajectory attention (upper-left block)
+        mask[:T_traj, :T_traj] = 0.0
+        
+        # Allow route-to-route attention (lower-right block)
+        mask[T_traj:, T_traj:] = 0.0
+        
+        return mask
+    
     def forward(
         self,
         traj_emb: torch.Tensor,  # (B, horizon, d_model) - trajectory query embeddings
-        hist_status: torch.Tensor,  # (B, To, status_dim) - raw history status for cross-attention
         bev_tokens: torch.Tensor,
         vl_tokens: torch.Tensor,
         reasoning_tokens: torch.Tensor,
         conditioning: torch.Tensor,
-        self_attn_mask: Optional[torch.Tensor] = None,
-        hist_padding_mask: Optional[torch.Tensor] = None,
         bev_padding_mask: Optional[torch.Tensor] = None,
         vl_padding_mask: Optional[torch.Tensor] = None,
         reasoning_padding_mask: Optional[torch.Tensor] = None,
@@ -702,9 +699,16 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         """
         Forward pass with unified queries and multi-source attention.
         
+        Uses block diagonal self-attention mask to ensure:
+        - Trajectory queries only attend to other trajectory queries in self-attention
+        - Route queries only attend to other route queries in self-attention
+        - Both can attend to all cross-attention sources (BEV, VL, Reasoning)
+        
+        This design allows trajectory and route to be learned independently
+        while sharing the same cross-attention context.
+        
         Args:
             traj_emb: (B, horizon, d_model) - trajectory query embeddings (noisy traj embedded)
-            hist_status: (B, To, status_dim) - raw history status sequence
             bev_tokens: (B, seq_len, bev_dim) - BEV spatial tokens
             vl_tokens: (B, T_vl, vl_dim) - VL tokens
             reasoning_tokens: (B, T_r, reasoning_dim) - reasoning tokens
@@ -716,7 +720,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         """
         B = traj_emb.shape[0]
         T_traj = traj_emb.shape[1]
-        To = hist_status.shape[1]
+        T_route = self.num_waypoints
         
         # Add segment embedding to trajectory
         traj_emb = traj_emb + self.traj_segment_emb
@@ -727,12 +731,12 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Concatenate queries: [trajectory | route]
         x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
         
-        # Project history status to d_model and add position embedding
-        hist_proj = self.hist_proj(hist_status)  # (B, To, d_model)
-        hist_pos = self.hist_pos_emb[:, :To, :] if To <= self.hist_pos_emb.shape[1] else self.hist_pos_emb
-        hist_proj = hist_proj + hist_pos
+        # Create block diagonal self-attention mask
+        self_attn_mask = self._create_block_diagonal_mask(
+            T_traj, T_route, device=x.device, dtype=x.dtype
+        )
         
-        # Project other conditions
+        # Project conditions
         bev_proj = self.bev_proj(bev_tokens)
         bev_seq_len = bev_proj.shape[1]
         if bev_seq_len <= self.bev_pos_emb.shape[1]:
@@ -745,13 +749,11 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         for layer in self.layers:
             x = layer(
                 x, 
-                hist_proj, 
                 bev_proj, 
                 vl_proj, 
                 reasoning_proj, 
                 conditioning,
                 self_attn_mask, 
-                hist_padding_mask, 
                 bev_padding_mask,
                 vl_padding_mask, 
                 reasoning_padding_mask
@@ -776,15 +778,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
     
     Key features:
     - Unified decoder with heterogeneous queries for trajectory + route
-    - Sequential cross-attention to: History -> BEV -> VL -> Reasoning
-    - History status as cross-attention source (complete 4-frame sequence)
-    - No separate State cross-attention (History contains complete low-dim state)
+    - Cross-attention to: BEV -> VL -> Reasoning
+    - ego_status history used for AdaLN conditioning only (not cross-attention)
     - Segment embeddings to distinguish query types
     - MLP output heads (no GRU)
-    - AdaLN modulation based on timestep + current_ego_status
+    - AdaLN modulation based on timestep + current_ego_status + GRU(history)
     
     Query structure: [trajectory (horizon) | route (20)]
-    Cross-attention sources: History (4 frames) -> BEV -> VL -> Reasoning
+    Cross-attention sources: BEV -> VL -> Reasoning
     
     Loss design:
     - Trajectory loss: for longitudinal control (speed/acceleration)
@@ -842,20 +843,18 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.history_encoder = HistoryEncoder(status_dim, n_emb)  # GRU for global history encoding
         
         # Unified Decoder with heterogeneous queries
-        # History status is cross-attention source (no separate State cross-attention)
+        # hist_status removed - ego_status history is now only used for AdaLN conditioning
         self.decoder = UnifiedDecoderOnlyTransformer(
             d_model=n_emb,
             nhead=n_head,
             num_layers=n_layer,
             dim_feedforward=4 * n_emb,
             dropout=p_drop_attn,
-            status_dim=status_dim,  # For history projection inside decoder
             bev_dim=bev_dim,
             vl_dim=vl_emb_dim,
             reasoning_dim=reasoning_emb_dim,
             horizon=horizon,
             num_waypoints=num_waypoints,
-            n_obs_steps=n_obs_steps,
         )
         
         # Causal mask for trajectory queries (route queries can attend to all)
@@ -943,33 +942,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
                             betas: Tuple[float, float] = (0.9, 0.95)):
         return torch.optim.AdamW(self.get_optim_groups(weight_decay), lr=learning_rate, betas=betas)
     
-    def _create_unified_attn_mask(self, T_traj: int, T_route: int, device: torch.device, dtype: torch.dtype):
-        """
-        Create attention mask for unified queries.
-        
-        Structure: [trajectory (T_traj) | route (T_route)]
-        
-        Mask rules:
-        - Trajectory tokens: causal within trajectory
-        - Route tokens: can attend to everything (no causal constraint)
-        """
-        total_len = T_traj + T_route
-        
-        if not self.causal_attn:
-            return None
-        
-        # Start with full attention allowed
-        mask = torch.zeros(total_len, total_len, device=device, dtype=dtype)
-        
-        # Trajectory: causal within trajectory
-        for i in range(T_traj):
-            mask[i, i+1:T_traj] = float('-inf')  # Can't attend to future trajectory
-        
-        # Route: can attend to everything (no masking)
-        # Already zeros, so nothing to do
-        
-        return mask
-    
     def forward(
         self,
         sample: torch.Tensor,
@@ -1001,11 +973,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
             route_pred: (B, num_waypoints, 2) - for lateral control
             
         History status utilization:
-            1. AdaLN conditioning: current_status (last frame) + GRU-encoded global history
-            2. Cross-attention: complete history sequence as first cross-attention source
+            AdaLN conditioning: current_status (last frame) + GRU-encoded global history
             
-        Note: state_tokens from BEV encoder are NOT used since ego_status
-        already contains complete low-dim state info (speed, theta, command, etc.)
+        Note: hist_status removed from cross-attention - ego_status is now only used for 
+        AdaLN conditioning, not as a cross-attention source.
         """
         model_dtype = next(self.parameters()).dtype
         
@@ -1046,22 +1017,18 @@ class TransformerForDiffusion(ModuleAttrMixin):
         traj_emb = self.drop(traj_emb)
         traj_emb = self.pre_decoder_norm(traj_emb)
         
-        # ========== Create Attention Mask ==========
-        self_attn_mask = self._create_unified_attn_mask(
-            T_traj, self.num_waypoints, sample.device, model_dtype
-        )
-        
         # ========== Padding Masks ==========
         vl_padding_mask = ~vl_mask if vl_mask is not None else (torch.norm(vl_tokens, dim=-1) == 0)
         reasoning_padding_mask = ~reasoning_mask if reasoning_mask is not None else (torch.norm(reasoning_tokens, dim=-1) == 0)
         
         # ========== Unified Decoder ==========
-        # Cross-attention order: History -> BEV -> VL -> Reasoning
+        # Note: Block diagonal self-attention mask is created internally by decoder
+        # This ensures trajectory and route queries only attend to their own segment in self-attention
+        # Cross-attention order: BEV -> VL -> Reasoning (hist removed)
         traj_out, route_out = self.decoder(
             traj_emb,
-            ego_status,  # Complete history for cross-attention (B, T_obs, status_dim)
             bev_tokens, vl_tokens, reasoning_tokens, conditioning,
-            self_attn_mask, None, bev_padding_mask, vl_padding_mask, reasoning_padding_mask
+            bev_padding_mask, vl_padding_mask, reasoning_padding_mask
         )
         
         # ========== Output Heads ==========
@@ -1076,10 +1043,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
 # =============================================================================
 
 def test():
-    """Test the unified decoder-only architecture with history as cross-attention."""
+    """Test the unified decoder-only architecture without history cross-attention."""
     print("=" * 60)
     print("Testing TransformerForDiffusion (Unified Decoder-Only)")
-    print("History as Cross-Attention Source (No State Cross-Attn)")
+    print("No History Cross-Attention - Only BEV, VL, Reasoning")
     print("=" * 60)
     
     transformer = TransformerForDiffusion(
@@ -1094,7 +1061,7 @@ def test():
         causal_attn=True,
         vl_emb_dim=1536,
         reasoning_emb_dim=1536,
-        status_dim=13,
+        status_dim=14,  # Updated: speed(1) + theta(1) + command(6) + target_point(2) + target_point_next(2) + waypoints(2)
         bev_dim=512,
         num_waypoints=20,
     )
@@ -1108,7 +1075,7 @@ def test():
     bev_tokens = torch.randn((B, 197, 512))
     vl_tokens = torch.randn((B, 36, 1536))
     reasoning_tokens = torch.randn((B, 10, 1536))
-    ego_status = torch.randn((B, 4, 13))  # 4 frames of history
+    ego_status = torch.randn((B, 4, 14))  # 4 frames of history with updated dim
     
     print("\nTest 1: Basic forward pass")
     trajectory, route_pred = transformer(
@@ -1132,15 +1099,15 @@ def test():
     print(f"  Difference: {diff:.6f}")
     assert diff > 0, "BEV should affect output"
     
-    print("\nTest 3: Different history affects output")
-    ego_status2 = torch.randn((B, 4, 13))
+    print("\nTest 3: Different ego_status affects conditioning")
+    ego_status2 = torch.randn((B, 4, 14))
     traj3, _ = transformer(sample=sample, timestep=timestep, cond=cond,
                           bev_tokens=bev_tokens,
                           gen_vit_tokens=vl_tokens, reasoning_query_tokens=reasoning_tokens,
                           ego_status=ego_status2)
     diff_hist = torch.abs(trajectory - traj3).mean()
     print(f"  Difference: {diff_hist:.6f}")
-    assert diff_hist > 0, "History should affect output"
+    assert diff_hist > 0, "Ego status should affect conditioning"
     
     print("\nTest 4: Optimizer")
     opt = transformer.configure_optimizers()
@@ -1151,9 +1118,14 @@ def test():
     print("=" * 60)
     print("\nArchitecture summary:")
     print("  - Queries: [trajectory (8) | route (20)]")
-    print("  - Cross-attention order: History(4) -> BEV(197) -> VL -> Reasoning")
+    print("  - Self-attention: Block diagonal (trajectory & route isolated)")
+    print("  - Cross-attention sources: BEV(197) -> VL -> Reasoning")
     print("  - AdaLN conditioning: timestep + current_status + GRU(history)")
-    print("  - No State cross-attention (History contains complete low-dim state)")
+    print("  - ego_status used only for conditioning, not cross-attention")
+    print("\nBlock Diagonal Self-Attention:")
+    print("  - Trajectory queries only attend to other trajectory queries")
+    print("  - Route queries only attend to other route queries")
+    print("  - Both share same cross-attention context (BEV, VL, Reasoning)")
     print("\nControl design:")
     print("  - Trajectory output: longitudinal control (speed/acceleration)")
     print("  - Route output: lateral control (steering direction)")

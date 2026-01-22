@@ -9,7 +9,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # Default values
 NUM_GPUS=${1:-8}  # Default to 8 GPUs (GPU 0-7)
-CONFIG_PATH=${2:-"/root/z_projects/code/MoT-DP-1/config/pdm_server.yaml"}
+CONFIG_PATH=${2:-"/root/z_projects/MoT-DP/config/pdm_server2.yaml"}
 
 # Set environment variables for better performance
 export OMP_NUM_THREADS=8

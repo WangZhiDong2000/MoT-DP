@@ -92,11 +92,13 @@ class LateralPIDController(object):
         # used at leaderboard
         current_speed = current_speed*3.6
         if self.inference_mode:  # Transfuser predicts checkpoints 1m apart, whereas in the expert the route points have distance 10cm.
-            n_lookahead = np.clip(self.speed_scale * current_speed + self.speed_offset, 24, 105) / 10 # range [2.4, 10.5]
+            n_lookahead = np.clip(self.speed_scale * current_speed + self.speed_offset, self.default_lookahead, 105) / 10 # range [2.4, 10.5]
             n_lookahead = n_lookahead - 2
             n_lookahead = int(min(n_lookahead, route_np.shape[0] - 1))  # range [2, 9] - but 0 and 1 are never used because n_lookahead is overwritten below
         else:
-            n_lookahead = int(min(np.clip(self.speed_scale * current_speed + self.speed_offset, 24, 105), route_np.shape[0] - 1))
+            # 使用 default_lookahead 作为最小前视距离（单位：0.1m间隔的点数）
+            # default_lookahead=40 意味着最小看4m处的点
+            n_lookahead = int(min(np.clip(self.speed_scale * current_speed + self.speed_offset, self.default_lookahead, 105), route_np.shape[0] - 1))
 
         n_lookahead = min(n_lookahead, len(route_np)-1)
         desired_heading_vec = route_np[n_lookahead]

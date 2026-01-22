@@ -56,7 +56,7 @@ shape_meta:
 enable_action_normalization: true
 bev_encoder:
   pretrained_path: /home/wang/Project/MoT-DP/checkpoints/interfuser/lidar_bev_encoder_only.pth
-  state_dim: 12
+  state_dim: 14
   feature_dim: 256
   use_group_norm: true
   freeze_backbone: false

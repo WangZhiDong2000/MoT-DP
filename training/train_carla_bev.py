@@ -697,7 +697,7 @@ def train_pdm_policy(config_path):
                             'val_loss': val_loss,
                             'train_loss': avg_train_loss,
                             'val_metrics': val_metrics
-                            }, os.path.join(checkpoint_dir, "policy_best.pt"))
+                            }, os.path.join(checkpoint_dir, "dit_policy_best.pt"))
                     print(f"✓ New best model saved with L2_avg: {l2_avg:.4f} (val_loss: {val_loss:.4f})")
                    
                     safe_wandb_log({
@@ -726,7 +726,7 @@ def train_pdm_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
-    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/pdm_local.yaml", 
+    parser.add_argument('--config_path', type=str, default="/root/z_projects/MoT-DP/config/pdm_server2.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_pdm_policy(config_path=args.config_path)

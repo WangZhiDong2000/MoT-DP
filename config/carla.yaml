@@ -66,7 +66,7 @@ enable_action_normalization: true
 # BEV Encoder configuration
 bev_encoder:
   pretrained_path: '/home/wang/Project/MoT-DP/model/interfuser/lidar_bev_encoder_only.pth'
-  state_dim: 9           # speed(1) + target_point(2) + command(6)
+  state_dim: 14          # speed(1) + theta(1) + command(6) + target_point(2) + target_point_next(2) + waypoints(2)
   feature_dim: 256
   use_group_norm: true
   freeze_backbone: false

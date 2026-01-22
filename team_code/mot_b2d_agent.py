@@ -20,10 +20,6 @@ import numpy as np
 from filterpy.kalman import MerweScaledSigmaPoints
 from filterpy.kalman import UnscentedKalmanFilter as UKF
 
-# lsof -ti:2002 | xargs kill -9 2>/dev/null
-# pkill -9 -f CarlaUE4
-# pkill -9 -f "leaderboard_evaluator\|CarlaUE4"
-# 
 project_root = str(pathlib.Path(__file__).parent.parent.parent)
 leaderboard_root = str(os.path.join(project_root, 'leaderboard'))
 scenario_runner_root = str(os.path.join(project_root, 'scenario_runner'))
@@ -74,6 +70,19 @@ from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from mot.evaluation.inference import InterleaveInferencer
 from transformers import AutoTokenizer
 
+# Import utility modules
+from team_code.mot_utils import (
+    ModelArguments, InferenceArguments,
+    load_model_mot, build_cleaned_prompt_and_modes,
+    parse_decision_sequence, split_prompt
+)
+from team_code.lidar_utils import lidar_to_ego_coordinate, algin_lidar
+from team_code.ukf_utils import (
+    bicycle_model_forward, measurement_function_hx,
+    state_mean, measurement_mean,
+    residual_state_x, residual_measurement_h
+)
+
 try:
     import pygame
 except ImportError:
@@ -85,11 +94,12 @@ PLANNER_TYPE = os.environ.get('PLANNER_TYPE', None)
 EARTH_RADIUS_EQUA = 6378137.0
 USE_UKF = True  # Enable Unscented Kalman Filter for GPS/compass smoothing
 
-# dp utils
+# Entry point
 def get_entry_point():
 	return 'MOTAgent'
 
 def create_carla_config(config_path=None):
+    """Load CARLA configuration from YAML file."""
     if config_path is None:
         config_path = "/home/wang/Project/MoT-DP/config/pdm_local.yaml"
     with open(config_path, 'r') as f:
@@ -97,6 +107,7 @@ def create_carla_config(config_path=None):
     return config
 
 def load_best_model(checkpoint_path, config, device):
+    """Load the DP (Diffusion Policy) best model checkpoint."""
     print(f"Loading best model from: {checkpoint_path}")
     if not hasattr(np, '_core'):
         sys.modules['numpy._core'] = np.core
@@ -138,7 +149,7 @@ def load_best_model(checkpoint_path, config, device):
 
     return policy
 
-# display purpose only
+# Display interface for visualization
 class DisplayInterface(object):
     def __init__(self):
         self._width = 1200
@@ -152,7 +163,7 @@ class DisplayInterface(object):
             (self._width, self._height), pygame.HWSURFACE | pygame.DOUBLEBUF
         )
 
-        pygame.display.set_caption("MoT Agent")
+        pygame.display.set_caption("CORL Agent")
 
     def run_interface(self, input_data):
         rgb = input_data['rgb']
@@ -207,549 +218,6 @@ class DisplayInterface(object):
     def _quit(self):
         pygame.quit()
 
-# mot utils
-@dataclass
-class ModelArguments:
-    model_path: str = field(
-        default="/home/wang/Project/MoT-DP/checkpoints/mot",
-        metadata={"help": "Path to the converted AutoMoT model checkpoint"}
-    )
-    qwen3vl_path: str = field(
-        default="/home/wang/Project/MoT-DP/config/mot_config",
-        metadata={"help": "Path to the Qwen3VL base model for config loading"}
-    )
-    max_latent_size: int = field(
-        default=64,
-        metadata={"help": "Maximum size of latent representations"}
-    )
-    latent_patch_size: int = field(
-        default=2,
-        metadata={"help": "Patch size for latent space processing"}
-    )
-    vit_max_num_patch_per_side: int = field(
-        default=70,
-        metadata={"help": "Maximum number of patches per side for vision transformer"}
-    )
-    connector_act: str = field(
-        default="gelu_pytorch_tanh",
-        metadata={"help": "Activation function for connector layers"}
-    )
-    mot_num_attention_heads: int = field(
-        default=16,
-        metadata={"help": "Number of attention heads for MoT attention components. Defaults to half of regular attention heads if not specified."}
-    )
-    mot_num_key_value_heads: int = field(
-        default=4,
-        metadata={"help": "Number of key-value heads for MoT attention components. Defaults to half of regular KV heads if not specified."}
-    )
-    mot_intermediate_size: int = field(
-        default=4864,
-        metadata={"help": "Intermediate size for MoT MLP components. Defaults to same as regular intermediate_size if not specified."}
-    )
-    reasoning_query_dim: int = field(
-        default=588,
-        metadata={"help": "Dimension of the reasoning query embedding."}
-    )
-    reasoning_query_max_num_tokens: int = field(
-        default=8, #256, #64,
-        metadata={"help": "Maximum number of tokens in the reasoning query."}
-    )
-    action_query_dim: int = field(
-        default=588,
-        metadata={"help": "Dimension of the action query embedding."}
-    )
-    action_query_tokens: int = field(
-        default=1,
-        metadata={"help": "Number of tokens in the action query."}
-    )
-
-@dataclass
-class InferenceArguments:
-    dataset_jsonl: str = field(
-        default="b2d_data_val.jsonl",
-        metadata={"help": "Path to the input dataset JSONL file"}
-    )
-    output_jsonl: str = field(
-        default="",
-        metadata={"help": "Path to the output JSONL file. If empty, will use input filename with .pred.jsonl suffix"}
-    )
-    base_path: str = field(
-        default="/share-data/pdm_lite",
-        metadata={"help": "Base path for resolving relative image paths. If empty, use current working directory"}
-    )
-    visual_gen: bool = field(
-        default=True,
-        metadata={"help": "Enable visual generation capabilities"}
-    )
-    visual_und: bool = field(
-        default=True,
-        metadata={"help": "Enable visual understanding capabilities"}
-    )
-    max_num_tokens: int = field(
-        default=16384,
-        metadata={"help": "Maximum number of tokens for inference"}
-    )
-    start_idx: int = field(
-        default=0,
-        metadata={"help": "Starting index for processing dataset samples"}
-    )
-    max_samples: int = field(
-        default=-1,
-        metadata={"help": "Maximum number of samples to process. -1 means process all samples"}
-    )
-
-def load_safetensors_weights(model_path):
-    """Load weights from single or multiple safetensors files."""
-    # Try single file first (like AutoMoT 2B)
-    single_file = os.path.join(model_path, "model.safetensors")
-    if os.path.exists(single_file):
-        print(f"Loading from single file: {single_file}")
-        return load_file(single_file)
-    
-    # Try multiple files (like Qwen3VL-4B)
-    pattern = os.path.join(model_path, "model-*.safetensors")
-    safetensor_files = sorted(glob.glob(pattern))
-    
-    if not safetensor_files:
-        raise FileNotFoundError(f"No safetensors files found in {model_path}")
-    
-    print(f"Loading from multiple files: {safetensor_files}")
-    combined_state_dict = {}
-    
-    for file_path in safetensor_files:
-        file_state_dict = load_file(file_path)
-        combined_state_dict.update(file_state_dict)
-        print(f"Loaded {len(file_state_dict)} parameters from {os.path.basename(file_path)}")
-    
-    print(f"Total loaded parameters: {len(combined_state_dict)}")
-    return combined_state_dict
-
-def convert_model_dtype_with_exceptions(model, target_dtype, exclude_buffer_patterns=None):
-    """Convert model parameters to target dtype, with memory-efficient approach."""
-    if exclude_buffer_patterns is None:
-        exclude_buffer_patterns = []
-    
-    # Convert parameters in chunks to avoid memory spikes
-    for name, param in model.named_parameters():
-        if param.device.type == 'cuda':
-            # For CUDA tensors, convert in-place to avoid extra memory allocation
-            param.data = param.data.to(target_dtype)
-        else:
-            # For CPU tensors, convert and then move to avoid duplicating on GPU
-            param.data = param.data.to(target_dtype)
-
-    for name, buffer in model.named_buffers():
-        should_exclude = any(pattern in name for pattern in exclude_buffer_patterns)
-        
-        if should_exclude:
-            pass  # Keep original dtype
-        else:
-            if buffer.device.type == 'cuda':
-                buffer.data = buffer.data.to(target_dtype)
-            else:
-                buffer.data = buffer.data.to(target_dtype)
-    
-    return model
-
-def load_model_mot(device):
-    parser = HfArgumentParser((ModelArguments, InferenceArguments))
-    model_args, inference_args = parser.parse_args_into_dataclasses(args=[])
-
-    assert torch.cuda.is_available(), "CUDA is required"
-    seed = 42
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    # Load configs from Qwen3VL model
-    qwen3vl_config_path = model_args.qwen3vl_path
-    
-    # Load the unified config and extract text_config and vision_config
-    with open(f"{qwen3vl_config_path}/config.json", "r") as f:
-        full_config = json.load(f)
-    
-    # Extract and create LLM config using Qwen3VL LLM with mRoPE support
-    text_config_dict = full_config["text_config"]
-    llm_config = Qwen3VLTextConfig(**text_config_dict)
-    llm_config.qk_norm = True
-    llm_config.tie_word_embeddings = True #False
-    llm_config.layer_module = "Qwen3VLMoTDecoderLayer"  # Disable MoT for debugging
-    # llm_config.layer_module = "Qwen3VLMoTDecoderLayer"  
-    llm_config.mot_num_attention_heads = model_args.mot_num_attention_heads
-    llm_config.mot_num_key_value_heads = model_args.mot_num_key_value_heads
-    llm_config.mot_intermediate_size = model_args.mot_intermediate_size
-
-    # Extract and create Vision config
-    vision_config_dict = full_config["vision_config"]
-    vit_config = Qwen3VLVisionConfig(**vision_config_dict)
-
-    config = AutoMoTConfig(
-        visual_gen=inference_args.visual_gen,
-        visual_und=inference_args.visual_und,
-        llm_config=llm_config,
-        vision_config=vit_config,  # Changed from vit_config to vision_config
-        latent_patch_size=model_args.latent_patch_size,
-        max_latent_size=model_args.max_latent_size,
-        connector_act=model_args.connector_act,
-        interpolate_pos=False,
-        reasoning_query_dim=model_args.reasoning_query_dim,
-        reasoning_query_tokens=model_args.reasoning_query_max_num_tokens,
-        action_query_dim=model_args.action_query_dim,
-        action_query_tokens=model_args.action_query_tokens,
-    )
-
-    # Initialize model on CPU first to save GPU memory during loading
-    print("Initializing model on CPU...")
-    language_model = Qwen3VLForConditionalGenerationMoT(llm_config)
-    vit_model = Qwen3VLVisionModel(vit_config)
-    model = AutoMoT(language_model, vit_model, config)
-
-    # Load converted AutoMoT checkpoint manually (accelerate has weight issues)
-    print(f"Loading converted AutoMoT checkpoint from {model_args.model_path}...")
-    
-    state_dict = load_safetensors_weights(model_args.model_path)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    
-    # Filter out lm_head.weight from missing keys if tie_word_embeddings=True
-    actual_missing_keys = [k for k in missing_keys if k != 'language_model.lm_head.weight']
-    print(f"Loaded weights: {len(actual_missing_keys)} missing, {len(unexpected_keys)} unexpected")
-    
-    if actual_missing_keys:
-        print(f"Missing keys: {actual_missing_keys[:10]}")
-    if unexpected_keys:
-        print(f"Unexpected keys: {unexpected_keys[:5]}")
-    
-    # Free state_dict memory immediately
-    del state_dict
-    import gc
-    gc.collect()
-    
-    # Convert to bfloat16 on CPU first (saves GPU memory during transfer)
-    print("Converting model to bfloat16 on CPU...")
-    model = convert_model_dtype_with_exceptions(
-        model,
-        torch.bfloat16,
-        exclude_buffer_patterns=['inv_freq']
-    )
-    
-    # Clear any cached memory before moving to GPU
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Now move to GPU (already in bfloat16, so less memory needed)
-    print("Moving model to GPU...")
-    model = model.to("cuda:0").eval()
-    
-    # Verify tie_word_embeddings is working correctly
-    embed_weight = model.language_model.model.embed_tokens.weight
-    lm_head_weight = model.language_model.lm_head.weight
-    weights_tied = embed_weight is lm_head_weight
-    weights_equal = torch.equal(embed_weight, lm_head_weight)
-    embed_norm = torch.norm(embed_weight).item()
-    
-    if not weights_tied or not weights_equal:
-        print("WARNING: tie_word_embeddings may not be working correctly!")
-    elif embed_norm < 10:
-        print("WARNING: embed_tokens weights appear to be randomly initialized!")
-    else:
-        print("✓ tie_word_embeddings is working correctly")
-    
-    # Final cleanup
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    print("Model loaded successfully")
-
-
-    return model
-
-def attach_debugger():
-    import debugpy
-    debugpy.listen(5683)
-    print("Waiting for debugger!")
-    debugpy.wait_for_client()
-    print("Attached!")
-
-
-def select_dp_target_point(target_point, next_target_point, 
-                           lateral_threshold_turn=3.0, 
-                           lateral_threshold_straight=1.0,
-                           angle_threshold_turn=30.0,      # degrees
-                           angle_threshold_straight=10.0): # degrees
-    """
-    Select the appropriate target point for DP model input based on path geometry.
-    
-    The decision is based on multiple factors:
-    1. Ego-to-TP alignment: How aligned is the ego vehicle's forward direction with target_point?
-       - Large lateral offset of TP from ego's forward axis means ego needs to turn first
-       - Example: On-ramp merging - ego is still on ramp, needs to turn into main road
-    
-    2. TP-to-NTP alignment: How aligned is the path from target_point to next_target_point?
-       - Large angle change indicates intersection turn or sharp curve
-       - Example: T-junction - need to turn at the intersection
-    
-    3. Navigation jitter detection: If TP and NTP have opposite lateral offsets (one left, one right),
-       this may indicate the planner incorrectly routed to another lane and back.
-       - Example: Straight road but TP is right of ego, NTP is left of TP
-       - In this case, use NTP as it better represents the actual straight path
-    
-    Decision logic:
-    - If navigation jitter detected (opposite lateral directions): use NTP
-    - If ego needs significant turning to reach TP (large ego-to-TP lateral offset): use TP
-    - If path turns sharply from TP to NTP (large angle change): use TP  
-    - If both segments are relatively straight: use NTP for better horizon
-    - Intermediate cases: use weighted interpolation
-    
-    Args:
-        target_point: numpy array (2,) in ego frame [x_forward, y_left], closer waypoint
-        next_target_point: numpy array (2,) in ego frame [x_forward, y_left], farther waypoint
-        lateral_threshold_turn: float, lateral deviation threshold for turn detection (meters)
-        lateral_threshold_straight: float, lateral deviation threshold for straight detection (meters)
-        angle_threshold_turn: float, angle change threshold for turn detection (degrees)
-        angle_threshold_straight: float, angle change threshold for straight detection (degrees)
-    
-    Returns:
-        selected_target_point: numpy array (2,) the selected target point for DP
-        selection_type: str, one of 'straight', 'turn', 'curve', 'ramp', 'nav_jitter' for debugging
-    """
-    # Convert to numpy if needed
-    if isinstance(target_point, torch.Tensor):
-        target_point = target_point.detach().cpu().numpy().squeeze()
-    if isinstance(next_target_point, torch.Tensor):
-        next_target_point = next_target_point.detach().cpu().numpy().squeeze()
-    
-    # Ego is at origin (0, 0), facing forward along x-axis (ego frame convention)
-    ego = np.array([0.0, 0.0])
-    ego_forward = np.array([1.0, 0.0])  # Ego's forward direction in ego frame
-    
-    # ==================== Factor 0: Navigation Jitter Detection ====================
-    # Check if TP and the vector from TP to NTP have opposite lateral directions
-    # This indicates the planner may have incorrectly routed to another lane and back
-    # 
-    # Example: Straight road, but planner puts TP in right lane, NTP back in ego's lane
-    #   - target_point[1] < 0 (TP is to the right of ego)
-    #   - (next_target_point[1] - target_point[1]) > 0 (NTP is to the left of TP)
-    #   - This is navigation jitter, should use NTP
-    
-    tp_lateral = target_point[1]  # Signed lateral offset of TP (positive = left, negative = right)
-    tp_to_ntp_lateral = next_target_point[1] - target_point[1]  # Signed lateral change from TP to NTP
-    
-    # Check for opposite directions (one positive, one negative) and both significant
-    lateral_jitter_threshold = 0.5  # Minimum lateral offset to consider as jitter (meters)
-    
-    is_navigation_jitter = (
-        # TP and TP->NTP have opposite lateral directions
-        (tp_lateral * tp_to_ntp_lateral < 0) and
-        # Both offsets are significant (not just noise)
-        (abs(tp_lateral) > lateral_jitter_threshold) and
-        (abs(tp_to_ntp_lateral) > lateral_jitter_threshold) and
-        # NTP is closer to ego's forward axis than TP (the path is "correcting" back)
-        (abs(next_target_point[1]) < abs(target_point[1]))
-    )
-    
-    if is_navigation_jitter:
-        # Navigation jitter detected - the path goes away and comes back
-        # Use next_target_point as it represents the actual intended path
-        return next_target_point.copy(), 'nav_jitter'
-    
-    # ==================== Factor 1: Ego-to-TP alignment ====================
-    # Check how much the ego needs to turn to face target_point
-    v_ego_to_tp = target_point - ego
-    tp_dist = np.linalg.norm(v_ego_to_tp)
-    
-    if tp_dist < 1e-6:
-        # target_point is at ego position, use next_target_point
-        return next_target_point.copy(), 'straight'
-    
-    # Lateral offset of target_point from ego's forward axis
-    # In ego frame: x is forward, y is left
-    # So the lateral offset is simply the y-component of target_point
-    ego_to_tp_lateral = abs(target_point[1])  # Absolute lateral offset
-    
-    # Angle between ego forward and direction to target_point
-    v_ego_to_tp_unit = v_ego_to_tp / tp_dist
-    cos_angle_ego_tp = np.clip(np.dot(ego_forward, v_ego_to_tp_unit), -1.0, 1.0)
-    angle_ego_to_tp = np.rad2deg(np.arccos(cos_angle_ego_tp))  # degrees
-    
-    # ==================== Factor 2: TP-to-NTP alignment ====================
-    # Check the angle change from ego->TP direction to TP->NTP direction
-    v_tp_to_ntp = next_target_point - target_point
-    ntp_dist = np.linalg.norm(v_tp_to_ntp)
-    
-    if ntp_dist < 1e-6:
-        # next_target_point is same as target_point
-        return target_point.copy(), 'straight'
-    
-    v_tp_to_ntp_unit = v_tp_to_ntp / ntp_dist
-    
-    # Angle between (ego->TP) and (TP->NTP) directions
-    cos_angle_turn = np.clip(np.dot(v_ego_to_tp_unit, v_tp_to_ntp_unit), -1.0, 1.0)
-    angle_tp_to_ntp = np.rad2deg(np.arccos(cos_angle_turn))  # degrees
-    
-    # Also compute lateral deviation of NTP from the ego->TP line (original method)
-    longitudinal = np.dot(next_target_point - ego, v_ego_to_tp_unit)
-    lateral_vec = (next_target_point - ego) - longitudinal * v_ego_to_tp_unit
-    lateral_deviation_ntp = np.linalg.norm(lateral_vec)
-    
-    # ==================== Decision Logic ====================
-    # Score: higher means more likely to need target_point (closer point)
-    # We consider both factors and take the more conservative choice
-    
-    # Factor 1 score: ego alignment with target_point
-    # If ego needs to turn a lot to reach TP, we should use TP (not skip to NTP)
-    if ego_to_tp_lateral > lateral_threshold_turn or angle_ego_to_tp > angle_threshold_turn:
-        ego_alignment_score = 1.0  # Need to turn significantly, use TP
-        ego_alignment_type = 'ramp'  # Like on-ramp scenario
-    elif ego_to_tp_lateral < lateral_threshold_straight and angle_ego_to_tp < angle_threshold_straight:
-        ego_alignment_score = 0.0  # Well aligned, can use NTP
-        ego_alignment_type = 'aligned'
-    else:
-        # Interpolate based on the worse of lateral offset or angle
-        lat_ratio = (ego_to_tp_lateral - lateral_threshold_straight) / (lateral_threshold_turn - lateral_threshold_straight)
-        ang_ratio = (angle_ego_to_tp - angle_threshold_straight) / (angle_threshold_turn - angle_threshold_straight)
-        ego_alignment_score = np.clip(max(lat_ratio, ang_ratio), 0.0, 1.0)
-        ego_alignment_type = 'partial_ramp'
-    
-    # Factor 2 score: path curvature from TP to NTP
-    if lateral_deviation_ntp > lateral_threshold_turn or angle_tp_to_ntp > angle_threshold_turn:
-        path_curvature_score = 1.0  # Sharp turn ahead, use TP
-        path_curvature_type = 'turn'
-    elif lateral_deviation_ntp < lateral_threshold_straight and angle_tp_to_ntp < angle_threshold_straight:
-        path_curvature_score = 0.0  # Straight path, can use NTP
-        path_curvature_type = 'straight'
-    else:
-        # Interpolate
-        lat_ratio = (lateral_deviation_ntp - lateral_threshold_straight) / (lateral_threshold_turn - lateral_threshold_straight)
-        ang_ratio = (angle_tp_to_ntp - angle_threshold_straight) / (angle_threshold_turn - angle_threshold_straight)
-        path_curvature_score = np.clip(max(lat_ratio, ang_ratio), 0.0, 1.0)
-        path_curvature_type = 'curve'
-    
-    # Final decision: take the more conservative (higher score = use TP)
-    final_score = max(ego_alignment_score, path_curvature_score)
-    
-    # Determine selection type for debugging
-    if ego_alignment_score >= path_curvature_score:
-        primary_reason = ego_alignment_type
-    else:
-        primary_reason = path_curvature_type
-    
-    # Select point based on final score
-    if final_score < 0.1:
-        # Very straight, use next_target_point
-        selected_point = next_target_point.copy()
-        selection_type = 'straight'
-    elif final_score > 0.9:
-        # Need to turn or not aligned, use target_point
-        selected_point = target_point.copy()
-        selection_type = primary_reason
-    else:
-        # Interpolate: alpha=1 means use NTP, alpha=0 means use TP
-        alpha = 1.0 - final_score
-        selected_point = alpha * next_target_point + (1 - alpha) * target_point
-        selection_type = f'blend_{primary_reason}'
-    
-    return selected_point, selection_type
-
-
-def build_cleaned_prompt_and_modes(target_point_speed):
-
-    if isinstance(target_point_speed, torch.Tensor):
-        tp = target_point_speed.detach().cpu().view(-1)
-        speed, x, y = float(tp[0].item()), float(tp[1].item()), float(tp[2].item())
-    elif isinstance(target_point_speed, np.ndarray):
-        tp = target_point_speed.reshape(-1)
-        speed, x, y = float(tp[0]), float(tp[1]), float(tp[2])
-    elif isinstance(target_point_speed, (list, tuple)):
-        assert len(target_point_speed) >= 3
-        speed, x, y = float(target_point_speed[0]), float(target_point_speed[1]), float(target_point_speed[2])
-    else:
-        raise TypeError(f"Unsupported type for target_point: {type(target_point_speed)}")
-
-    x_str = f"{x:.6f}"
-    y_str = f"{y:.6f}"
-    prompt = f"Your target point is ({x_str}, {y_str}), and your current velocity is {speed:.2f} m/s. Predict the driving actions ( now, +1s, +2s) and plan the trajectory for the next 3 seconds."
-
-    understanding_output = False
-    reasoning_output = True
-
-    return prompt, understanding_output, reasoning_output
-
-def parse_decision_sequence(decision_str):
-    """
-    Parse decision sequence from model output.
-    
-    Args:
-        decision_str: String like '<|im_start|> stop, accelerate, stop<|im_end|>'
-                      or 'stop, accelerate, stop'
-    
-    Returns:
-        tuple: (decision_now, decision_1s, decision_2s) - three decisions as strings
-               Returns (None, None, None) if parsing fails
-    
-    Example:
-        >>> parse_decision_sequence('<|im_start|> stop, accelerate, stop<|im_end|>')
-        ('stop', 'accelerate', 'stop')
-    """
-    if not decision_str or not isinstance(decision_str, str):
-        return (None, None, None)
-    
-    # Remove special tokens
-    cleaned = decision_str.replace('<|im_start|>', '').replace('<|im_end|>', '')
-    # Strip whitespace
-    cleaned = cleaned.strip()
-    
-    # Split by comma
-    parts = [p.strip() for p in cleaned.split(',')]
-    
-    # Ensure we have exactly 3 decisions
-    if len(parts) >= 3:
-        return (parts[0], parts[1], parts[2])
-    elif len(parts) == 2:
-        return (parts[0], parts[1], None)
-    elif len(parts) == 1:
-        return (parts[0], None, None)
-    else:
-        return (None, None, None)
-
-def split_prompt(prompt_cleaned):
-    """
-    Split the prompt into two sentences.
-    
-    Args:
-        prompt_cleaned: String like 'Your target point is (53.101654, 0.201010), and your current velocity is 0.00 m/s. Predict the driving actions ( now, +1s, +2s) and plan the trajectory for the next 3 seconds.'
-    
-    Returns:
-        tuple: (sentence1, sentence2)
-    
-    Example:
-        >>> split_prompt('Your target point is (...). Predict the driving actions...')
-        ('Your target point is (...).', 'Predict the driving actions...')
-    """
-    if not prompt_cleaned or not isinstance(prompt_cleaned, str):
-        return (None, None)
-    
-    # Find the first period followed by space (end of first sentence)
-    # Pattern: "...m/s. Predict..."
-    split_marker = "m/s. "
-    if split_marker in prompt_cleaned:
-        idx = prompt_cleaned.find(split_marker)
-        sentence1 = prompt_cleaned[:idx + 4]  # Include "m/s."
-        sentence2 = prompt_cleaned[idx + 5:]  # Skip "m/s. "
-        return (sentence1.strip(), sentence2.strip())
-    
-    # Fallback: split by ". " if marker not found
-    if ". " in prompt_cleaned:
-        idx = prompt_cleaned.find(". ")
-        sentence1 = prompt_cleaned[:idx + 1]
-        sentence2 = prompt_cleaned[idx + 2:]
-        return (sentence1.strip(), sentence2.strip())
-    
-    return (prompt_cleaned, None)
-
 class MOTAgent(autonomous_agent.AutonomousAgent):
 	def setup(self, path_to_conf_file):
 		self.track = autonomous_agent.Track.SENSORS
@@ -771,7 +239,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
-		checkpoint_path = os.path.join(checkpoint_base_path, "carla_policy_best.pt")
+		checkpoint_path = os.path.join(checkpoint_base_path, "policy_best.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
 		self.net = self.net.to(torch.bfloat16)
 		if hasattr(self.net, 'obs_encoder'):
@@ -918,6 +386,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.last_pred_traj = None  # Store the last predicted trajectory (in ego frame)
 		self.last_dp_pred_traj = None  # Store the last DP refined trajectory (in ego frame)
 		self.last_target_point = None  # Store the last target point (in ego frame)
+		self.last_next_target_point = None  # Store the last next target point (in ego frame)
 		self.last_route_pred = None  # Store the last route prediction (20 waypoints for lateral control)
 
 	def _init(self):
@@ -964,7 +433,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				self.lat_ref, self.lon_ref = 0.0, 0.0
 		
 
-		self.route_planner_min_distance = 7.5 # 7.5
+		self.route_planner_min_distance = 7.5
 		self.route_planner_max_distance = 50.0
 		self._route_planner = RoutePlanner(self.route_planner_min_distance, self.route_planner_max_distance,
 										   self.lat_ref, self.lon_ref)
@@ -993,12 +462,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		Build observation dictionaries from historical data.
 		
 		Args:
-			target_point: Used for MOT model history (kept for compatibility)
-			next_target_point: Used for DP model input in ego_status_stacked
+			target_point: Current target point in ego frame
+			next_target_point: Next target point in ego frame (used together with target_point for DP model)
 		
 		Returns:
 			lidar_stacked: (1, obs_horizon, C, H, W) stacked lidar BEV images
-			ego_status_stacked: (1, obs_horizon, 14) concatenated ego status features (uses next_target_point)
+			ego_status_stacked: (1, obs_horizon, 14) concatenated ego status features
+			                    Order: speed(1) + theta(1) + cmd(6) + target_point(2) + next_target_point(2) + waypoint_relative(2)
 			rgb_stacked: (1, 5, C, H, W) stacked RGB images
 		"""
 		# Build obs_dict from historical observations
@@ -1042,8 +512,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		lidar_stacked = torch.stack(lidar_list, dim=0).unsqueeze(0)  # (1, obs_horizon, C, H, W)
 		speed_stacked = torch.cat(speed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
 		theta_stacked = torch.cat(theta_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
-		throttle_stacked = torch.cat(throttle_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
-		brake_stacked = torch.cat(brake_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 1)
 		cmd_stacked = torch.cat(cmd_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 6)
 		target_point_stacked = torch.cat(target_point_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		waypoint_stacked = torch.stack(waypoint_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
@@ -1074,12 +542,37 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		
 		waypoint_relative_stacked = torch.stack(waypoint_relative_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
-		# Use next_target_point for DP model input (transformed to current ego frame)
+		# Transform target_point history to current ego frame (same logic as next_target_point)
+		target_point_transformed_list = []
+		for i in range(self.obs_horizon):
+			past_world_pos = waypoint_list[i].cpu().numpy()  # [x, y] in world coordinates
+			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame (already preprocessed)
+			target_in_past_ego = target_point_list[i].squeeze().cpu().numpy()  # [x, y] in past ego frame
+			
+			# Build past ego-to-world rotation matrix
+			cos_past = np.cos(past_theta)
+			sin_past = np.sin(past_theta)
+			past_R_ego_to_world = np.array([
+				[cos_past, -sin_past],
+				[sin_past, cos_past]
+			])  # This is R, for ego-to-world transformation
+			
+			# Step 1: Transform target_point from past ego frame to world frame
+			target_world = past_R_ego_to_world @ target_in_past_ego + past_world_pos
+			
+			# Step 2: Transform from world frame to current ego frame
+			target_in_current_ego = current_R @ (target_world - current_pos)
+			
+			target_point_transformed_list.append(torch.from_numpy(target_in_current_ego).float().to('cuda'))
+		
+		target_point_transformed_stacked = torch.stack(target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
+		
+		# Transform next_target_point history to current ego frame
 		next_target_point_transformed_list = []
 		for i in range(self.obs_horizon):
 			past_world_pos = waypoint_list[i].cpu().numpy()  # [x, y] in world coordinates
 			past_theta = theta_list[i].squeeze().cpu().item()  # theta value for past frame (already preprocessed)
-			next_target_in_past_ego = next_target_point_list[i].squeeze().cpu().numpy()  # [x, y] in past ego frame (next_target_point for DP)
+			next_target_in_past_ego = next_target_point_list[i].squeeze().cpu().numpy()  # [x, y] in past ego frame
 			
 			# Build past ego-to-world rotation matrix
 			cos_past = np.cos(past_theta)
@@ -1100,14 +593,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		next_target_point_transformed_stacked = torch.stack(next_target_point_transformed_list, dim=0).unsqueeze(0)  # (1, obs_horizon, 2)
 		
 		
-		# Concatenate all ego status features: speed + theta + cmd + next_target_point + waypoint_relative
-		# ego_status_stacked: (1, obs_horizon, 1+1+6+2+2) = (1, obs_horizon, 12)
-		# Note: DP model uses next_target_point while MOT model uses target_point
+		# Concatenate all ego status features following unified_carla_dataset order:
+		# speed(1) + theta(1) + cmd(6) + target_point(2) + next_target_point(2) + waypoint_relative(2) = 14
 		ego_status_stacked = torch.cat([
 			speed_stacked,                            # (1, obs_horizon, 1)
 			theta_stacked,                            # (1, obs_horizon, 1)
 			cmd_stacked,                              # (1, obs_horizon, 6)
-			next_target_point_transformed_stacked,    # (1, obs_horizon, 2) - next_target_points transformed to current ego frame (for DP)
+			target_point_transformed_stacked,         # (1, obs_horizon, 2) - target_points transformed to current ego frame
+			next_target_point_transformed_stacked,    # (1, obs_horizon, 2) - next_target_points transformed to current ego frame
 			waypoint_relative_stacked                 # (1, obs_horizon, 2) - ego positions in current frame
 		], dim=-1)  # Concatenate along feature dimension
 		
@@ -1298,136 +791,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		return result
 	
-	def _truncate_route_by_target_point(self, route_waypoints_np, target_point_np):
-		"""
-		Truncate route_pred based on target_point projection.
-		
-		Logic:
-		- Project target_point onto the polyline formed by route_pred
-		- If projection falls inside route_pred (route is truncated by target_point),
-		  then the portion after projection is inaccurate and should not be used
-		- If projection falls beyond route_pred's end, the entire route is valid
-		
-		Protection mechanism:
-		- If truncated route has too few points (< MIN_POINTS_THRESHOLD) or
-		  is too short (< MIN_LENGTH_THRESHOLD), skip truncation and use original route
-		- This handles edge cases near the destination where target_point is very close
-		
-		Args:
-			route_waypoints_np: (N, 2) numpy array in ego frame [x_forward, y_left]
-			target_point_np: (2,) numpy array in ego frame [x_forward, y_left]
-		
-		Returns:
-			truncated_route: (M, 2) numpy array, M <= N, the valid portion of route_pred
-			truncation_idx: int, the index up to which the route is valid (-1 if no truncation)
-		"""
-		# Protection thresholds
-		MIN_POINTS_THRESHOLD = 5  # Minimum number of points needed for reliable control
-		MIN_LENGTH_THRESHOLD = 3.0  # Minimum route length in meters for reliable lookahead
-		
-		if len(route_waypoints_np) < 2:
-			return route_waypoints_np, -1
-		
-		# Find the closest segment to target_point
-		min_dist = float('inf')
-		best_segment_idx = -1
-		best_t = 0.0  # Parameter along segment [0, 1]
-		best_proj_point = None
-		
-		for i in range(len(route_waypoints_np) - 1):
-			p1 = route_waypoints_np[i]
-			p2 = route_waypoints_np[i + 1]
-			
-			# Vector from p1 to p2
-			v = p2 - p1
-			# Vector from p1 to target_point
-			w = target_point_np - p1
-			
-			# Length squared of segment
-			l2 = np.dot(v, v)
-			if l2 < 1e-10:  # Degenerate segment
-				t = 0.0
-				proj = p1
-			else:
-				# Project target_point onto the line containing the segment
-				t = np.dot(w, v) / l2
-				proj = p1 + t * v
-			
-			# Distance from target_point to projection
-			dist = np.linalg.norm(target_point_np - proj)
-			
-			# We consider projections within or beyond the segment
-			# t < 0: projection is before p1
-			# 0 <= t <= 1: projection is within segment
-			# t > 1: projection is beyond p2
-			
-			if dist < min_dist:
-				min_dist = dist
-				best_segment_idx = i
-				best_t = t
-				best_proj_point = proj
-		
-		# Determine truncation based on projection position
-		# If best_t is within [0, 1], the projection is inside the route segment
-		# If best_t > 1, check if we're on the last segment - if so, projection is beyond route
-		
-		if best_segment_idx == -1:
-			# No valid segment found, return original route
-			return route_waypoints_np, -1
-		
-		# Calculate the "arc length" position of the projection along the route
-		# If projection is beyond the last point, no truncation needed
-		is_on_last_segment = (best_segment_idx == len(route_waypoints_np) - 2)
-		
-		if best_t > 1.0 and is_on_last_segment:
-			# Projection is beyond the end of route_pred
-			# The entire route is valid for lookahead calculation
-			return route_waypoints_np, -1
-		
-		# Projection is within route_pred or before it (shouldn't happen normally)
-		# Truncate the route at the projection point
-		if best_t <= 0.0:
-			# Projection is at or before the start of this segment
-			# Keep points up to and including segment start
-			truncation_idx = best_segment_idx
-		elif best_t >= 1.0:
-			# Projection is at or beyond the end of this segment
-			# Keep points up to and including segment end
-			truncation_idx = best_segment_idx + 1
-		else:
-			# Projection is within the segment
-			# Keep points up to segment start, then add the projection point
-			truncation_idx = best_segment_idx
-		
-		# Build truncated route
-		if truncation_idx >= len(route_waypoints_np) - 1:
-			# No truncation needed
-			return route_waypoints_np, -1
-		
-		# Include points up to truncation_idx, then add projection point
-		truncated = route_waypoints_np[:truncation_idx + 1].copy()
-		
-		# Add the projection point if it's meaningfully different from the last included point
-		if best_proj_point is not None and len(truncated) > 0:
-			dist_to_last = np.linalg.norm(best_proj_point - truncated[-1])
-			if dist_to_last > 0.1:  # Only add if more than 0.1m away
-				truncated = np.vstack([truncated, best_proj_point])
-		
-		# ============ Protection mechanism ============
-		# Calculate the total length of truncated route
-		truncated_length = 0.0
-		for i in range(len(truncated) - 1):
-			truncated_length += np.linalg.norm(truncated[i + 1] - truncated[i])
-		
-		# Check if truncated route meets minimum requirements
-		if len(truncated) < MIN_POINTS_THRESHOLD or truncated_length < MIN_LENGTH_THRESHOLD:
-			# Truncated route is too short, skip truncation and use original route
-			# This handles edge cases near destination where target_point is very close
-			print(f"[Lateral] Skip truncation: points={len(truncated)}, length={truncated_length:.2f}m "
-				  f"(thresholds: {MIN_POINTS_THRESHOLD} points, {MIN_LENGTH_THRESHOLD}m)")
-			return route_waypoints_np, -1
-		
-		return truncated, truncation_idx
 	
 	def control_pid(self, route_waypoints, velocity, speed_waypoints, target_point=None):
 		"""
@@ -1437,24 +800,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			route_waypoints: (1, N, 2) tensor in ego frame [x_forward, y_left]
 			velocity: float, current speed in m/s
 			speed_waypoints: (1, N, 2) tensor for speed calculation
-			target_point: (1, 2) tensor or (2,) numpy array, the target point used by DP model
+			target_point: Unused, kept for API compatibility
 		"""
 		assert route_waypoints.size(0) == 1
 		route_waypoints_np = route_waypoints[0].data.cpu().numpy()  # (N, 2)
 		speed = velocity  # Already a float
 		speed_waypoints_np = speed_waypoints[0].data.cpu().numpy()  # (N, 2)
 		
-		# Truncate route_pred based on target_point projection
-		# This ensures we only use the accurate portion of route_pred for lookahead calculation
-		if target_point is not None:
-			if isinstance(target_point, torch.Tensor):
-				tp_np = target_point.squeeze().cpu().numpy()
-			else:
-				tp_np = np.asarray(target_point).squeeze()
-			
-			route_waypoints_np, truncation_idx = self._truncate_route_by_target_point(route_waypoints_np, tp_np)
-			if truncation_idx >= 0:
-				print(f"[Lateral] Route truncated at idx {truncation_idx} due to target_point projection")
+		# Route is no longer truncated - use full route_waypoints for control
 		
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
 		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
@@ -1470,6 +823,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			# Fallback: use first point distance, assuming it represents 0.5s travel
 			desired_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
 
+		# Speed limit: cap desired_speed at 35 km/h = 35/3.6 ≈ 9.72 m/s
+		max_desired_speed_ms = 35.0 / 3.6  # 35 km/h in m/s
+		desired_speed = min(desired_speed, max_desired_speed_ms)
+
 		brake = ((desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio))
 		
 		delta = np.clip(desired_speed - speed, 0.0, self.clip_delta)
@@ -1480,20 +837,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		route_interp = self.interpolate_waypoints(route_waypoints_np)
 		
-		# 低速时增加前视距离：跳过路径开头的直线部分
-		# route_pred 的特点是 直行-转弯-直行，开头一小段没有曲率
-		# 低速时跳过开头的点，让控制器看到更远处的转弯点
-		low_speed_threshold = 5.0  # m/s，低于此速度时增加前视
-		skip_distance = 0.0  # 默认不跳过
-		if speed < low_speed_threshold and len(route_interp) > 30:
-			# 低速时跳过开头的直线段，跳过距离与速度成反比
-			# 速度越低，跳过越多（最多跳过2m = 20个点，因为0.1m间隔）
-			skip_ratio = 1.0 - (speed / low_speed_threshold)  # 0~1
-			max_skip_points = 20  # 最多跳过2m
-			skip_points = int(skip_ratio * max_skip_points)
-			skip_points = min(skip_points, len(route_interp) - 20)  # 确保剩余足够的点
-			if skip_points > 0:
-				route_interp = route_interp[skip_points:]
+		# # 低速时增加前视距离：跳过路径开头的直线部分
+		# # route_pred 的特点是 直行-转弯-直行，开头一小段没有曲率
+		# # 低速时跳过开头的点，让控制器看到更远处的转弯点
+		# low_speed_threshold = 5.0  # m/s，低于此速度时增加前视
+		# skip_distance = 0.0  # 默认不跳过
+		# if speed < low_speed_threshold and len(route_interp) > 30:
+		# 	# 低速时跳过开头的直线段，跳过距离与速度成反比
+		# 	# 速度越低，跳过越多（最多跳过2m = 20个点，因为0.1m间隔）
+		# 	skip_ratio = 1.0 - (speed / low_speed_threshold)  # 0~1
+		# 	max_skip_points = 20  # 最多跳过2m
+		# 	skip_points = int(skip_ratio * max_skip_points)
+		# 	skip_points = min(skip_points, len(route_interp) - 20)  # 确保剩余足够的点
+		# 	if skip_points > 0:
+		# 		route_interp = route_interp[skip_points:]
 		
 		steer = self.turn_controller.step(route_interp, speed)
 		steer = np.clip(steer, -1.0, 1.0)
@@ -1557,36 +914,20 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		rgb_front = rgb_front.to('cuda', dtype=torch.float32)
 		waypoint = torch.from_numpy(tick_data['gps']).float().to('cuda', dtype=torch.float32)
 		target_point = torch.from_numpy(tick_data['target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
-		next_target_point_raw = torch.from_numpy(tick_data['next_target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
+		next_target_point = torch.from_numpy(tick_data['next_target_point']).unsqueeze(0).float().to('cuda', dtype=torch.float32)
 		
-		# Select appropriate target point for DP model based on path geometry
-		# This handles: straight driving (use next_target_point), intersection turns (use target_point),
-		# and curved roads (smooth interpolation), and ramp scenarios (ego not aligned with path)
-		dp_target_point_np, selection_type = select_dp_target_point(
-			tick_data['target_point'], 
-			tick_data['next_target_point'],
-			lateral_threshold_turn=3.0,      # Large lateral offset = intersection turn (meters)
-			lateral_threshold_straight=1.0,  # Small lateral offset = straight road (meters)
-			angle_threshold_turn=30.0,       # Large angle change = turn (degrees)
-			angle_threshold_straight=10.0    # Small angle change = straight (degrees)
-		)
-		dp_target_point = torch.from_numpy(dp_target_point_np).unsqueeze(0).float().to('cuda', dtype=torch.float32)
-		
-		# For debugging: print selection info occasionally
+		# For debugging: print target point info occasionally
 		if self.step % 20 == 0:
 			tp = tick_data['target_point']
 			ntp = tick_data['next_target_point']
-			print(f"[DP Target] type={selection_type}, "
-				  f"TP=({tp[0]:.1f},{tp[1]:.1f}), "
-				  f"NTP=({ntp[0]:.1f},{ntp[1]:.1f}), "
-				  f"sel=({dp_target_point_np[0]:.1f},{dp_target_point_np[1]:.1f})")
+			print(f"[Target Points] TP=({tp[0]:.1f},{tp[1]:.1f}), NTP=({ntp[0]:.1f},{ntp[1]:.1f})")
 
 		# Accumulate observation history into buffers 
 		self.lidar_bev_history.append(lidar)
 		self.rgb_history.append(rgb_front)
 		self.speed_history.append(speed)
 		self.target_point_history.append(target_point)
-		self.next_target_point_history.append(dp_target_point)  # For DP model input (selected based on path geometry)
+		self.next_target_point_history.append(next_target_point)  # Both target_point and next_target_point are used for DP model
 		self.next_command_history.append(cmd_one_hot)
 		self.theta_history.append(theta)
 		self.waypoint_history.append(waypoint)
@@ -1613,9 +954,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			self.pid_metadata['step'] = self.step
 		else:
 			# Build observation dict
-			# Note: target_point is for MOT model (kept for compatibility), dp_target_point is used for DP model in ego_status_stacked
+			# Both target_point and next_target_point are used for DP model in ego_status_stacked
 			lidar_stacked, ego_status_stacked, rgb_stacked = self._build_obs_dict(
-				tick_data, lidar, rgb_front, speed, theta, target_point, dp_target_point,
+				tick_data, lidar, rgb_front, speed, theta, target_point, next_target_point,
 				cmd_one_hot, waypoint
 			)
 			
@@ -1634,7 +975,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			if self.stuck_helper > 0:
 				# When stuck, always use next_target_point (farther) to help get unstuck
-				target_point_speed=torch.cat([speed, next_target_point_raw], dim=-1)
+				target_point_speed=torch.cat([speed, next_target_point], dim=-1)
 				print("Get stucked! Trigger the stuck helper!")
 			else:
 				target_point_speed=torch.cat([speed, target_point], dim=-1)  # (1, 3)
@@ -1659,6 +1000,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			self.last_pred_traj = pred_traj.squeeze(0).float().cpu().numpy()  # (6, 2) in [x, y] format
 			self.last_target_point = target_point.squeeze(0).float().cpu().numpy()  # (2,) in [x, y] format
+			self.last_next_target_point = next_target_point.squeeze(0).float().cpu().numpy()  # (2,) in [x, y] format
 		
 			# DP trajectory refinement
 			# Add batch dimension to features: (seq_len, feat_dim) -> (1, seq_len, feat_dim)
@@ -1701,8 +1043,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			gt_velocity = tick_data['speed']
 			
-			# Pass dp_target_point to control_pid for route truncation based on target_point projection
-			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=dp_target_point)
+			# Route is not truncated anymore - use full route_waypoints for control
+			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=None)
 			
 			# Restart mechanism in case the car got stuck (following simlingo logic)
 			# 0.1 is just an arbitrary low number to threshold when the car is stopped
@@ -1730,6 +1072,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			control.steer = float(steer)
 			control.throttle = float(throttle)
 			control.brake = float(brake)
+			control.throttle = max(0.0, min(0.75, control.throttle))
+			control.steer = max(-0.4, min(0.4, control.steer))
+			# control.throttle = 0.0 if np.abs(control.steer) > 0.4 and gt_velocity > 1.0 else control.throttle  # Sharp turn cut throttle
+			
+			# Speed limit enforcement: if current speed > 35 km/h, force brake
+			# gt_velocity is in m/s, convert to km/h by multiplying 3.6
+			if gt_velocity * 3.6 > 35:
+				control.throttle = 0.0
+				control.brake = 1.0
+				print(f"[Speed Limit] Speed {gt_velocity * 3.6:.2f} km/h > 35 km/h, forcing brake!")
 			
 			# Store metadata
 			self.pid_metadata = {
@@ -1832,7 +1184,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		bev_img = tick_data['bev'].copy()
 		if self.last_pred_traj is not None:
 			# Pass last_route_pred for visualization (20 waypoints for lateral control, blue points)
-			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point, self.last_dp_pred_traj, self.last_route_pred)
+			# Pass both target_point and next_target_point for visualization
+			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point, 
+			                                        self.last_next_target_point, self.last_dp_pred_traj, self.last_route_pred)
 		tick_data['bev_traj'] = bev_img
 		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		
@@ -1852,7 +1206,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		json.dump(self.metric_info, outfile, indent=4)
 		outfile.close()
 
-	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, dp_traj=None, route_pred=None):
+	def _draw_trajectory_on_bev(self, bev_img, traj, target_point=None, next_target_point=None, dp_traj=None, route_pred=None):
 		"""
 		Draw predicted trajectory on BEV image.
 		
@@ -1869,6 +1223,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			bev_img: numpy array (512, 512, 3) RGB image
 			traj: numpy array (6, 2) trajectory points in ego frame [x_forward, y_left]
 			target_point: numpy array (2,) target point in ego frame [x_forward, y_left], optional
+			next_target_point: numpy array (2,) next target point in ego frame [x_forward, y_left], optional
 			dp_traj: numpy array (6, 2) DP refined trajectory points in ego frame, optional
 			route_pred: numpy array (20, 2) route waypoints for lateral control, optional
 		
@@ -1978,6 +1333,16 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				cv2.circle(bev_img, (tp_col, tp_row), 10, (0, 255, 255), -1)  # Cyan circle for target point
 				cv2.circle(bev_img, (tp_col, tp_row), 12, (255, 255, 255), 2)  # White border
 		
+		# Draw next target point if provided (magenta/pink color with larger circle)
+		if next_target_point is not None:
+			x, y = next_target_point[0], next_target_point[1]  # x: forward, y: left (model convention)
+			# Negate y for visualization
+			ntp_col = int(cx + y / meters_per_pixel)
+			ntp_row = int(cy - x / meters_per_pixel)
+			if 0 <= ntp_col < img_w and 0 <= ntp_row < img_h:
+				cv2.circle(bev_img, (ntp_col, ntp_row), 10, (255, 0, 255), -1)  # Magenta circle for next target point
+				cv2.circle(bev_img, (ntp_col, ntp_row), 12, (255, 255, 255), 2)  # White border
+		
 		# Draw ego position (center)
 		cv2.circle(bev_img, (cx, cy), 8, (255, 255, 0), -1)  # Yellow circle for ego
 		
@@ -1998,137 +1363,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		return np.array([x, y])
 
 
-def lidar_to_ego_coordinate(lidar):
-	"""
-	Converts the LiDAR points given by the simulator into the ego agents
-	coordinate system
-	:param lidar: the LiDAR point cloud as provided in the input of run_step
-	:return: lidar where the points are w.r.t. 0/0/0 of the car and the carla
-	coordinate system.
-	"""
-	yaw = np.deg2rad(-90.0)
-	rotation_matrix = np.array([[np.cos(yaw), -np.sin(yaw), 0.0], [np.sin(yaw), np.cos(yaw), 0.0], [0.0, 0.0, 1.0]])
-
-	translation = np.array([0.0, 0.0, 2.5])
-
-	# The double transpose is a trick to compute all the points together.
-	ego_lidar = (rotation_matrix @ lidar[1][:, :3].T).T + translation
-
-	return ego_lidar
 
 
-def algin_lidar(lidar, translation, yaw):
-	"""
-	Translates and rotates a LiDAR into a new coordinate system.
-	Rotation is inverse to translation and yaw
-	:param lidar: numpy LiDAR point cloud (N,3)
-	:param translation: translations in meters
-	:param yaw: yaw angle in radians
-	:return: numpy LiDAR point cloud in the new coordinate system.
-	"""
-	rotation_matrix = np.array([[np.cos(yaw), -np.sin(yaw), 0.0], [np.sin(yaw), np.cos(yaw), 0.0], [0.0, 0.0, 1.0]])
-
-	aligned_lidar = (rotation_matrix.T @ (lidar - translation).T).T
-
-	return aligned_lidar
 
 
-# ============== UKF Filter Functions ==============
-
-def bicycle_model_forward(x, dt, steer, throttle, brake):
-	"""
-	Kinematic bicycle model.
-	Numbers are the tuned parameters from World on Rails
-	"""
-	front_wb = -0.090769015
-	rear_wb = 1.4178275
-
-	steer_gain = 0.36848336
-	brake_accel = -4.952399
-	throt_accel = 0.5633837
-
-	locs_0 = x[0]
-	locs_1 = x[1]
-	yaw = x[2]
-	speed = x[3]
-
-	if brake:
-		accel = brake_accel
-	else:
-		accel = throt_accel * throttle
-
-	wheel = steer_gain * steer
-
-	beta = math.atan(rear_wb / (front_wb + rear_wb) * math.tan(wheel))
-	next_locs_0 = locs_0.item() if hasattr(locs_0, 'item') else locs_0
-	next_locs_0 = next_locs_0 + speed * math.cos(yaw + beta) * dt
-	next_locs_1 = locs_1.item() if hasattr(locs_1, 'item') else locs_1
-	next_locs_1 = next_locs_1 + speed * math.sin(yaw + beta) * dt
-	next_yaws = yaw + speed / rear_wb * math.sin(beta) * dt
-	next_speed = speed + accel * dt
-	next_speed = next_speed * (next_speed > 0.0)  # Fast ReLU
-
-	next_state_x = np.array([next_locs_0, next_locs_1, next_yaws, next_speed])
-
-	return next_state_x
 
 
-def measurement_function_hx(vehicle_state):
-	"""
-	For now we use the same internal state as the measurement state
-	:param vehicle_state: VehicleState vehicle state variable containing
-		an internal state of the vehicle from the filter
-	:return: np array: describes the vehicle state as numpy array.
-		0: pos_x, 1: pos_y, 2: rotation, 3: speed
-	"""
-	return vehicle_state
-
-
-def state_mean(state, wm):
-	"""
-	We use the arctan of the average of sin and cos of the angle to calculate
-	the average of orientations.
-	:param state: array of states to be averaged. First index is the timestep.
-	:param wm: weights
-	:return: averaged state
-	"""
-	x = np.zeros(4)
-	sum_sin = np.sum(np.dot(np.sin(state[:, 2]), wm))
-	sum_cos = np.sum(np.dot(np.cos(state[:, 2]), wm))
-	x[0] = np.sum(np.dot(state[:, 0], wm))
-	x[1] = np.sum(np.dot(state[:, 1], wm))
-	x[2] = math.atan2(sum_sin, sum_cos)
-	x[3] = np.sum(np.dot(state[:, 3], wm))
-
-	return x
-
-
-def measurement_mean(state, wm):
-	"""
-	We use the arctan of the average of sin and cos of the angle to
-	calculate the average of orientations.
-	:param state: array of states to be averaged. First index is the timestep.
-	:param wm: weights
-	:return: averaged measurement
-	"""
-	x = np.zeros(4)
-	sum_sin = np.sum(np.dot(np.sin(state[:, 2]), wm))
-	sum_cos = np.sum(np.dot(np.cos(state[:, 2]), wm))
-	x[0] = np.sum(np.dot(state[:, 0], wm))
-	x[1] = np.sum(np.dot(state[:, 1], wm))
-	x[2] = math.atan2(sum_sin, sum_cos)
-	x[3] = np.sum(np.dot(state[:, 3], wm))
-
-	return x
-
-
-def residual_state_x(a, b):
-	y = a - b
-	y[2] = t_u.normalize_angle(y[2])
-	return y
-
-
-def residual_measurement_h(a, b):
-	y = a - b
-	y[2] = t_u.normalize_angle(y[2])
-	return y

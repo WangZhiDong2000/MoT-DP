@@ -6,7 +6,7 @@ from collections import defaultdict
 import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from model.transformer_for_diffusion import TransformerForDiffusion
+from model.transformer_for_diffusion_multi_head import TransformerForDiffusion
 from model.interfuser_bev_encoder import InterfuserBEVEncoder
 from model.interfuser_bev_encoder import load_lidar_submodules
 import os
@@ -52,7 +52,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         bev_encoder_cfg = config.get('bev_encoder', {})
         obs_encoder = InterfuserBEVEncoder(
             perception_backbone=None,
-            state_dim=bev_encoder_cfg.get('state_dim', 13),  # 修改为13维以支持拼接后的ego_status
             freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
             bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
         )
@@ -337,7 +336,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def extract_bev_state_tokens(self, obs_dict):
         """
-        使用InterfuserBEVEncoder提取BEV tokens和State tokens (Decoder-Only架构)
+        使用InterfuserBEVEncoder提取BEV tokens (Decoder-Only架构)
         
         支持两种模式：
         1. 使用预处理好的BEV特征（推荐，快速）
@@ -348,16 +347,13 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
                 - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
                 - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                - 'ego_status' (B, state_dim): 状态向量
                 
         Returns:
             bev_tokens: (B, seq_len+1, 512) - BEV空间tokens + global token
-            state_tokens: (B, 1, 128) - 状态编码tokens
         """
         try:
             device = next(self.parameters()).device
             model_dtype = next(self.parameters()).dtype
-            state = obs_dict['ego_status'].to(device=device, dtype=model_dtype)
             
             use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
             
@@ -365,8 +361,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 lidar_token = obs_dict['lidar_token'].to(device=device, dtype=model_dtype)
                 lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=model_dtype)
                 
-                bev_tokens, state_tokens = self.obs_encoder(
-                    state=state,
+                bev_tokens = self.obs_encoder(
                     lidar_token=lidar_token,
                     lidar_token_global=lidar_token_global,
                 )
@@ -376,17 +371,16 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 
                 lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=model_dtype)
                 
-                bev_tokens, state_tokens = self.obs_encoder(
+                bev_tokens = self.obs_encoder(
                     image=lidar_bev_img,
-                    state=state,
                 )
             
-            return bev_tokens, state_tokens
+            return bev_tokens
                 
         except KeyError as e:
-            raise KeyError(f"Missing required field in obs_dict for BEV/State token extraction: {e}")
+            raise KeyError(f"Missing required field in obs_dict for BEV token extraction: {e}")
         except Exception as e:
-            raise RuntimeError(f"Error in TCP feature extraction: {e}")
+            raise RuntimeError(f"Error in BEV feature extraction: {e}")
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -443,16 +437,14 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
-        # Extract BEV tokens and State tokens (Decoder-Only架构)
+        # Extract BEV tokens (Decoder-Only架构)
         # Flatten temporal dimension for feature extraction
         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
+        bev_tokens = self.extract_bev_state_tokens(batch_nobs)
         
-        # Use only the last timestep's features (or average over time)
+        # Use only the last timestep's features
         # bev_tokens: (B*To, seq_len+1, 512) -> use last timestep
-        # state_tokens: (B*To, 1, 128) -> use last timestep
         bev_tokens = bev_tokens.reshape(batch_size, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
-        state_tokens = state_tokens.reshape(batch_size, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
 
         # Prepare VL tokens
         gen_vit_tokens = batch['gen_vit_tokens']
@@ -470,7 +462,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             trajectory=trajectory,
             anchor=anchor,
             bev_tokens=bev_tokens,
-            state_tokens=state_tokens,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
@@ -486,7 +477,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         trajectory: torch.Tensor,
         anchor: torch.Tensor,
         bev_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
         gen_vit_tokens: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
@@ -505,7 +495,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             trajectory: (B, horizon, 2) - ground truth trajectory
             anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
             bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens from encoder
-            state_tokens: (B, 1, 128) - state tokens from encoder
             gen_vit_tokens: (B, seq_len, dim) - VIT tokens
             reasoning_query_tokens: (B, seq_len, dim) - reasoning tokens
             ego_status: (B, To, status_dim) - ego vehicle status
@@ -548,7 +537,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             timestep=timesteps,
             cond=cond,  # For API compatibility
             bev_tokens=bev_tokens,
-            state_tokens=state_tokens,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status
@@ -579,7 +567,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     def conditional_sample(self, 
             bev_tokens: torch.Tensor,
-            state_tokens: torch.Tensor,
             gen_vit_tokens: torch.Tensor,
             reasoning_query_tokens: torch.Tensor,
             ego_status: torch.Tensor,
@@ -594,7 +581,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         Args:
             bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens
-            state_tokens: (B, 1, 128) - state tokens
             gen_vit_tokens: (B, seq_len, 1536) - VL tokens
             reasoning_query_tokens: (B, seq_len, 1536) - reasoning tokens
             ego_status: (B, To, status_dim) - ego status history
@@ -606,7 +592,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         result = self._truncated_diffusion_sample(
             anchor=anchor,
             bev_tokens=bev_tokens,
-            state_tokens=state_tokens,
             ego_status=ego_status,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
@@ -621,7 +606,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self,
         anchor: torch.Tensor,
         bev_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         gen_vit_tokens: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
@@ -687,7 +671,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 timestep=timesteps,
                 cond=cond,
                 bev_tokens=bev_tokens,
-                state_tokens=state_tokens,
                 gen_vit_tokens=gen_vit_tokens,
                 reasoning_query_tokens=reasoning_query_tokens,
                 ego_status=ego_status,
@@ -722,13 +705,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Da = self.action_dim
         To = self.n_obs_steps
 
-        # Extract BEV tokens and State tokens
+        # Extract BEV tokens
         batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
+        bev_tokens = self.extract_bev_state_tokens(batch_nobs)
         
         # Use only the last timestep's features
         bev_tokens = bev_tokens.reshape(B, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
-        state_tokens = state_tokens.reshape(B, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
 
         # Process VL tokens
         gen_vit_tokens = nobs['gen_vit_tokens']
@@ -756,7 +738,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         # Generate samples using truncated diffusion
         nsample, route_pred = self.conditional_sample(
             bev_tokens=bev_tokens,
-            state_tokens=state_tokens,
             gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,

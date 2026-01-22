@@ -197,6 +197,67 @@ def get_history_target_points(measurements, current_idx, obs_horizon):
     
     return target_points_hist
 
+
+def get_history_target_points_next(measurements, current_idx, obs_horizon):
+    """
+    Transform historical target_point_next to the current frame's coordinate system.
+    
+    Args:
+        measurements: List of measurement dicts for the entire sample
+        current_idx: Index of the current frame in measurements list
+        obs_horizon: Number of history frames to extract
+    
+    Returns:
+        target_points_next_hist: List of target_point_next transformed to current ego frame (BEV, 2D), 
+                                 length = obs_horizon
+                                 Each historical target_point_next is transformed from its original frame's 
+                                 coordinate system to the current frame's coordinate system
+        None: If not enough history frames available (no padding)
+    """
+    current_anno = measurements[current_idx]
+    current_matrix = np.array(current_anno['ego_matrix'])[:3]
+    current_translation = current_matrix[:, 3:4]
+    current_rotation = current_matrix[:, :3]
+    
+    target_points_next_hist = []
+    
+    # Extract target_point_next for each history frame and transform to current frame
+    for j in range(max(0, current_idx - obs_horizon + 1), current_idx + 1):
+        frame_anno = measurements[j]
+        
+        # Get the target_point_next from this frame (in that frame's ego coordinate)
+        if 'target_point_next' in frame_anno:
+            target_point_next_in_past_frame = np.array(frame_anno['target_point_next'])[:2]  # x, y in BEV
+            
+            # Get the transformation matrix of the past frame
+            past_matrix = np.array(frame_anno['ego_matrix'])[:3]
+            past_translation = past_matrix[:, 3:4]
+            past_rotation = past_matrix[:, :3]
+            
+            # Transform target_point_next from past frame's ego coordinate to world coordinate
+            # target_point_next is in past ego frame (x, y)
+            target_point_next_3d = np.array([target_point_next_in_past_frame[0], 
+                                             target_point_next_in_past_frame[1], 
+                                             0.0]).reshape(3, 1)
+            target_next_world = past_rotation @ target_point_next_3d + past_translation
+            
+            # Transform from world coordinate to current frame's ego coordinate
+            # This matches the transformation used for historical waypoints (positions)
+            # relative to the reference (current) position.
+            target_next_in_current_frame = current_rotation.T @ (target_next_world - current_translation)
+            
+            target_points_next_hist.append(target_next_in_current_frame[:2, 0])
+        else:
+            # If target_point_next is missing, use [0, 0] as fallback
+            target_points_next_hist.append(np.array([0.0, 0.0]))
+    
+    # Return None if we don't have enough history frames (no padding)
+    if len(target_points_next_hist) < obs_horizon:
+        return None
+    
+    return target_points_next_hist
+
+
 def get_waypoints(measurements, action_horizon, y_augmentation=0.0, yaw_augmentation=0.0):
     """
     Transform waypoints to be origin at current ego position.
@@ -462,6 +523,15 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
             frame_data['target_point_hist'] = np.array(target_points_hist)
             assert frame_data['target_point_hist'].shape == (obs_horizon, 2)
 
+            # --- Historical Target Points Next ---
+            # Get target_point_next for each history frame in their respective ego coordinates
+            target_points_next_hist = get_history_target_points_next(loaded_measurements, current_idx_in_list, obs_horizon)
+            # Skip this sample if not enough history frames (no padding allowed)
+            if target_points_next_hist is None:
+                continue
+            frame_data['target_point_next_hist'] = np.array(target_points_next_hist)
+            assert frame_data['target_point_next_hist'].shape == (obs_horizon, 2)
+
             # --- Image History ---
             rgb_hist = []
             obs_start_idx = ii - (obs_horizon - 1) * hz_interval
@@ -622,8 +692,8 @@ def split_train_val(in_dir, out_dir, val_ratio=0.1):
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description='Preprocess PDM Lite dataset')
-    argparser.add_argument('--data-root', type=str, default='/share-data/pdm_lite' , help='Root directory of raw PDM Lite data')
-    argparser.add_argument('--out-dir', type=str, default='/share-data/pdm_lite/tmp_data', help='Output directory for processed data')
+    argparser.add_argument('--data-root', type=str, default='/home/wang/Dataset/pdm_lite_mini' , help='Root directory of raw PDM Lite data')
+    argparser.add_argument('--out-dir', type=str, default='/home/wang/Dataset/pdm_lite_mini/tmp_data', help='Output directory for processed data')
     argparser.add_argument('--obs-horizon', type=int, default=4, help='Number of observation history frames')
     argparser.add_argument('--action-horizon', type=int, default=6, help='Number of future action/waypoint frames to predict (e.g., 8 for 4s at 2Hz)')
     argparser.add_argument('--sample-interval', type=int, default=1, help='Interval between training samples (e.g., 10 frames)')

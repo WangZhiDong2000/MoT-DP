@@ -181,7 +181,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         target_point_data = final_sample['target_point_hist']
         ego_status_components.append(target_point_data)  # (obs_horizon, 2)
         
-        # 6. waypoints_hist (shape: (obs_horizon, 2))
+        # 7. target point next
+        target_point_next_data = final_sample['target_point_next_hist']
+        ego_status_components.append(target_point_next_data)  # (obs_horizon, 2)
+        
+        # 8. waypoints_hist (shape: (obs_horizon, 2))
         waypoints_data = final_sample['waypoints_hist']
         ego_status_components.append(waypoints_data)  # (obs_horizon, 2)
         
