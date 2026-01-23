@@ -273,6 +273,33 @@ class MultiSourceAttentionBlock(nn.Module):
         self.reason_residual_proj = nn.Linear(d_model, d_model)
         self.reason_residual_gate = nn.Parameter(torch.zeros(1))
         
+        # ========== Route-Specific Components (Stability Enhancement) ==========
+        # These components provide route queries with independent processing paths,
+        # simulating the effect of an independent Route Decoder within the unified architecture.
+        
+        # Route-specific Q adapters (separate from trajectory adapters)
+        # This allows route to learn different attention patterns for cross-attention
+        self.route_q_adapter_bev = nn.Linear(d_model, d_model // 4)
+        self.route_q_adapter_vl = nn.Linear(d_model, d_model // 4)
+        self.route_q_adapter_reason = nn.Linear(d_model, d_model // 4)
+        self.route_q_adapter_out = nn.Linear(d_model // 4, d_model)
+        
+        # Route-specific attention temperature and bias
+        # Allows route to have different attention sharpness/bias than trajectory
+        self.route_temp_bev = nn.Parameter(torch.zeros(1))
+        self.route_temp_vl = nn.Parameter(torch.zeros(1))
+        self.route_temp_reason = nn.Parameter(torch.zeros(1))
+        self.route_bias_bev = nn.Parameter(torch.zeros(1))
+        self.route_bias_vl = nn.Parameter(torch.zeros(1))
+        self.route_bias_reason = nn.Parameter(torch.zeros(1))
+        
+        # Route-specific AdaLN modulation (separate from shared modulation)
+        # This is key for route stability - independent conditioning pathway
+        self.route_adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model, bias=True)
+        )
+        
         # ========== FFN ==========
         self.ffn = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -315,7 +342,7 @@ class MultiSourceAttentionBlock(nn.Module):
     
     def forward(
         self,
-        x: torch.Tensor,  # (B, T, d_model) - main sequence
+        x: torch.Tensor,  # (B, T, d_model) - main sequence [trajectory | route]
         bev_tokens: torch.Tensor,   # (B, T_b, d_model) - BEV tokens (already projected)
         vl_tokens: torch.Tensor,    # (B, T_v, d_model) - VL tokens (already projected)
         reasoning_tokens: torch.Tensor,  # (B, T_r, d_model) - reasoning tokens (already projected)
@@ -324,6 +351,8 @@ class MultiSourceAttentionBlock(nn.Module):
         bev_padding_mask: Optional[torch.Tensor] = None,
         vl_padding_mask: Optional[torch.Tensor] = None,
         reasoning_padding_mask: Optional[torch.Tensor] = None,
+        route_conditioning: Optional[torch.Tensor] = None,  # (B, d_model) - route-specific conditioning
+        T_traj: Optional[int] = None,  # Number of trajectory queries (for route-specific processing)
     ) -> torch.Tensor:
         """
         Forward pass with multi-source attention.
@@ -333,6 +362,11 @@ class MultiSourceAttentionBlock(nn.Module):
            - Uses block diagonal mask to isolate trajectory and route segments
         2. Adapter cross-attention: Q_adapted(x) @ [K(bev), K(vl)]^T with RoPE on K only
         3. Task cross-attention: Q_adapted(x) @ K(reasoning)^T with RoPE on K only, scaled by gating
+        
+        Route-Specific Processing (when T_traj is provided):
+        - Route queries use independent Q adapters for cross-attention
+        - Route queries use independent temperature/bias for attention
+        - Route queries use independent AdaLN modulation
         
         All attention scores are concatenated, temperature-scaled, bias-adjusted, and softmaxed together.
         
@@ -345,12 +379,34 @@ class MultiSourceAttentionBlock(nn.Module):
         T_v = vl_tokens.shape[1]
         T_r = reasoning_tokens.shape[1]
         
+        # Determine if we have route-specific processing
+        if T_traj is None:
+            T_traj = T  # No route separation, treat all as trajectory
+        T_route = T - T_traj
+        
         # ========== AdaLN modulation parameters ==========
         mod_params = self.adaLN_modulation(conditioning)
         shift_pre, scale_pre, gate_attn, shift_ffn, scale_ffn, gate_ffn = mod_params.chunk(6, dim=1)
         
-        # ========== Pre-LayerNorm with modulation ==========
-        x_norm = self.modulate(self.norm_pre(x), shift_pre, scale_pre)
+        # Route-specific AdaLN (if route exists and route_conditioning provided)
+        if T_route > 0 and route_conditioning is not None:
+            route_mod_params = self.route_adaLN_modulation(route_conditioning)
+            route_shift_pre, route_scale_pre, route_gate_attn, route_shift_ffn, route_scale_ffn, route_gate_ffn = route_mod_params.chunk(6, dim=1)
+        else:
+            # Use shared modulation for route
+            route_shift_pre, route_scale_pre = shift_pre, scale_pre
+            route_gate_attn, route_shift_ffn, route_scale_ffn, route_gate_ffn = gate_attn, shift_ffn, scale_ffn, gate_ffn
+        
+        # ========== Pre-LayerNorm with modulation (segment-specific) ==========
+        x_norm_ln = self.norm_pre(x)
+        
+        # Apply different modulation to trajectory and route
+        x_norm_traj = self.modulate(x_norm_ln[:, :T_traj, :], shift_pre, scale_pre)
+        if T_route > 0:
+            x_norm_route = self.modulate(x_norm_ln[:, T_traj:, :], route_shift_pre, route_scale_pre)
+            x_norm = torch.cat([x_norm_traj, x_norm_route], dim=1)
+        else:
+            x_norm = x_norm_traj
         
         # ========== Gating factor for Reasoning ==========
         g = self.gating_factor
@@ -362,13 +418,33 @@ class MultiSourceAttentionBlock(nn.Module):
         temp_vl = 1.0 + torch.nn.functional.softplus(self.temp_vl)
         temp_reason = 1.0 + torch.nn.functional.softplus(self.temp_reason)
         
+        # Route-specific temperatures
+        route_temp_bev = 1.0 + torch.nn.functional.softplus(self.route_temp_bev)
+        route_temp_vl = 1.0 + torch.nn.functional.softplus(self.route_temp_vl)
+        route_temp_reason = 1.0 + torch.nn.functional.softplus(self.route_temp_reason)
+        
         # ========== Q projection (base + source-specific adaptations) ==========
         q_base = self.q_proj(x_norm)  # (B, T, d_model)
         
-        # Source-specific Q adaptations (low-rank: d -> d/4 -> d)
-        q_adapt_bev = self.q_adapter_out(torch.tanh(self.q_adapter_bev(x_norm)))
-        q_adapt_vl = self.q_adapter_out(torch.tanh(self.q_adapter_vl(x_norm)))
-        q_adapt_reason = self.q_adapter_out(torch.tanh(self.q_adapter_reason(x_norm)))
+        # Trajectory Q adaptations (original adapters)
+        q_adapt_bev_traj = self.q_adapter_out(torch.tanh(self.q_adapter_bev(x_norm[:, :T_traj, :])))
+        q_adapt_vl_traj = self.q_adapter_out(torch.tanh(self.q_adapter_vl(x_norm[:, :T_traj, :])))
+        q_adapt_reason_traj = self.q_adapter_out(torch.tanh(self.q_adapter_reason(x_norm[:, :T_traj, :])))
+        
+        # Route Q adaptations (route-specific adapters)
+        if T_route > 0:
+            q_adapt_bev_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_bev(x_norm[:, T_traj:, :])))
+            q_adapt_vl_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_vl(x_norm[:, T_traj:, :])))
+            q_adapt_reason_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_reason(x_norm[:, T_traj:, :])))
+            
+            # Concatenate trajectory and route adaptations
+            q_adapt_bev = torch.cat([q_adapt_bev_traj, q_adapt_bev_route], dim=1)
+            q_adapt_vl = torch.cat([q_adapt_vl_traj, q_adapt_vl_route], dim=1)
+            q_adapt_reason = torch.cat([q_adapt_reason_traj, q_adapt_reason_route], dim=1)
+        else:
+            q_adapt_bev = q_adapt_bev_traj
+            q_adapt_vl = q_adapt_vl_traj
+            q_adapt_reason = q_adapt_reason_traj
         
         # ========== Self-attention K, V ==========
         k_self = self.k_self(x_norm)  # (B, T, d_model)
@@ -442,12 +518,32 @@ class MultiSourceAttentionBlock(nn.Module):
         # Self-attention scores (with temperature and bias)
         attn_self = torch.matmul(q_base, k_self.transpose(-2, -1)) * temp_self + self.bias_self  # (B, nhead, T, T)
         
-        # Adapter cross-attention scores (with source-specific Q, temperature and bias)
-        attn_bev = torch.matmul(q_bev, k_bev.transpose(-2, -1)) * temp_bev + self.bias_bev       # (B, nhead, T, T_b)
-        attn_vl = torch.matmul(q_vl, k_vl.transpose(-2, -1)) * temp_vl + self.bias_vl           # (B, nhead, T, T_v)
+        # ========== Cross-attention with segment-specific temperature/bias ==========
+        # Compute raw attention scores first
+        attn_bev_raw = torch.matmul(q_bev, k_bev.transpose(-2, -1))   # (B, nhead, T, T_b)
+        attn_vl_raw = torch.matmul(q_vl, k_vl.transpose(-2, -1))     # (B, nhead, T, T_v)
+        attn_reason_raw = torch.matmul(q_reason, k_reason.transpose(-2, -1)) * ratio_g  # (B, nhead, T, T_r)
         
-        # Task cross-attention scores (with gating for Reasoning, temperature and bias)
-        attn_reason = torch.matmul(q_reason, k_reason.transpose(-2, -1)) * ratio_g * temp_reason + self.bias_reason  # (B, nhead, T, T_r)
+        if T_route > 0:
+            # Apply trajectory-specific temperature/bias to trajectory part
+            attn_bev_traj = attn_bev_raw[:, :, :T_traj, :] * temp_bev + self.bias_bev
+            attn_vl_traj = attn_vl_raw[:, :, :T_traj, :] * temp_vl + self.bias_vl
+            attn_reason_traj = attn_reason_raw[:, :, :T_traj, :] * temp_reason + self.bias_reason
+            
+            # Apply route-specific temperature/bias to route part
+            attn_bev_route = attn_bev_raw[:, :, T_traj:, :] * route_temp_bev + self.route_bias_bev
+            attn_vl_route = attn_vl_raw[:, :, T_traj:, :] * route_temp_vl + self.route_bias_vl
+            attn_reason_route = attn_reason_raw[:, :, T_traj:, :] * route_temp_reason + self.route_bias_reason
+            
+            # Concatenate trajectory and route attention scores
+            attn_bev = torch.cat([attn_bev_traj, attn_bev_route], dim=2)
+            attn_vl = torch.cat([attn_vl_traj, attn_vl_route], dim=2)
+            attn_reason = torch.cat([attn_reason_traj, attn_reason_route], dim=2)
+        else:
+            # No route, use trajectory-only processing
+            attn_bev = attn_bev_raw * temp_bev + self.bias_bev
+            attn_vl = attn_vl_raw * temp_vl + self.bias_vl
+            attn_reason = attn_reason_raw * temp_reason + self.bias_reason
         
         # ========== Build attention mask ==========
         # Concatenate all attention scores
@@ -522,13 +618,35 @@ class MultiSourceAttentionBlock(nn.Module):
         # Combine main output with residual paths
         output = output + bev_gate * bev_residual + vl_gate * vl_residual + reason_gate * reason_residual
         
-        # ========== Residual with gate ==========
-        x = x + gate_attn.unsqueeze(1) * output
+        # ========== Residual with segment-specific gate ==========
+        if T_route > 0:
+            # Apply different gates to trajectory and route
+            x_traj = x[:, :T_traj, :] + gate_attn.unsqueeze(1) * output[:, :T_traj, :]
+            x_route = x[:, T_traj:, :] + route_gate_attn.unsqueeze(1) * output[:, T_traj:, :]
+            x = torch.cat([x_traj, x_route], dim=1)
+        else:
+            x = x + gate_attn.unsqueeze(1) * output
         
-        # ========== FFN with AdaLN ==========
-        x_norm_ffn = self.modulate(nn.functional.layer_norm(x, [C]), shift_ffn, scale_ffn)
+        # ========== FFN with segment-specific AdaLN ==========
+        x_ln = nn.functional.layer_norm(x, [C])
+        
+        if T_route > 0:
+            # Apply different modulation to trajectory and route
+            x_norm_ffn_traj = self.modulate(x_ln[:, :T_traj, :], shift_ffn, scale_ffn)
+            x_norm_ffn_route = self.modulate(x_ln[:, T_traj:, :], route_shift_ffn, route_scale_ffn)
+            x_norm_ffn = torch.cat([x_norm_ffn_traj, x_norm_ffn_route], dim=1)
+        else:
+            x_norm_ffn = self.modulate(x_ln, shift_ffn, scale_ffn)
+        
         x_ffn = self.ffn(x_norm_ffn)
-        x = x + gate_ffn.unsqueeze(1) * x_ffn
+        
+        if T_route > 0:
+            # Apply different gates to trajectory and route
+            x_traj = x[:, :T_traj, :] + gate_ffn.unsqueeze(1) * x_ffn[:, :T_traj, :]
+            x_route = x[:, T_traj:, :] + route_gate_ffn.unsqueeze(1) * x_ffn[:, T_traj:, :]
+            x = torch.cat([x_traj, x_route], dim=1)
+        else:
+            x = x + gate_ffn.unsqueeze(1) * x_ffn
         
         return x
 
@@ -728,16 +846,30 @@ class TrajectoryMLPHead(nn.Module):
 
 class RouteMLPHead(nn.Module):
     """
-    MLP-based Route Head with conditioning support.
+    MLP-based Route Head with independent conditioning support.
+    
+    Key design (inspired by AdaLNRouteHeadDecoderOnly for stability):
+    - Route-specific status projection (separate from shared conditioning)
+    - Final AdaLN modulation before output (like original stable version)
+    - Combined conditioning from both shared and route-specific sources
     
     Unlike trajectory, route does not need to attend to trajectory (unidirectional).
-    But it benefits from conditioning (timestep + ego_status).
+    But it benefits from route-specific conditioning for closed-loop stability.
     """
-    def __init__(self, n_emb: int, output_dim: int = 2, p_drop: float = 0.1):
+    def __init__(self, n_emb: int, status_dim: int = 14, output_dim: int = 2, p_drop: float = 0.1):
         super().__init__()
         self.ln_f = nn.LayerNorm(n_emb)
         
-        # Conditioning projection
+        # ========== Route-Specific Status Projection (Key for Stability) ==========
+        # This mirrors AdaLNRouteHeadDecoderOnly's independent status_proj
+        # Provides route-specific conditioning separate from shared trajectory conditioning
+        self.route_status_proj = nn.Sequential(
+            nn.Linear(status_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        
+        # Shared conditioning projection (for timestep + history)
         self.cond_proj = nn.Sequential(
             nn.Linear(n_emb, n_emb),
             nn.SiLU(),
@@ -753,25 +885,53 @@ class RouteMLPHead(nn.Module):
             nn.Dropout(p_drop),
         )
         
+        # ========== Final AdaLN Modulation (Key for Stability) ==========
+        # This mirrors AdaLNRouteHeadDecoderOnly's final_adaLN
+        # Provides fine-grained control over route output based on current ego state
+        self.final_adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(n_emb, 2 * n_emb, bias=True),
+        )
+        
         # Output projection
         self.output_head = nn.Linear(n_emb, output_dim)
+        
+        self._init_weights()
     
-    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+    def _init_weights(self):
+        # Initialize final AdaLN to identity (shift=0, scale=0 -> x * 1 + 0)
+        nn.init.zeros_(self.final_adaLN[-1].weight)
+        nn.init.zeros_(self.final_adaLN[-1].bias)
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        conditioning: torch.Tensor,
+        ego_status: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, T_route, n_emb) - route decoder output
-            conditioning: (B, n_emb) - timestep + ego_status conditioning
+            conditioning: (B, n_emb) - timestep + history conditioning
+            ego_status: (B, status_dim) - current ego status for route-specific conditioning
         Returns:
             (B, T_route, output_dim) - route prediction (waypoints)
         """
         x = self.ln_f(x)
         
-        # Add conditioning
-        cond = self.cond_proj(conditioning).unsqueeze(1)  # (B, 1, n_emb)
-        x = x + cond
+        # Combine route-specific and shared conditioning
+        route_cond = self.route_status_proj(ego_status) + self.cond_proj(conditioning)
+        
+        # Add conditioning to features
+        x = x + route_cond.unsqueeze(1)  # (B, T_route, n_emb)
         
         # MLP processing
         x = x + self.mlp(x)
+        
+        # ========== Final AdaLN Modulation (Key for Stability) ==========
+        # Apply route-specific modulation before output
+        shift, scale = self.final_adaLN(route_cond).chunk(2, dim=1)
+        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
         
         # Output projection
         return self.output_head(x)
@@ -860,6 +1020,20 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         ])
         
         self.final_norm = nn.LayerNorm(d_model)
+        
+        # ========== Route Residual Path (Stability Enhancement) ==========
+        # This bypasses the shared decoder to preserve route-specific information
+        # Key insight: Original AdaLNRouteHeadDecoderOnly had independent decoder,
+        # this residual path simulates that independence within unified architecture
+        self.route_residual_path = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        # Learnable gate, initialized to 0 (residual starts inactive, model learns to use it)
+        self.route_residual_gate = nn.Parameter(torch.zeros(1))
+        
         self._init_weights()
     
     def _create_sinusoidal_pos_encoding(self, max_len: int, d_model: int) -> torch.Tensor:
@@ -889,9 +1063,14 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         nn.init.normal_(self.route_segment_emb, mean=0.0, std=0.02)
         nn.init.ones_(self.traj_pos_scale)
         nn.init.ones_(self.route_pos_scale)
+        # Initialize route residual gate to 0 (starts inactive)
+        nn.init.zeros_(self.route_residual_gate)
         for layer in self.layers:
             nn.init.zeros_(layer.adaLN_modulation[-1].weight)
             nn.init.zeros_(layer.adaLN_modulation[-1].bias)
+            # Initialize route-specific AdaLN to identity
+            nn.init.zeros_(layer.route_adaLN_modulation[-1].weight)
+            nn.init.zeros_(layer.route_adaLN_modulation[-1].bias)
     
     def _create_block_diagonal_mask(self, T_traj: int, T_route: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -941,6 +1120,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         bev_padding_mask: Optional[torch.Tensor] = None,
         vl_padding_mask: Optional[torch.Tensor] = None,
         reasoning_padding_mask: Optional[torch.Tensor] = None,
+        route_conditioning: Optional[torch.Tensor] = None,  # (B, d_model) - route-specific conditioning
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass with unified queries and multi-source attention.
@@ -949,6 +1129,11 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         - Trajectory queries can see: trajectory + route (route guides trajectory)
         - Route queries can only see: route (independent planning)
         - Both can attend to all cross-attention sources (BEV, VL, Reasoning)
+        
+        Route-Specific Processing:
+        - Route queries use independent Q adapters for cross-attention
+        - Route queries use independent temperature/bias for attention
+        - Route queries use independent AdaLN modulation (if route_conditioning provided)
         
         Position Encoding:
         - Both trajectory and route use unified sinusoidal position encoding
@@ -961,6 +1146,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             vl_tokens: (B, T_vl, vl_dim) - VL tokens
             reasoning_tokens: (B, T_r, reasoning_dim) - reasoning tokens
             conditioning: (B, d_model) - timestep + current_status conditioning
+            route_conditioning: (B, d_model) - route-specific conditioning (optional)
             
         Returns:
             traj_out: (B, horizon, d_model) - trajectory output
@@ -1000,6 +1186,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         reasoning_proj = self.reasoning_proj(reasoning_tokens)
         
         # Decoder layers with multi-source attention
+        # Pass T_traj and route_conditioning for route-specific processing
         for layer in self.layers:
             x = layer(
                 x, 
@@ -1010,7 +1197,9 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
                 self_attn_mask, 
                 bev_padding_mask,
                 vl_padding_mask, 
-                reasoning_padding_mask
+                reasoning_padding_mask,
+                route_conditioning=route_conditioning,
+                T_traj=T_traj,
             )
         
         x = self.final_norm(x)
@@ -1018,6 +1207,13 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Split outputs
         traj_out = x[:, :T_traj, :]
         route_out = x[:, T_traj:, :]
+        
+        # ========== Route Residual Path (Stability Enhancement) ==========
+        # Add route-specific residual from initial queries (bypasses shared decoder)
+        # This provides a stable baseline that the shared decoder output modulates
+        # Similar to how AdaLNRouteHeadDecoderOnly had independent route_queries
+        route_residual = self.route_residual_path(route_emb)
+        route_out = route_out + torch.sigmoid(self.route_residual_gate) * route_residual
         
         return traj_out, route_out
 
@@ -1096,6 +1292,14 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.ego_status_proj = nn.Linear(status_dim, n_emb)  # For current status only
         self.history_encoder = HistoryEncoder(status_dim, n_emb)  # GRU for global history encoding
         
+        # Route-specific conditioning generator (key for stability)
+        # This provides route queries with independent conditioning pathway
+        self.route_status_proj = nn.Sequential(
+            nn.Linear(status_dim, n_emb),
+            nn.SiLU(),
+            nn.Linear(n_emb, n_emb),
+        )
+        
         # Unified Decoder with heterogeneous queries
         # hist_status removed - ego_status history is now only used for AdaLN conditioning
         self.decoder = UnifiedDecoderOnlyTransformer(
@@ -1118,8 +1322,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # Output heads with Route Guidance
         # TrajectoryHead now receives route features for guidance
         self.trajectory_head = TrajectoryMLPHead(n_emb, output_dim, p_drop_emb, num_heads=n_head)
-        # RouteHead with conditioning support
-        self.route_head = RouteMLPHead(n_emb, output_dim=2, p_drop=p_drop_emb)
+        # RouteHead with independent conditioning support (key for closed-loop stability)
+        self.route_head = RouteMLPHead(n_emb, status_dim=status_dim, output_dim=2, p_drop=p_drop_emb)
         
         self.apply(self._init_weights)
         
@@ -1176,6 +1380,22 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 no_decay.add(name)
             elif 'inv_freq' in name:
                 # inv_freq is a buffer, should not be in param_dict, but handle if exists
+                no_decay.add(name)
+            # ========== New parameters for stability enhancement ==========
+            elif '_residual_gate' in name or '_residual_query' in name:
+                # Residual gates and queries - no weight decay (like other gate params)
+                no_decay.add(name)
+            elif '_pos_scale' in name:
+                # Position scaling parameters - no weight decay
+                no_decay.add(name)
+            elif 'summary_query' in name:
+                # History encoder summary query - no weight decay
+                no_decay.add(name)
+            elif 'guidance_gate' in name:
+                # Route guidance gate - no weight decay
+                no_decay.add(name)
+            elif 'route_temp_' in name or 'route_bias_' in name:
+                # Route-specific temperature and bias parameters - no weight decay
                 no_decay.add(name)
         
         inter_params = decay & no_decay
@@ -1257,8 +1477,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # 3. GRU-encoded global history for AdaLN
         hist_global_emb = self.history_encoder(ego_status)  # (B, n_emb)
         
-        # Combined conditioning for AdaLN modulation
+        # Combined conditioning for trajectory AdaLN modulation
         conditioning = time_emb + status_emb + hist_global_emb
+        
+        # 4. Route-specific conditioning (independent pathway for stability)
+        # Uses separate status projection + shared time embedding
+        route_status_emb = self.route_status_proj(current_status)
+        route_conditioning = time_emb + route_status_emb + hist_global_emb
         
         # ========== Trajectory Query Embedding ==========
         traj_emb = self.input_emb(sample)  # (B, T_traj, n_emb)
@@ -1276,15 +1501,18 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # - Trajectory can see: trajectory + route (route guides trajectory)
         # - Route can only see: route (independent planning)
         # Cross-attention order: BEV -> VL -> Reasoning
+        # Route-specific processing: independent Q adapters, temperature/bias, AdaLN
         traj_out, route_out = self.decoder(
             traj_emb,
             bev_tokens, vl_tokens, reasoning_tokens, conditioning,
-            bev_padding_mask, vl_padding_mask, reasoning_padding_mask
+            bev_padding_mask, vl_padding_mask, reasoning_padding_mask,
+            route_conditioning=route_conditioning,
         )
         
         # ========== Output Heads ==========
         # Route head processes first (no dependency on trajectory)
-        route_pred = self.route_head(route_out, conditioning)
+        # Pass current_status for route-specific conditioning (key for stability)
+        route_pred = self.route_head(route_out, conditioning, ego_status=current_status)
         
         # Trajectory head with Route Guidance (attends to route features)
         trajectory = self.trajectory_head(traj_out, conditioning, route_features=route_out)
@@ -1392,13 +1620,26 @@ def test():
     print("     - Reasoning: attention pooling with learnable query")
     print("     - Gated addition bypasses competitive softmax")
     print("     - Ensures each modality contributes information")
+    print("\n  6. Route-Specific Components (NEW - Stability Enhancement):")
+    print("     - Route-specific Q adapters for cross-attention")
+    print("     - Route-specific temperature & bias for attention")
+    print("     - Route-specific AdaLN modulation")
+    print("     - Route-specific conditioning pathway")
+    print("     - Route residual path (bypasses shared decoder)")
+    print("     - Final AdaLN in RouteMLPHead")
     print("\nInformation Flow:")
     print("  Main path: fused softmax over all sources (competitive)")
     print("  Residual: direct paths from each source (guaranteed)")
     print("  Route: env context → route planning (independent)")
     print("  Trajectory: env context + route guidance → trajectory")
+    print("\nRoute Stability Design:")
+    print("  - Independent Q adapters: route learns different attention")
+    print("  - Independent AdaLN: route has separate modulation")
+    print("  - Independent conditioning: route_status_proj + time_emb")
+    print("  - Residual path: stable baseline from initial queries")
+    print("  - Final AdaLN: fine-grained output control")
     print("\nOutput Heads:")
-    print("  - RouteMLPHead: with conditioning support")
+    print("  - RouteMLPHead: with independent conditioning + final AdaLN")
     print("  - TrajectoryMLPHead: with route guidance + conditioning")
     print("=" * 60)
 
