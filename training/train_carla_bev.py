@@ -172,10 +172,11 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 val_metrics['loss'].append(loss.item())
                 
                 obs_dict = {
-                    'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
-                    'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
+                    'transfuser_bev_feature': batch['transfuser_bev_feature'],
+                    'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
+                    'transfuser_fused_features': batch['transfuser_fused_features'],
+                    'transfuser_image_feature_grid': batch['transfuser_image_feature_grid'],
                     'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
-                    'gen_vit_tokens': batch['gen_vit_tokens'],
                     'reasoning_query_tokens': batch['reasoning_query_tokens'],
                     'anchor': batch['anchor']  # Pass anchor for truncated diffusion
                 }

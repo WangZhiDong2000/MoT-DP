@@ -7,8 +7,6 @@ import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from model.transformer_for_diffusion_multi_head import TransformerForDiffusion
-from model.interfuser_bev_encoder import InterfuserBEVEncoder
-from model.interfuser_bev_encoder import load_lidar_submodules
 import os
 
 
@@ -48,32 +46,21 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
         
-        # Load BEV encoder configuration from config file
-        bev_encoder_cfg = config.get('bev_encoder', {})
-        obs_encoder = InterfuserBEVEncoder(
-            perception_backbone=None,
-            freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
-            bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
-        )
-        
-        # Load pretrained weights from config
-        pretrained_path = bev_encoder_cfg.get('pretrained_path', None)
-        if pretrained_path is not None and os.path.exists(pretrained_path):
-            load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
-            print(f"✓ BEV encoder loaded from: {pretrained_path}")
-        else:
-            print(f"⚠ BEV encoder pretrained_path not found or not specified: {pretrained_path}")
-            print("  Continuing with random initialization...")
-        
-        self.obs_encoder = obs_encoder
+        # Transfuser feature dimensions (based on backbone output)
+        # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
+        # fused_features: (1512, 8, 8), image_feature_grid: (1512, 12, 32)
+        transfuser_cfg = config.get('transfuser_encoder', {})
+        self.bev_feature_dim = transfuser_cfg.get('bev_feature_dim', 1512)
+        self.bev_feature_upsample_dim = transfuser_cfg.get('bev_feature_upsample_dim', 64)
+        self.image_feature_grid_dim = transfuser_cfg.get('image_feature_grid_dim', 1512)
 
         vlm_feature_dim = 2560  # 隐藏层维度
         self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
 
         obs_feature_dim = 256  
 
-        # Get status_dim from bev_encoder config
-        status_dim = bev_encoder_cfg.get('state_dim', 15)
+        # Get status_dim from config
+        status_dim = config.get('bev_encoder', {}).get('state_dim', 15)
         
         # Get ego_status_seq_len from policy config (defaults to n_obs_steps)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
@@ -98,8 +85,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             n_cond_layers=policy_cfg.get('n_cond_layers', 4),
             status_dim=status_dim,
             ego_status_seq_len=ego_status_seq_len,
-            bev_dim=512,  # BEV token dimension from InterfuserBEVEncoder
-            state_token_dim=128,  # State token dimension from InterfuserBEVEncoder
+            # Transfuser feature dimensions (from transfuser backbone)
+            # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
+            # fused_features: (1512, 8, 8), image_feature_grid: (1512, 12, 32)
+            transfuser_bev_dim=self.bev_feature_dim,
+            transfuser_bev_upsample_dim=self.bev_feature_upsample_dim,
+            transfuser_image_dim=self.image_feature_grid_dim,
             num_waypoints=num_waypoints,  # Number of route waypoints
         )
 
@@ -330,58 +321,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         return noisy_sample
 
-
-
-    
-
-    def extract_bev_state_tokens(self, obs_dict):
-        """
-        使用InterfuserBEVEncoder提取BEV tokens (Decoder-Only架构)
-        
-        支持两种模式：
-        1. 使用预处理好的BEV特征（推荐，快速）
-        2. 使用原始lidar_bev图像（兼容模式，慢）
-        
-        Args:
-            obs_dict: 观测字典，应包含：
-                - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
-                - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
-                - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                
-        Returns:
-            bev_tokens: (B, seq_len+1, 512) - BEV空间tokens + global token
-        """
-        try:
-            device = next(self.parameters()).device
-            model_dtype = next(self.parameters()).dtype
-            
-            use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
-            
-            if use_precomputed:
-                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=model_dtype)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=model_dtype)
-                
-                bev_tokens = self.obs_encoder(
-                    lidar_token=lidar_token,
-                    lidar_token_global=lidar_token_global,
-                )
-            else:
-                if 'lidar_bev' not in obs_dict:
-                    raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
-                
-                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=model_dtype)
-                
-                bev_tokens = self.obs_encoder(
-                    image=lidar_bev_img,
-                )
-            
-            return bev_tokens
-                
-        except KeyError as e:
-            raise KeyError(f"Missing required field in obs_dict for BEV token extraction: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Error in BEV feature extraction: {e}")
-
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Forward method for DDP compatibility.
@@ -394,10 +333,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
-            # BEV特征（二选一）
-            'lidar_token': (B, obs_horizon, seq_len, 512) - 预处理的空间特征（推荐）
-            'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征（推荐）
-            'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
+            # Transfuser features (single frame, no temporal)
+            'transfuser_bev_feature': (B, 1512, 8, 8) - BEV feature
+            'transfuser_bev_feature_upsample': (B, 64, 64, 64) - Upscaled BEV feature
+            'transfuser_fused_features': (B, 1512, 8, 8) - Fused camera-lidar features
+            'transfuser_image_feature_grid': (B, 1512, 12, 32) - Image feature grid
             
             'agent_pos': (B, horizon, 2) - 未来轨迹点
             'ego_status': (B, obs_horizon, state_dim) - 车辆状态
@@ -407,15 +347,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
-        nobs = {}
-        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 'reasoning_query_tokens', 'gen_vit_tokens', 'anchor', 'route']
-        
-        for field in required_fields:
-            if field in batch:
-                if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
-                    nobs[field] = batch[field].to(device=device, dtype=model_dtype)
-                else:
-                    nobs[field] = batch[field].to(device)
 
         raw_agent_pos = batch['agent_pos'].to(device)
 
@@ -437,32 +368,28 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
-        # Extract BEV tokens (Decoder-Only架构)
-        # Flatten temporal dimension for feature extraction
-        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        bev_tokens = self.extract_bev_state_tokens(batch_nobs)
-        
-        # Use only the last timestep's features
-        # bev_tokens: (B*To, seq_len+1, 512) -> use last timestep
-        bev_tokens = bev_tokens.reshape(batch_size, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
+        # Load transfuser features (single frame, no temporal)
+        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        transfuser_fused_features = batch['transfuser_fused_features'].to(device=device, dtype=model_dtype)
+        transfuser_image_feature_grid = batch['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
 
-        # Prepare VL tokens
-        gen_vit_tokens = batch['gen_vit_tokens']
+        # Prepare reasoning tokens
         reasoning_query_tokens = batch['reasoning_query_tokens']
-        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=model_dtype)
-        gen_vit_tokens = self.feature_encoder(gen_vit_tokens)
         reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)
         reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)
         
         # Get ego_status
-        ego_status = nobs['ego_status'].to(dtype=model_dtype)
+        ego_status = batch['ego_status'].to(device=device, dtype=model_dtype)
 
         # ========== Compute Loss (Truncated Diffusion DiffusionDriveV2 style) ==========
         loss = self._compute_truncated_diffusion_loss(
             trajectory=trajectory,
             anchor=anchor,
-            bev_tokens=bev_tokens,
-            gen_vit_tokens=gen_vit_tokens,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            transfuser_fused_features=transfuser_fused_features,
+            transfuser_image_feature_grid=transfuser_image_feature_grid,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
             route_gt=route_gt,
@@ -476,8 +403,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self,
         trajectory: torch.Tensor,
         anchor: torch.Tensor,
-        bev_tokens: torch.Tensor,
-        gen_vit_tokens: torch.Tensor,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        transfuser_fused_features: torch.Tensor,
+        transfuser_image_feature_grid: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         device: torch.device,
@@ -494,8 +423,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Args:
             trajectory: (B, horizon, 2) - ground truth trajectory
             anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
-            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens from encoder
-            gen_vit_tokens: (B, seq_len, dim) - VIT tokens
+            transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
+            transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
+            transfuser_fused_features: (B, 1512, 8, 8) - Fused camera-lidar features
+            transfuser_image_feature_grid: (B, 1512, 12, 32) - Image feature grid
             reasoning_query_tokens: (B, seq_len, dim) - reasoning tokens
             ego_status: (B, To, status_dim) - ego vehicle status
             device: torch device
@@ -536,8 +467,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             sample=noisy_trajectory_denorm,
             timestep=timesteps,
             cond=cond,  # For API compatibility
-            bev_tokens=bev_tokens,
-            gen_vit_tokens=gen_vit_tokens,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            transfuser_fused_features=transfuser_fused_features,
+            transfuser_image_feature_grid=transfuser_image_feature_grid,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status
         )
@@ -566,8 +499,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         return total_loss
 
     def conditional_sample(self, 
-            bev_tokens: torch.Tensor,
-            gen_vit_tokens: torch.Tensor,
+            transfuser_bev_feature: torch.Tensor,
+            transfuser_bev_feature_upsample: torch.Tensor,
+            transfuser_fused_features: torch.Tensor,
+            transfuser_image_feature_grid: torch.Tensor,
             reasoning_query_tokens: torch.Tensor,
             ego_status: torch.Tensor,
             anchor: torch.Tensor,
@@ -580,8 +515,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Generate trajectory samples using truncated diffusion (DiffusionDriveV2 style).
         
         Args:
-            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens
-            gen_vit_tokens: (B, seq_len, 1536) - VL tokens
+            transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
+            transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
+            transfuser_fused_features: (B, 1512, 8, 8) - Fused camera-lidar features
+            transfuser_image_feature_grid: (B, 1512, 12, 32) - Image feature grid
             reasoning_query_tokens: (B, seq_len, 1536) - reasoning tokens
             ego_status: (B, To, status_dim) - ego status history
             anchor: (B, T, 2) - anchor trajectory
@@ -591,9 +528,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         result = self._truncated_diffusion_sample(
             anchor=anchor,
-            bev_tokens=bev_tokens,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            transfuser_fused_features=transfuser_fused_features,
+            transfuser_image_feature_grid=transfuser_image_feature_grid,
             ego_status=ego_status,
-            gen_vit_tokens=gen_vit_tokens,
             reasoning_query_tokens=reasoning_query_tokens,
             device=device,
             model_dtype=model_dtype,
@@ -605,9 +544,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def _truncated_diffusion_sample(
         self,
         anchor: torch.Tensor,
-        bev_tokens: torch.Tensor,
+        transfuser_bev_feature: torch.Tensor,
+        transfuser_bev_feature_upsample: torch.Tensor,
+        transfuser_fused_features: torch.Tensor,
+        transfuser_image_feature_grid: torch.Tensor,
         ego_status: torch.Tensor,
-        gen_vit_tokens: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         device: torch.device,
         model_dtype: torch.dtype,
@@ -670,8 +611,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 sample=noisy_traj_points.to(dtype=model_dtype),
                 timestep=timesteps,
                 cond=cond,
-                bev_tokens=bev_tokens,
-                gen_vit_tokens=gen_vit_tokens,
+                transfuser_bev_feature=transfuser_bev_feature,
+                transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+                transfuser_fused_features=transfuser_fused_features,
+                transfuser_image_feature_grid=transfuser_image_feature_grid,
                 reasoning_query_tokens=reasoning_query_tokens,
                 ego_status=ego_status,
             )
@@ -700,25 +643,19 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
-        B, To = value.shape[:2]
+        B = value.shape[0]
         T = self.horizon
         Da = self.action_dim
         To = self.n_obs_steps
 
-        # Extract BEV tokens
-        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        bev_tokens = self.extract_bev_state_tokens(batch_nobs)
-        
-        # Use only the last timestep's features
-        bev_tokens = bev_tokens.reshape(B, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
+        # Load transfuser features (single frame, no temporal)
+        transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+        transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+        transfuser_fused_features = nobs['transfuser_fused_features'].to(device=device, dtype=model_dtype)
+        transfuser_image_feature_grid = nobs['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
 
-        # Process VL tokens
-        gen_vit_tokens = nobs['gen_vit_tokens']
+        # Process reasoning tokens
         reasoning_query_tokens = nobs['reasoning_query_tokens']
-        
-        gen_vit_tokens = gen_vit_tokens.to(device=device, dtype=model_dtype)
-        gen_vit_tokens = self.feature_encoder(gen_vit_tokens)
-        
         reasoning_query_tokens = reasoning_query_tokens.to(device=device, dtype=model_dtype)
         reasoning_query_tokens = self.feature_encoder(reasoning_query_tokens)
         
@@ -737,8 +674,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         # Generate samples using truncated diffusion
         nsample, route_pred = self.conditional_sample(
-            bev_tokens=bev_tokens,
-            gen_vit_tokens=gen_vit_tokens,
+            transfuser_bev_feature=transfuser_bev_feature,
+            transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
+            transfuser_fused_features=transfuser_fused_features,
+            transfuser_image_feature_grid=transfuser_image_feature_grid,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
             anchor=anchor,

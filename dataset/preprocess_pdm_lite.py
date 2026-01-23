@@ -554,33 +554,31 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                     
             frame_data['rgb_hist_jpg'] = rgb_hist
             
-            # --- Lidar BEV History ---
-            lidar_bev_dir = join(folder_path, 'lidar_bev')
-            lidar_bev_hist = []
-            if os.path.exists(lidar_bev_dir):
-                for j in range(obs_start_idx, ii + 1, hz_interval):
-                    if j < 0: continue
-                    bev_path = join(lidar_bev_dir, f"{j:04d}.png")
-                    if STORE_BYTES:
-                        try:
-                            with open(bev_path, 'rb') as f:
-                                lidar_bev_hist.append(f.read())
-                        except FileNotFoundError:
-                            lidar_bev_hist.append(b"")
-                    else:
-                        if os.path.exists(bev_path):
-                            lidar_bev_hist.append(join(folder_name, 'lidar_bev', f"{j:04d}.png"))
-                        else:
-                            lidar_bev_hist.append(None) # Mark missing BEV image
+            # --- Transfuser Features (single frame, no temporal) ---
+            # Load four features: bev_feature, bev_feature_upsample, fused_features, image_feature_grid
+            transfuser_feature_dir = join(folder_path, 'transfuser_feature')
+            
+            if os.path.exists(transfuser_feature_dir):
+                # Check if all four feature files exist for current frame
+                bev_feature_file = join(transfuser_feature_dir, f"{ii:04d}_feature.pt")
+                bev_feature_upsample_file = join(transfuser_feature_dir, f"{ii:04d}_feature_upsample.pt")
+                fused_features_file = join(transfuser_feature_dir, f"{ii:04d}_fused_features.pt")
+                image_feature_grid_file = join(transfuser_feature_dir, f"{ii:04d}_image_feature_grid.pt")
                 
-                # Skip this sample if we don't have enough history frames (no padding allowed)
-                if len(lidar_bev_hist) < obs_horizon:
+                if all(os.path.exists(f) for f in [bev_feature_file, bev_feature_upsample_file, 
+                                                    fused_features_file, image_feature_grid_file]):
+                    # Store relative paths for lazy loading
+                    frame_data['transfuser_bev_feature'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_feature.pt")
+                    frame_data['transfuser_bev_feature_upsample'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_feature_upsample.pt")
+                    frame_data['transfuser_fused_features'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_fused_features.pt")
+                    frame_data['transfuser_image_feature_grid'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_image_feature_grid.pt")
+                else:
+                    # Skip this sample if any transfuser feature is missing
                     continue
             else:
-                # If lidar_bev directory doesn't exist, fill with None
-                lidar_bev_hist = [None] * obs_horizon
-                
-            frame_data['lidar_bev_hist'] = lidar_bev_hist
+                # Skip this sample if transfuser_feature directory doesn't exist
+                print(f"Warning: transfuser_feature directory not found in {folder_name}, skipping frame {ii}...")
+                continue
 
             # --- VQA Features (dp_vl_feature) ---
             # Load only the current frame's corresponding .pt file (no history)

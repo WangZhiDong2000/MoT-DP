@@ -77,38 +77,28 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             image_paths = sample.get('rgb_hist_jpg', [])
             images_tensor = self.load_image(image_paths, sample_path)
 
-
-        # Load LiDAR BEV features
-        lidar_bev_paths = sample.get('lidar_bev_hist', [])
-        if self.mode == 'val':
-            lidar_bev_tensor = self.load_lidar_bev(lidar_bev_paths, sample_path)
+        # --- Load Transfuser Features (single frame, no temporal) ---
+        # Four features: bev_feature, bev_feature_upsample, fused_features, image_feature_grid
+        transfuser_bev_feature = None
+        transfuser_bev_feature_upsample = None
+        transfuser_fused_features = None
+        transfuser_image_feature_grid = None
         
-        lidar_tokens = []
-        lidar_tokens_global = []
-        for bev_path in lidar_bev_paths:
-            if bev_path is None:
-                continue
-            
-            # Infer feature paths from BEV image paths
-            # Example: Town01/data/Route_0/lidar_bev/0000.png 
-            #       -> Town01/data/Route_0/lidar_bev_features/0000_token.pt
-            bev_dir = os.path.dirname(bev_path)
-            frame_id = os.path.splitext(os.path.basename(bev_path))[0]
-            feature_dir = bev_dir.replace('lidar_bev', 'lidar_bev_features')
-                
-            token_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token.pt')
-            token_global_path = os.path.join(self.image_data_root, feature_dir, f'{frame_id}_token_global.pt')
-
-            lidar_token = torch.load(token_path, weights_only=True)
-            lidar_token_global = torch.load(token_global_path, weights_only=True)
-            lidar_tokens.append(lidar_token)
-            lidar_tokens_global.append(lidar_token_global)
+        if 'transfuser_bev_feature' in sample:
+            bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
+            transfuser_bev_feature = torch.load(bev_feature_path, weights_only=True).squeeze(0)  # Remove batch dim
         
-
-        lidar_token_tensor = torch.stack(lidar_tokens)  # (obs_horizon, seq_len, 512)
-        lidar_token_global_tensor = torch.stack(lidar_tokens_global)  # (obs_horizon, 1, 512)
-        lidar_tokens.clear()  # Clear list to release references
-        lidar_tokens_global.clear()  # Clear list to release references
+        if 'transfuser_bev_feature_upsample' in sample:
+            bev_feature_upsample_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature_upsample'])
+            transfuser_bev_feature_upsample = torch.load(bev_feature_upsample_path, weights_only=True).squeeze(0)
+        
+        if 'transfuser_fused_features' in sample:
+            fused_features_path = os.path.join(self.image_data_root, sample['transfuser_fused_features'])
+            transfuser_fused_features = torch.load(fused_features_path, weights_only=True).squeeze(0)
+        
+        if 'transfuser_image_feature_grid' in sample:
+            image_feature_grid_path = os.path.join(self.image_data_root, sample['transfuser_image_feature_grid'])
+            transfuser_image_feature_grid = torch.load(image_feature_grid_path, weights_only=True).squeeze(0)
         
         # Load VQA feature from pt file
         vqa_path = sample.get('vqa', None)
@@ -123,13 +113,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             if key == 'rgb_hist_jpg' and self.mode == 'val':
                 final_sample['rgb_hist_jpg'] = image_paths  
                 final_sample['image'] = images_tensor
-            elif key == 'lidar_bev_hist':
-                if self.mode == 'val':
-                    final_sample['lidar_bev'] = lidar_bev_tensor
-                    final_sample['lidar_bev_hist'] = lidar_bev_paths
-                if lidar_token_tensor is not None:
-                    final_sample['lidar_token'] = lidar_token_tensor
-                    final_sample['lidar_token_global'] = lidar_token_global_tensor
             elif key == 'speed_hist':
                 speed_data = sample['speed_hist']
                 final_sample['speed'] = torch.from_numpy(speed_data).float()
@@ -137,9 +120,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 ego_waypoints = torch.from_numpy(sample['ego_waypoints'][1:]).float()
                 final_sample['agent_pos'] = ego_waypoints
             elif key == 'vqa':
-                # Load dp_vit_feat as gen_vit_tokens
-                final_sample['gen_vit_tokens'] = vqa_feature['dp_vit_feat']
-                
                 # Load pred_traj as anchor
                 anchor = vqa_feature['pred_traj']
                 # Remove extra batch dimension if present: (1, T, 2) -> (T, 2)
@@ -151,15 +131,27 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 reasoning_feat = vqa_feature['reasoning_feat']  # shape: (8, 2560)
                 # Take first 7 tokens
                 final_sample['reasoning_query_tokens'] = reasoning_feat[:7]  # shape: (7, 2560)
-
             elif key == 'route':
                 # Load route waypoints (expected shape: (20, 2))
                 route_data = torch.from_numpy(value).float()
                 final_sample['route'] = route_data
+            elif key.startswith('transfuser_'):
+                # Skip transfuser paths, we already loaded them as tensors
+                continue
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
                 final_sample[key] = value
+
+        # Add transfuser features to final_sample
+        if transfuser_bev_feature is not None:
+            final_sample['transfuser_bev_feature'] = transfuser_bev_feature
+        if transfuser_bev_feature_upsample is not None:
+            final_sample['transfuser_bev_feature_upsample'] = transfuser_bev_feature_upsample
+        if transfuser_fused_features is not None:
+            final_sample['transfuser_fused_features'] = transfuser_fused_features
+        if transfuser_image_feature_grid is not None:
+            final_sample['transfuser_image_feature_grid'] = transfuser_image_feature_grid
 
         # Build ego_status: concatenate historical low-dimensional states
         # Order: speed_hist, theta_hist, command_hist, waypoints_hist
