@@ -248,6 +248,31 @@ class MultiSourceAttentionBlock(nn.Module):
         self.bias_vl = nn.Parameter(torch.zeros(1))
         self.bias_reason = nn.Parameter(torch.zeros(1))
         
+        # ========== Source-Specific Residual Paths ==========
+        # These provide direct information flow from each source, bypassing the competitive softmax
+        # Each path: pool source -> project -> gate -> add to output
+        # This ensures each modality can contribute even if softmax suppresses it
+        
+        # BEV residual path: spatial average pooling + projection
+        self.bev_residual_proj = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, d_model),
+        )
+        self.bev_residual_gate = nn.Parameter(torch.zeros(1))
+        
+        # VL residual path: attention pooling (query-based)
+        self.vl_residual_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.vl_residual_attn = nn.MultiheadAttention(d_model, num_heads=4, dropout=dropout, batch_first=True)
+        self.vl_residual_proj = nn.Linear(d_model, d_model)
+        self.vl_residual_gate = nn.Parameter(torch.zeros(1))
+        
+        # Reasoning residual path: attention pooling (query-based)
+        self.reason_residual_query = nn.Parameter(torch.randn(1, 1, d_model))
+        self.reason_residual_attn = nn.MultiheadAttention(d_model, num_heads=4, dropout=dropout, batch_first=True)
+        self.reason_residual_proj = nn.Linear(d_model, d_model)
+        self.reason_residual_gate = nn.Parameter(torch.zeros(1))
+        
         # ========== FFN ==========
         self.ffn = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -465,6 +490,38 @@ class MultiSourceAttentionBlock(nn.Module):
         output = output.transpose(1, 2).contiguous().view(B, T, C)
         output = self.o_proj(output)
         
+        # ========== Source-Specific Residual Paths ==========
+        # These bypass the competitive softmax to ensure each modality contributes
+        
+        # BEV residual: spatial average pooling -> broadcast to all query positions
+        bev_gate = torch.sigmoid(self.bev_residual_gate)
+        bev_pooled = bev_tokens.mean(dim=1, keepdim=True)  # (B, 1, d_model)
+        bev_residual = self.bev_residual_proj(bev_pooled)  # (B, 1, d_model)
+        bev_residual = bev_residual.expand(-1, T, -1)  # (B, T, d_model)
+        
+        # VL residual: attention pooling with learnable query
+        vl_gate = torch.sigmoid(self.vl_residual_gate)
+        vl_query = self.vl_residual_query.expand(B, -1, -1)  # (B, 1, d_model)
+        vl_pooled, _ = self.vl_residual_attn(
+            query=vl_query, key=vl_tokens, value=vl_tokens,
+            key_padding_mask=vl_padding_mask
+        )  # (B, 1, d_model)
+        vl_residual = self.vl_residual_proj(vl_pooled)  # (B, 1, d_model)
+        vl_residual = vl_residual.expand(-1, T, -1)  # (B, T, d_model)
+        
+        # Reasoning residual: attention pooling with learnable query
+        reason_gate = torch.sigmoid(self.reason_residual_gate)
+        reason_query = self.reason_residual_query.expand(B, -1, -1)  # (B, 1, d_model)
+        reason_pooled, _ = self.reason_residual_attn(
+            query=reason_query, key=reasoning_tokens, value=reasoning_tokens,
+            key_padding_mask=reasoning_padding_mask
+        )  # (B, 1, d_model)
+        reason_residual = self.reason_residual_proj(reason_pooled)  # (B, 1, d_model)
+        reason_residual = reason_residual.expand(-1, T, -1)  # (B, T, d_model)
+        
+        # Combine main output with residual paths
+        output = output + bev_gate * bev_residual + vl_gate * vl_residual + reason_gate * reason_residual
+        
         # ========== Residual with gate ==========
         x = x + gate_attn.unsqueeze(1) * output
         
@@ -508,35 +565,109 @@ class ModuleAttrMixin(nn.Module):
 
 
 # =============================================================================
-# History Encoder
+# History Encoder with Attention
 # =============================================================================
 
 class HistoryEncoder(nn.Module):
-    """Encodes the history sequence of ego status into a single vector using GRU."""
-    def __init__(self, input_dim, hidden_dim, num_layers=1):
+    """
+    Encodes the history sequence of ego status with GRU + Temporal Attention.
+    
+    Improvements over simple GRU:
+    1. GRU captures sequential dependencies
+    2. Temporal attention allows focusing on important history frames
+    3. Combines global (GRU hidden) and selective (attention) information
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int = 1, num_heads: int = 4):
         super().__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.act = nn.SiLU()
-
-    def forward(self, x):
-        _, h_n = self.gru(x)
-        h = h_n[-1]
-        return self.out_proj(self.act(h))
+        self.hidden_dim = hidden_dim
+        
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        
+        # GRU for sequential encoding
+        self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        
+        # Temporal attention: last frame queries all history
+        self.temporal_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.attn_norm = nn.LayerNorm(hidden_dim)
+        
+        # Learnable query for global summary (alternative to using last frame)
+        self.summary_query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        
+        # Combine GRU hidden state and attention output
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, input_dim) - history sequence of ego status
+        Returns:
+            (B, hidden_dim) - encoded history representation
+        """
+        B, T, _ = x.shape
+        
+        # Project input
+        x = self.input_proj(x)  # (B, T, hidden_dim)
+        
+        # GRU encoding
+        gru_out, h_n = self.gru(x)  # gru_out: (B, T, hidden_dim), h_n: (1, B, hidden_dim)
+        gru_hidden = h_n[-1]  # (B, hidden_dim) - global sequential summary
+        
+        # Temporal attention: summary query attends to all GRU outputs
+        query = self.summary_query.expand(B, -1, -1)  # (B, 1, hidden_dim)
+        attn_out, _ = self.temporal_attn(
+            query=query,
+            key=gru_out,
+            value=gru_out
+        )  # (B, 1, hidden_dim)
+        attn_out = self.attn_norm(attn_out).squeeze(1)  # (B, hidden_dim)
+        
+        # Fuse GRU hidden and attention output
+        combined = torch.cat([gru_hidden, attn_out], dim=-1)  # (B, hidden_dim * 2)
+        output = self.fusion(combined)  # (B, hidden_dim)
+        
+        return output
 
 
 # =============================================================================
-# Trajectory Head (MLP version)
+# Trajectory Head with Route Guidance
 # =============================================================================
 
 class TrajectoryMLPHead(nn.Module):
     """
-    MLP-based Trajectory Head for decoding trajectory.
-    Replaces GRU with simple MLP layers.
+    MLP-based Trajectory Head with Route-to-Trajectory Guidance.
+    
+    Key features:
+    1. Cross-attention from trajectory to route features (Route Guidance)
+    2. Conditioning injection from timestep + ego_status
+    3. MLP processing for final output
+    
+    This allows trajectory prediction to explicitly attend to and be guided by
+    the planned route, improving trajectory-route consistency.
     """
-    def __init__(self, n_emb: int, output_dim: int, p_drop: float = 0.1):
+    def __init__(self, n_emb: int, output_dim: int, p_drop: float = 0.1, num_heads: int = 8):
         super().__init__()
+        self.n_emb = n_emb
         self.ln_f = nn.LayerNorm(n_emb)
+        
+        # Route Guidance: trajectory attends to route
+        self.route_guidance_attn = nn.MultiheadAttention(
+            embed_dim=n_emb,
+            num_heads=num_heads,
+            dropout=p_drop,
+            batch_first=True
+        )
+        self.route_guidance_norm = nn.LayerNorm(n_emb)
+        self.route_guidance_gate = nn.Parameter(torch.zeros(1))  # Learnable gate
         
         # MLP layers with conditioning
         self.mlp = nn.Sequential(
@@ -557,17 +688,85 @@ class TrajectoryMLPHead(nn.Module):
         # Output projection
         self.output_head = nn.Linear(n_emb, output_dim)
 
-    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, conditioning: torch.Tensor, 
+                route_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            x: (B, T, n_emb) - decoder output
+            x: (B, T_traj, n_emb) - trajectory decoder output
             conditioning: (B, n_emb) - timestep + ego_status conditioning
+            route_features: (B, T_route, n_emb) - route decoder output for guidance
         Returns:
-            (B, T, output_dim) - trajectory prediction
+            (B, T_traj, output_dim) - trajectory prediction
         """
         x = self.ln_f(x)
         
+        # Route Guidance: trajectory attends to route features
+        if route_features is not None:
+            gate = torch.sigmoid(self.route_guidance_gate)
+            route_guided, _ = self.route_guidance_attn(
+                query=x,
+                key=route_features,
+                value=route_features
+            )
+            route_guided = self.route_guidance_norm(route_guided)
+            x = x + gate * route_guided  # Gated residual connection
+        
         # Add conditioning as bias
+        cond = self.cond_proj(conditioning).unsqueeze(1)  # (B, 1, n_emb)
+        x = x + cond
+        
+        # MLP processing
+        x = x + self.mlp(x)
+        
+        # Output projection
+        return self.output_head(x)
+
+
+# =============================================================================
+# Route Head with Conditioning
+# =============================================================================
+
+class RouteMLPHead(nn.Module):
+    """
+    MLP-based Route Head with conditioning support.
+    
+    Unlike trajectory, route does not need to attend to trajectory (unidirectional).
+    But it benefits from conditioning (timestep + ego_status).
+    """
+    def __init__(self, n_emb: int, output_dim: int = 2, p_drop: float = 0.1):
+        super().__init__()
+        self.ln_f = nn.LayerNorm(n_emb)
+        
+        # Conditioning projection
+        self.cond_proj = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.SiLU(),
+        )
+        
+        # MLP layers
+        self.mlp = nn.Sequential(
+            nn.Linear(n_emb, n_emb),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+            nn.Linear(n_emb, n_emb),
+            nn.GELU(),
+            nn.Dropout(p_drop),
+        )
+        
+        # Output projection
+        self.output_head = nn.Linear(n_emb, output_dim)
+    
+    def forward(self, x: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T_route, n_emb) - route decoder output
+            conditioning: (B, n_emb) - timestep + ego_status conditioning
+        Returns:
+            (B, T_route, output_dim) - route prediction (waypoints)
+        """
+        x = self.ln_f(x)
+        
+        # Add conditioning
         cond = self.cond_proj(conditioning).unsqueeze(1)  # (B, 1, n_emb)
         x = x + cond
         
@@ -588,17 +787,23 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
     
     Combines trajectory prediction (horizon points) and route prediction (20 waypoints)
     into a single decoder, using:
+    - Unified sinusoidal position encoding for both trajectory and route
     - Segment embeddings to distinguish query types (trajectory vs route)
-    - Multi-source attention with RoPE and gating (MLPResNetBlock_Pro style)
+    - Multi-source attention with RoPE and gating
     - Separate output heads for trajectory and route
     
     Query structure: [trajectory (horizon) | route (num_waypoints)]
+    
+    Position Encoding Design:
+    - Both trajectory and route share the same sinusoidal position encoding scheme
+    - Trajectory positions: 0, 1, 2, ... (horizon-1) representing future time steps
+    - Route positions: 0, 1, 2, ... (num_waypoints-1) representing spatial waypoints
+    - Segment embeddings differentiate the two modalities
+    
     Cross-attention sources: All fused in single attention operation with:
         - Self-attention with RoPE on Q and K
         - Adapter cross-attention (bev, vl) with RoPE on K only
         - Task cross-attention (reasoning) with RoPE on K only + gating
-    
-    Note: hist_status removed - ego_status history is now only used for AdaLN conditioning.
     """
     def __init__(
         self,
@@ -612,6 +817,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         reasoning_dim: int = 1536,
         horizon: int = 8,
         num_waypoints: int = 20,
+        max_seq_len: int = 64,  # Max length for unified position encoding
     ):
         super().__init__()
         self.d_model = d_model
@@ -630,10 +836,20 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         # Route queries (learnable)
         self.route_queries = nn.Parameter(torch.randn(1, num_waypoints, d_model))
         
-        # Position embeddings for queries
-        self.route_pos_emb = nn.Parameter(torch.zeros(1, num_waypoints, d_model))
+        # ========== Unified Position Encoding ==========
+        # Sinusoidal position encoding shared by trajectory and route
+        # This provides a consistent spatial/temporal representation
+        self.register_buffer(
+            "unified_pos_encoding",
+            self._create_sinusoidal_pos_encoding(max_seq_len, d_model)
+        )
         
-        # Segment embeddings to distinguish query types
+        # Learnable position scaling for each modality
+        # Allows the model to learn different position importance
+        self.traj_pos_scale = nn.Parameter(torch.ones(1, 1, d_model))
+        self.route_pos_scale = nn.Parameter(torch.ones(1, 1, d_model))
+        
+        # Segment embeddings to distinguish query types (trajectory vs route)
         self.traj_segment_emb = nn.Parameter(torch.zeros(1, 1, d_model))
         self.route_segment_emb = nn.Parameter(torch.zeros(1, 1, d_model))
         
@@ -646,23 +862,55 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
         self._init_weights()
     
+    def _create_sinusoidal_pos_encoding(self, max_len: int, d_model: int) -> torch.Tensor:
+        """
+        Create sinusoidal position encoding.
+        
+        Args:
+            max_len: Maximum sequence length
+            d_model: Model dimension
+            
+        Returns:
+            pos_encoding: (1, max_len, d_model) position encoding tensor
+        """
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return pe.unsqueeze(0)  # (1, max_len, d_model)
+    
     def _init_weights(self):
         nn.init.normal_(self.bev_pos_emb, mean=0.0, std=0.02)
         nn.init.normal_(self.route_queries, mean=0.0, std=0.02)
-        nn.init.normal_(self.route_pos_emb, mean=0.0, std=0.02)
         nn.init.normal_(self.traj_segment_emb, mean=0.0, std=0.02)
         nn.init.normal_(self.route_segment_emb, mean=0.0, std=0.02)
+        nn.init.ones_(self.traj_pos_scale)
+        nn.init.ones_(self.route_pos_scale)
         for layer in self.layers:
             nn.init.zeros_(layer.adaLN_modulation[-1].weight)
             nn.init.zeros_(layer.adaLN_modulation[-1].bias)
     
     def _create_block_diagonal_mask(self, T_traj: int, T_route: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
-        Create a block diagonal self-attention mask.
+        Create a unidirectional block self-attention mask.
         
         This ensures:
-        - Trajectory queries (0:T_traj) can only attend to other trajectory queries
-        - Route queries (T_traj:T_traj+T_route) can only attend to other route queries
+        - Trajectory queries can attend to: trajectory + route (full visibility)
+        - Route queries can only attend to: route (isolated from trajectory)
+        
+        Rationale:
+        - Trajectory prediction benefits from knowing the planned route
+        - Route planning should be independent of specific trajectory details
+        
+        Attention pattern (0 = allowed, -inf = blocked):
+        
+                    | Trajectory | Route |
+        ------------------------------------
+        Trajectory  |     0      |   0   |  <- can see both
+        Route       |   -inf     |   0   |  <- can only see route
         
         Args:
             T_traj: Number of trajectory queries
@@ -671,17 +919,15 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             dtype: Data type for the mask tensor
             
         Returns:
-            mask: (T_total, T_total) mask where -inf blocks cross-segment attention
+            mask: (T_total, T_total) mask where -inf blocks attention
         """
         T_total = T_traj + T_route
-        # Start with all blocked (will use additive mask, so -inf means blocked)
-        mask = torch.full((T_total, T_total), float('-inf'), device=device, dtype=dtype)
+        # Start with all allowed
+        mask = torch.zeros((T_total, T_total), device=device, dtype=dtype)
         
-        # Allow trajectory-to-trajectory attention (upper-left block)
-        mask[:T_traj, :T_traj] = 0.0
-        
-        # Allow route-to-route attention (lower-right block)
-        mask[T_traj:, T_traj:] = 0.0
+        # Block route-to-trajectory attention (lower-left block)
+        # Route queries (rows T_traj:) cannot attend to trajectory keys (cols :T_traj)
+        mask[T_traj:, :T_traj] = float('-inf')
         
         return mask
     
@@ -699,13 +945,15 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         """
         Forward pass with unified queries and multi-source attention.
         
-        Uses block diagonal self-attention mask to ensure:
-        - Trajectory queries only attend to other trajectory queries in self-attention
-        - Route queries only attend to other route queries in self-attention
+        Uses unidirectional self-attention mask:
+        - Trajectory queries can see: trajectory + route (route guides trajectory)
+        - Route queries can only see: route (independent planning)
         - Both can attend to all cross-attention sources (BEV, VL, Reasoning)
         
-        This design allows trajectory and route to be learned independently
-        while sharing the same cross-attention context.
+        Position Encoding:
+        - Both trajectory and route use unified sinusoidal position encoding
+        - Learnable scaling factors allow modality-specific position importance
+        - Segment embeddings differentiate trajectory from route
         
         Args:
             traj_emb: (B, horizon, d_model) - trajectory query embeddings (noisy traj embedded)
@@ -722,16 +970,22 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         T_traj = traj_emb.shape[1]
         T_route = self.num_waypoints
         
-        # Add segment embedding to trajectory
-        traj_emb = traj_emb + self.traj_segment_emb
+        # ========== Unified Position Encoding ==========
+        # Get sinusoidal position encoding for trajectory
+        traj_pos = self.unified_pos_encoding[:, :T_traj, :] * self.traj_pos_scale
+        # Get sinusoidal position encoding for route  
+        route_pos = self.unified_pos_encoding[:, :T_route, :] * self.route_pos_scale
+        
+        # Add position + segment embeddings to trajectory
+        traj_emb = traj_emb + traj_pos + self.traj_segment_emb
         
         # Route queries with position and segment embeddings
-        route_emb = self.route_queries.expand(B, -1, -1) + self.route_pos_emb + self.route_segment_emb
+        route_emb = self.route_queries.expand(B, -1, -1) + route_pos + self.route_segment_emb
         
         # Concatenate queries: [trajectory | route]
         x = torch.cat([traj_emb, route_emb], dim=1)  # (B, horizon + num_waypoints, d_model)
         
-        # Create block diagonal self-attention mask
+        # Create unidirectional self-attention mask
         self_attn_mask = self._create_block_diagonal_mask(
             T_traj, T_route, device=x.device, dtype=x.dtype
         )
@@ -861,15 +1115,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.causal_attn = causal_attn
         # Note: We create mask dynamically in forward() to handle variable lengths
         
-        # Output heads
-        self.trajectory_head = TrajectoryMLPHead(n_emb, output_dim, p_drop_emb)
-        self.route_head = nn.Sequential(
-            nn.LayerNorm(n_emb),
-            nn.Linear(n_emb, n_emb),
-            nn.GELU(),
-            nn.Dropout(p_drop_emb),
-            nn.Linear(n_emb, 2),  # Route outputs (x, y) waypoints
-        )
+        # Output heads with Route Guidance
+        # TrajectoryHead now receives route features for guidance
+        self.trajectory_head = TrajectoryMLPHead(n_emb, output_dim, p_drop_emb, num_heads=n_head)
+        # RouteHead with conditioning support
+        self.route_head = RouteMLPHead(n_emb, output_dim=2, p_drop=p_drop_emb)
         
         self.apply(self._init_weights)
         
@@ -1022,9 +1272,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
         reasoning_padding_mask = ~reasoning_mask if reasoning_mask is not None else (torch.norm(reasoning_tokens, dim=-1) == 0)
         
         # ========== Unified Decoder ==========
-        # Note: Block diagonal self-attention mask is created internally by decoder
-        # This ensures trajectory and route queries only attend to their own segment in self-attention
-        # Cross-attention order: BEV -> VL -> Reasoning (hist removed)
+        # Note: Unidirectional self-attention mask is created internally by decoder
+        # - Trajectory can see: trajectory + route (route guides trajectory)
+        # - Route can only see: route (independent planning)
+        # Cross-attention order: BEV -> VL -> Reasoning
         traj_out, route_out = self.decoder(
             traj_emb,
             bev_tokens, vl_tokens, reasoning_tokens, conditioning,
@@ -1032,8 +1283,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         
         # ========== Output Heads ==========
-        trajectory = self.trajectory_head(traj_out, conditioning)
-        route_pred = self.route_head(route_out)
+        # Route head processes first (no dependency on trajectory)
+        route_pred = self.route_head(route_out, conditioning)
+        
+        # Trajectory head with Route Guidance (attends to route features)
+        trajectory = self.trajectory_head(traj_out, conditioning, route_features=route_out)
         
         return trajectory, route_pred
 
@@ -1116,19 +1370,36 @@ def test():
     print("\n" + "=" * 60)
     print("✓ All tests passed!")
     print("=" * 60)
-    print("\nArchitecture summary:")
-    print("  - Queries: [trajectory (8) | route (20)]")
-    print("  - Self-attention: Block diagonal (trajectory & route isolated)")
-    print("  - Cross-attention sources: BEV(197) -> VL -> Reasoning")
-    print("  - AdaLN conditioning: timestep + current_status + GRU(history)")
-    print("  - ego_status used only for conditioning, not cross-attention")
-    print("\nBlock Diagonal Self-Attention:")
-    print("  - Trajectory queries only attend to other trajectory queries")
-    print("  - Route queries only attend to other route queries")
-    print("  - Both share same cross-attention context (BEV, VL, Reasoning)")
-    print("\nControl design:")
-    print("  - Trajectory output: longitudinal control (speed/acceleration)")
-    print("  - Route output: lateral control (steering direction)")
+    print("\nArchitecture Improvements:")
+    print("  1. History Encoder with Attention:")
+    print("     - GRU for sequential encoding")
+    print("     - Temporal attention for selective focus")
+    print("     - Fusion of global and selective information")
+    print("\n  2. Route-to-Trajectory Guidance:")
+    print("     - TrajectoryHead attends to route features")
+    print("     - Gated residual connection for controlled influence")
+    print("     - Improves trajectory-route consistency")
+    print("\n  3. Unified Position Encoding:")
+    print("     - Sinusoidal encoding shared by trajectory & route")
+    print("     - Learnable scaling per modality")
+    print("     - Segment embeddings for type differentiation")
+    print("\n  4. Unidirectional Self-Attention:")
+    print("     - Trajectory can see: trajectory + route")
+    print("     - Route can only see: route (independent)")
+    print("\n  5. Source-Specific Residual Paths:")
+    print("     - BEV: spatial avg pooling + MLP projection")
+    print("     - VL: attention pooling with learnable query")
+    print("     - Reasoning: attention pooling with learnable query")
+    print("     - Gated addition bypasses competitive softmax")
+    print("     - Ensures each modality contributes information")
+    print("\nInformation Flow:")
+    print("  Main path: fused softmax over all sources (competitive)")
+    print("  Residual: direct paths from each source (guaranteed)")
+    print("  Route: env context → route planning (independent)")
+    print("  Trajectory: env context + route guidance → trajectory")
+    print("\nOutput Heads:")
+    print("  - RouteMLPHead: with conditioning support")
+    print("  - TrajectoryMLPHead: with route guidance + conditioning")
     print("=" * 60)
 
 

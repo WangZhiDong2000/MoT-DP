@@ -690,6 +690,12 @@ def train_pdm_policy(config_path):
                 # Save best model based on L2_avg (average L2 error across all timesteps)
                 if l2_avg < best_l2_avg:
                     best_l2_avg = l2_avg
+                    # Append epoch number to filename if epoch > 100 to avoid overwriting
+                    if epoch > 100:
+                        # best_model_filename = f"dit_policy_best_epoch{epoch}.pt"
+                        best_model_filename = "dit_policy_best.pt"
+                    else:
+                        best_model_filename = "dit_policy_best.pt"
                     torch.save({
                             'model_state_dict': model_to_save.state_dict(),
                             'config': config,
@@ -697,7 +703,7 @@ def train_pdm_policy(config_path):
                             'val_loss': val_loss,
                             'train_loss': avg_train_loss,
                             'val_metrics': val_metrics
-                            }, os.path.join(checkpoint_dir, "dit_policy_best.pt"))
+                            }, os.path.join(checkpoint_dir, best_model_filename))
                     print(f"✓ New best model saved with L2_avg: {l2_avg:.4f} (val_loss: {val_loss:.4f})")
                    
                     safe_wandb_log({
@@ -726,7 +732,7 @@ def train_pdm_policy(config_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train pdm Driving Policy with Diffusion DiT - Multi-GPU Distributed Training")
-    parser.add_argument('--config_path', type=str, default="/root/z_projects/MoT-DP/config/pdm_server2.yaml", 
+    parser.add_argument('--config_path', type=str, default="/home/wang/Project/MoT-DP/config/pdm_local.yaml", 
                         help='Path to the configuration YAML file')
     args = parser.parse_args()
     train_pdm_policy(config_path=args.config_path)
