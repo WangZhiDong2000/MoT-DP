@@ -43,6 +43,12 @@ from scipy.optimize import fsolve
 from scipy.interpolate import PchipInterpolator
 import xml.etree.ElementTree as ET  
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  
+
+# TransFuser backbone for DP features
+from model.transfuser_extractor.backbone_extractor import TransFuserBackboneExtractor
+from model.transfuser_extractor.config import GlobalConfig as TransfuserConfig
+import model.transfuser_extractor.transfuser_utils as transfuser_t_u
+
 # mot dependencies
 project_root = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
@@ -70,6 +76,21 @@ from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 from mot.evaluation.inference import InterleaveInferencer
 from transformers import AutoTokenizer
 
+# Import TransfuserData using importlib to avoid conflicts with mot/data
+import importlib.util
+team_code_transfuser_path = os.path.join(mot_dp_path, 'team_code', 'team_code_transfuser')
+# Add team_code_transfuser to sys.path so its internal imports (like gaussian_target) work
+if team_code_transfuser_path not in sys.path:
+    sys.path.insert(0, team_code_transfuser_path)
+
+_transfuser_data_spec = importlib.util.spec_from_file_location(
+    "transfuser_data_module", 
+    os.path.join(team_code_transfuser_path, "data.py")
+)
+_transfuser_data_module = importlib.util.module_from_spec(_transfuser_data_spec)
+_transfuser_data_spec.loader.exec_module(_transfuser_data_module)
+TransfuserData = _transfuser_data_module.CARLA_Data
+
 # Import utility modules
 from team_code.mot_utils import (
     ModelArguments, InferenceArguments,
@@ -82,6 +103,7 @@ from team_code.ukf_utils import (
     state_mean, measurement_mean,
     residual_state_x, residual_measurement_h
 )
+from team_code.display_interface import DisplayInterface
 
 try:
     import pygame
@@ -149,74 +171,6 @@ def load_best_model(checkpoint_path, config, device):
 
     return policy
 
-# Display interface for visualization
-class DisplayInterface(object):
-    def __init__(self):
-        self._width = 1200
-        self._height = 600
-        self._surface = None
-
-        pygame.init()
-        pygame.font.init()
-        self._clock = pygame.time.Clock()
-        self._display = pygame.display.set_mode(
-            (self._width, self._height), pygame.HWSURFACE | pygame.DOUBLEBUF
-        )
-
-        pygame.display.set_caption("CORL Agent")
-
-    def run_interface(self, input_data):
-        rgb = input_data['rgb']
-        trajectory = input_data['predicted_trajectory']
-        decision_1s = input_data['decision_1s']
-        decision_2s = input_data['decision_2s']
-        decision_3s = input_data['decision_3s']
-        surface = np.zeros((600, 1200, 3),np.uint8)
-        surface[:, :800] = rgb
-        surface[:400,800:1200] = input_data['bev_traj']
-        surface[440:600,1000:1200] = trajectory[0:160,:]
-        surface = cv2.putText(surface, input_data['language_1'], (20,560), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
-        surface = cv2.putText(surface, input_data['language_2'], (20,580), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 1)
-        surface = cv2.putText(surface, input_data['control'], (20,540), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
-        surface = cv2.putText(surface, input_data['speed'], (20,520), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
-        surface = cv2.putText(surface, input_data['time'], (20,500), cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,255), 1)
-
-        # surface = cv2.putText(surface, 'Left  View', (40,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
-        # surface = cv2.putText(surface, 'Focus View', (335,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
-        # surface = cv2.putText(surface, 'Right View', (640,135), cv2.FONT_HERSHEY_SIMPLEX,0.75,(0,0,0), 2)
-
-        surface = cv2.putText(surface, 'Behavior Decision', (820,420), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 2)
-        surface = cv2.putText(surface, 'Planned Trajectory', (1010,420), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0), 2)
-        surface = cv2.putText(surface, decision_1s, (820,480), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
-        surface = cv2.putText(surface, decision_2s, (820,510), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
-        surface = cv2.putText(surface, decision_3s, (820,540), cv2.FONT_HERSHEY_SIMPLEX,0.75,(255,255,255), 2)
-
-        # surface[:150,198:202]=0
-        # surface[:150,323:327]=0
-        # surface[:150,473:477]=0
-        # surface[:150,598:602]=0
-        # surface[148:152, :200] = 0
-        # surface[148:152, 325:475] = 0
-        # surface[148:152, 600:800] = 0
-        surface[430:600, 998:1000] = 255
-        surface[0:600, 798:800] = 255
-        surface[0:600, 1198:1200] = 255
-        surface[0:2, 800:1200] = 255
-        surface[598:600, 800:1200] = 255
-        surface[398:400, 800:1200] = 255
-
-
-        # display image
-        self._surface = pygame.surfarray.make_surface(surface.swapaxes(0, 1))
-        if self._surface is not None:
-            self._display.blit(self._surface, (0, 0))
-
-        pygame.display.flip()
-        pygame.event.get()
-        return surface
-
-    def _quit(self):
-        pygame.quit()
 
 class MOTAgent(autonomous_agent.AutonomousAgent):
 	def setup(self, path_to_conf_file):
@@ -239,7 +193,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
-		checkpoint_path = os.path.join(checkpoint_base_path, "policy_best.pt")
+		checkpoint_path = os.path.join(checkpoint_base_path, "dit_policy_best.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
 		self.net = self.net.to(torch.bfloat16)
 		if hasattr(self.net, 'obs_encoder'):
@@ -280,10 +234,47 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
     	)
 		print("✓ MoT model loaded.")
 
+		# ========== Load TransFuser Backbone for DP features ==========
+		print("Loading TransFuser backbone for DP features...")
+		transfuser_config_path = "/home/wang/Project/carla_garage/leaderboard/leaderboard/pretrained_models/all_towns"
+		self.transfuser_backbone = TransFuserBackboneExtractor(
+			config_path=transfuser_config_path,
+			device='cuda:0'
+		)
+		# Backbone is already frozen in TransFuserBackboneExtractor
+		self.transfuser_backbone.eval()
+		# Convert to bfloat16 to match DP model precision
+		self.transfuser_backbone = self.transfuser_backbone.to(torch.bfloat16)
+		# Get transfuser config for lidar processing
+		self.transfuser_config = self.transfuser_backbone.config
+		# Initialize TransfuserData for lidar histogram conversion
+		self.transfuser_data = TransfuserData(root=[], config=self.transfuser_config, shared_dict=None)
+		print("✓ TransFuser backbone loaded, frozen, and converted to bfloat16.")
+		
+		# Initialize transfuser lidar buffer for temporal alignment
+		self.transfuser_lidar_buffer = deque(maxlen=self.transfuser_config.lidar_seq_len * self.transfuser_config.data_save_freq)
+		self.transfuser_lidar_last = None
+		self.transfuser_state_log = deque(maxlen=max((self.transfuser_config.lidar_seq_len * self.transfuser_config.data_save_freq), 2))
+		
+		# Print GPU memory status
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+			allocated = torch.cuda.memory_allocated() / 1024**3
+			reserved = torch.cuda.memory_reserved() / 1024**3
+			print(f"[GPU Memory] After TransFuser: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+
 		# route_pred有20个稀疏点(~20m, 1m间距)，插值后约200点(0.1m间距)
 		# inference_mode=False: lookahead范围24-105个点，对应2.4m-10.5m前方
-		# Increased k_p from default 3.118 to 3.5 to slightly increase sensitivity for mid-speed turns (reduce understeering)
-		self.turn_controller = LateralPIDController(inference_mode=False, k_p=3.118)
+		# 使用自定义的LateralPIDController，增加低速时的最小前视距离
+		# 默认 speed_offset=1.915, 低速时 lookahead = 0.9755*speed_kmh + 1.915，最小24
+		# 增加 speed_offset 和最小lookahead，让低速时看得更远，有助于直行时回正
+		self.turn_controller = LateralPIDController(
+			inference_mode=False, 
+			k_p=3.118,  # 增加P增益，提高回正响应（默认3.118）
+			speed_offset=1.195,  # 增加offset，低速时看更远（默认1.915）
+			default_lookahead=24  # 增加最小前视距离到4m（默认24=2.4m）
+		)
 		self.speed_controller = t_u.PIDController(k_p=1.75, k_i=1.0, k_d=2.0, n=20)  
 		
 		# Control config 
@@ -735,6 +726,54 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Convert BEV image to tensor format for interfuser_bev_encoder backbone
 		lidar_bev_tensor = torch.from_numpy(lidar_bev_img).permute(2, 0, 1).float() / 255.0
 		
+		# ========== TransFuser style processing for DP features ==========
+		# Process RGB for TransFuser (same as team_code_transfuser/sensor_agent.py)
+		transfuser_rgb = input_data['CAM_FRONT'][1][:, :, :3]
+		# Add jpg artifacts at test time, because the training data was saved as jpg
+		_, compressed_image = cv2.imencode('.jpg', transfuser_rgb)
+		transfuser_rgb = cv2.imdecode(compressed_image, cv2.IMREAD_UNCHANGED)
+		transfuser_rgb = cv2.cvtColor(transfuser_rgb, cv2.COLOR_BGR2RGB)
+		# Crop RGB image (same as transfuser training)
+		transfuser_rgb = transfuser_t_u.crop_array(self.transfuser_config, transfuser_rgb)
+		# Convert to PyTorch format (C, H, W) and batch
+		transfuser_rgb = np.transpose(transfuser_rgb, (2, 0, 1))
+		transfuser_rgb_tensor = torch.from_numpy(transfuser_rgb).float().unsqueeze(0).to('cuda')
+		
+		# Process LiDAR for TransFuser (same as team_code_transfuser/sensor_agent.py)
+		transfuser_lidar = transfuser_t_u.lidar_to_ego_coordinate(self.transfuser_config, input_data['LIDAR'])
+		
+		# Store state for lidar alignment
+		self.transfuser_state_log.append([gps_filtered[0], gps_filtered[1], compass_filtered, speed])
+		
+		# We only get half a LiDAR at every time step. Align the last half into the current frame.
+		if self.transfuser_lidar_last is not None and len(self.transfuser_state_log) >= 2:
+			ego_x = self.transfuser_state_log[-1][0]
+			ego_y = self.transfuser_state_log[-1][1]
+			ego_theta = self.transfuser_state_log[-1][2]
+			
+			ego_x_last = self.transfuser_state_log[-2][0]
+			ego_y_last = self.transfuser_state_log[-2][1]
+			ego_theta_last = self.transfuser_state_log[-2][2]
+			
+			transfuser_lidar_last_aligned = self._align_lidar_transfuser(
+				self.transfuser_lidar_last, 
+				ego_x_last, ego_y_last, ego_theta_last,
+				ego_x, ego_y, ego_theta
+			)
+			transfuser_lidar_full = np.concatenate((transfuser_lidar, transfuser_lidar_last_aligned), axis=0)
+		else:
+			transfuser_lidar_full = transfuser_lidar
+		
+		self.transfuser_lidar_last = transfuser_lidar.copy()
+		self.transfuser_lidar_buffer.append(transfuser_lidar_full)
+		
+		# Convert to histogram BEV (same as sensor_agent.py)
+		transfuser_lidar_bev = self.transfuser_data.lidar_to_histogram_features(
+			transfuser_lidar_full,
+			use_ground_plane=self.transfuser_config.use_ground_plane
+		)
+		transfuser_lidar_bev_tensor = torch.from_numpy(transfuser_lidar_bev).float().unsqueeze(0).to('cuda')
+		
 		# Process other sensors
 		bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
 		
@@ -744,7 +783,10 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'gps': gps_filtered,  # Use UKF filtered CARLA coordinates
 				'speed': speed,
 				'compass': compass_filtered,  # Use UKF filtered compass
-				'bev': bev
+				'bev': bev,
+				# TransFuser processed data for DP
+				'transfuser_rgb': transfuser_rgb_tensor,  # (1, 3, H, W) on GPU
+				'transfuser_lidar_bev': transfuser_lidar_bev_tensor,  # (1, C, H, W) on GPU
 				}
 		
 		waypoint_route = self._route_planner.run_step(np.append(result['gps'], gps_pos[2]))
@@ -756,14 +798,39 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			next_target_point, next_far_command = waypoint_route[2]
 		elif len(waypoint_route) > 1:
 			target_point, far_command = waypoint_route[1]
-			next_target_point, next_far_command = waypoint_route[1]
+			# Only target_point available, generate virtual next_target_point
+			# Extend 50m along the direction from ego to target_point (in world frame)
+			ego_pos = result['gps'][:2]
+			direction = target_point[:2] - ego_pos
+			dist = np.linalg.norm(direction)
+			if dist > 1e-3:
+				direction_normalized = direction / dist
+			else:
+				# If target_point is too close, use forward direction based on compass
+				direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
+			next_target_point = target_point[:2] + direction_normalized * 50.0
+			next_far_command = far_command
 		elif len(waypoint_route) > 0:
 			target_point, far_command = waypoint_route[0]
-			next_target_point, next_far_command = waypoint_route[0]
+			# Only one waypoint available, generate virtual next_target_point
+			# Extend 50m along the direction from ego to target_point (in world frame)
+			ego_pos = result['gps'][:2]
+			direction = target_point[:2] - ego_pos
+			dist = np.linalg.norm(direction)
+			if dist > 1e-3:
+				direction_normalized = direction / dist
+			else:
+				# If target_point is too close, use forward direction based on compass
+				direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
+			next_target_point = target_point[:2] + direction_normalized * 50.0
+			next_far_command = far_command
 		else:
 			# waypoint_route 为空的极端情况，使用当前位置
 			target_point, far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
-			next_target_point, next_far_command = (result['gps'][:2], RoadOption.LANEFOLLOW)
+			# Generate virtual next_target_point 50m ahead in ego's forward direction
+			direction_normalized = np.array([np.cos(result['compass']), np.sin(result['compass'])])
+			next_target_point = result['gps'][:2] + direction_normalized * 50.0
+			next_far_command = RoadOption.LANEFOLLOW
 
 		if self.last_command_tmp != far_command:
 			self.last_command = self.last_command_tmp
@@ -790,7 +857,160 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		result['theta'] = compass_filtered  # Use UKF filtered compass
 
 		return result
+
+	def _align_lidar_transfuser(self, lidar, x, y, orientation, x_target, y_target, orientation_target):
+		"""
+		Align lidar from past frame to current frame (same as sensor_agent.py).
+		
+		Args:
+			lidar: numpy LiDAR point cloud (N, 3)
+			x, y, orientation: past frame ego pose
+			x_target, y_target, orientation_target: current frame ego pose
+			
+		Returns:
+			aligned_lidar: numpy LiDAR point cloud in current frame coordinates
+		"""
+		pos_diff = np.array([x_target, y_target, 0.0]) - np.array([x, y, 0.0])
+		rot_diff = transfuser_t_u.normalize_angle(orientation_target - orientation)
+		
+		# Rotate difference vector from global to local coordinate system.
+		rotation_matrix = np.array([[np.cos(orientation_target), -np.sin(orientation_target), 0.0],
+		                            [np.sin(orientation_target), np.cos(orientation_target), 0.0], 
+		                            [0.0, 0.0, 1.0]])
+		pos_diff = rotation_matrix.T @ pos_diff
+		
+		return transfuser_t_u.algin_lidar(lidar, pos_diff, rot_diff)
 	
+	def _truncate_route_by_target_point(self, route_waypoints_np, target_point_np):
+		"""
+		Truncate route_pred based on target_point projection.
+		
+		Logic:
+		- Project target_point onto the polyline formed by route_pred
+		- If projection falls inside route_pred (route is truncated by target_point),
+		  then the portion after projection is inaccurate and should not be used
+		- If projection falls beyond route_pred's end, the entire route is valid
+		
+		Protection mechanism:
+		- If truncated route has too few points (< MIN_POINTS_THRESHOLD) or
+		  is too short (< MIN_LENGTH_THRESHOLD), skip truncation and use original route
+		- This handles edge cases near the destination where target_point is very close
+		
+		Args:
+			route_waypoints_np: (N, 2) numpy array in ego frame [x_forward, y_left]
+			target_point_np: (2,) numpy array in ego frame [x_forward, y_left]
+		
+		Returns:
+			truncated_route: (M, 2) numpy array, M <= N, the valid portion of route_pred
+			truncation_idx: int, the index up to which the route is valid (-1 if no truncation)
+		"""
+		# Protection thresholds
+		MIN_POINTS_THRESHOLD = 5  # Minimum number of points needed for reliable control
+		MIN_LENGTH_THRESHOLD = 3.0  # Minimum route length in meters for reliable lookahead
+		
+		if len(route_waypoints_np) < 2:
+			return route_waypoints_np, -1
+		
+		# Find the closest segment to target_point
+		min_dist = float('inf')
+		best_segment_idx = -1
+		best_t = 0.0  # Parameter along segment [0, 1]
+		best_proj_point = None
+		
+		for i in range(len(route_waypoints_np) - 1):
+			p1 = route_waypoints_np[i]
+			p2 = route_waypoints_np[i + 1]
+			
+			# Vector from p1 to p2
+			v = p2 - p1
+			# Vector from p1 to target_point
+			w = target_point_np - p1
+			
+			# Length squared of segment
+			l2 = np.dot(v, v)
+			if l2 < 1e-10:  # Degenerate segment
+				t = 0.0
+				proj = p1
+			else:
+				# Project target_point onto the line containing the segment
+				t = np.dot(w, v) / l2
+				proj = p1 + t * v
+			
+			# Distance from target_point to projection
+			dist = np.linalg.norm(target_point_np - proj)
+			
+			# We consider projections within or beyond the segment
+			# t < 0: projection is before p1
+			# 0 <= t <= 1: projection is within segment
+			# t > 1: projection is beyond p2
+			
+			if dist < min_dist:
+				min_dist = dist
+				best_segment_idx = i
+				best_t = t
+				best_proj_point = proj
+		
+		# Determine truncation based on projection position
+		# If best_t is within [0, 1], the projection is inside the route segment
+		# If best_t > 1, check if we're on the last segment - if so, projection is beyond route
+		
+		if best_segment_idx == -1:
+			# No valid segment found, return original route
+			return route_waypoints_np, -1
+		
+		# Calculate the "arc length" position of the projection along the route
+		# If projection is beyond the last point, no truncation needed
+		is_on_last_segment = (best_segment_idx == len(route_waypoints_np) - 2)
+		
+		if best_t > 1.0 and is_on_last_segment:
+			# Projection is beyond the end of route_pred
+			# The entire route is valid for lookahead calculation
+			return route_waypoints_np, -1
+		
+		# Projection is within route_pred or before it (shouldn't happen normally)
+		# Truncate the route at the projection point
+		if best_t <= 0.0:
+			# Projection is at or before the start of this segment
+			# Keep points up to and including segment start
+			truncation_idx = best_segment_idx
+		elif best_t >= 1.0:
+			# Projection is at or beyond the end of this segment
+			# Keep points up to and including segment end
+			truncation_idx = best_segment_idx + 1
+		else:
+			# Projection is within the segment
+			# Keep points up to segment start, then add the projection point
+			truncation_idx = best_segment_idx
+		
+		# Build truncated route
+		if truncation_idx >= len(route_waypoints_np) - 1:
+			# No truncation needed
+			return route_waypoints_np, -1
+		
+		# Include points up to truncation_idx, then add projection point
+		truncated = route_waypoints_np[:truncation_idx + 1].copy()
+		
+		# Add the projection point if it's meaningfully different from the last included point
+		if best_proj_point is not None and len(truncated) > 0:
+			dist_to_last = np.linalg.norm(best_proj_point - truncated[-1])
+			if dist_to_last > 0.1:  # Only add if more than 0.1m away
+				truncated = np.vstack([truncated, best_proj_point])
+		
+		# ============ Protection mechanism ============
+		# Calculate the total length of truncated route
+		truncated_length = 0.0
+		for i in range(len(truncated) - 1):
+			truncated_length += np.linalg.norm(truncated[i + 1] - truncated[i])
+		
+		# Check if truncated route meets minimum requirements
+		if len(truncated) < MIN_POINTS_THRESHOLD or truncated_length < MIN_LENGTH_THRESHOLD:
+			# Truncated route is too short, skip truncation and use original route
+			# This handles edge cases near destination where target_point is very close
+			print(f"[Lateral] Skip truncation: points={len(truncated)}, length={truncated_length:.2f}m "
+				  f"(thresholds: {MIN_POINTS_THRESHOLD} points, {MIN_LENGTH_THRESHOLD}m)")
+			return route_waypoints_np, -1
+		
+		return truncated, truncation_idx
 	
 	def control_pid(self, route_waypoints, velocity, speed_waypoints, target_point=None):
 		"""
@@ -800,14 +1020,19 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			route_waypoints: (1, N, 2) tensor in ego frame [x_forward, y_left]
 			velocity: float, current speed in m/s
 			speed_waypoints: (1, N, 2) tensor for speed calculation
-			target_point: Unused, kept for API compatibility
+			target_point: (1, 2) tensor in ego frame [x_forward, y_left], used for route truncation
 		"""
 		assert route_waypoints.size(0) == 1
 		route_waypoints_np = route_waypoints[0].data.cpu().numpy()  # (N, 2)
 		speed = velocity  # Already a float
 		speed_waypoints_np = speed_waypoints[0].data.cpu().numpy()  # (N, 2)
 		
-		# Route is no longer truncated - use full route_waypoints for control
+		# Truncate route using target_point projection
+		if target_point is not None:
+			target_point_np = target_point[0].data.cpu().numpy()  # (2,)
+			route_waypoints_np, truncation_idx = self._truncate_route_by_target_point(route_waypoints_np, target_point_np)
+			if truncation_idx >= 0:
+				print(f"[Lateral] Route truncated at index {truncation_idx}, remaining points: {len(route_waypoints_np)}")
 		
 		# MoT trajectory: 6 points, 0.5s interval each, total 3s
 		# Point indices: 0(0.5s), 1(1.0s), 2(1.5s), 3(2.0s), 4(2.5s), 5(3.0s)
@@ -824,8 +1049,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			desired_speed = np.linalg.norm(speed_waypoints_np[0]) * 2.0
 
 		# Speed limit: cap desired_speed at 35 km/h = 35/3.6 ≈ 9.72 m/s
-		max_desired_speed_ms = 35.0 / 3.6  # 35 km/h in m/s
-		desired_speed = min(desired_speed, max_desired_speed_ms)
+		# max_desired_speed_ms = 35.0 / 3.6  # 35 km/h in m/s
+		# desired_speed = min(desired_speed, max_desired_speed_ms)
 
 		brake = ((desired_speed < self.brake_speed) or ((speed / max(desired_speed, 1e-5)) > self.brake_ratio))
 		
@@ -837,20 +1062,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 		route_interp = self.interpolate_waypoints(route_waypoints_np)
 		
-		# # 低速时增加前视距离：跳过路径开头的直线部分
-		# # route_pred 的特点是 直行-转弯-直行，开头一小段没有曲率
-		# # 低速时跳过开头的点，让控制器看到更远处的转弯点
-		# low_speed_threshold = 5.0  # m/s，低于此速度时增加前视
-		# skip_distance = 0.0  # 默认不跳过
-		# if speed < low_speed_threshold and len(route_interp) > 30:
-		# 	# 低速时跳过开头的直线段，跳过距离与速度成反比
-		# 	# 速度越低，跳过越多（最多跳过2m = 20个点，因为0.1m间隔）
-		# 	skip_ratio = 1.0 - (speed / low_speed_threshold)  # 0~1
-		# 	max_skip_points = 20  # 最多跳过2m
-		# 	skip_points = int(skip_ratio * max_skip_points)
-		# 	skip_points = min(skip_points, len(route_interp) - 20)  # 确保剩余足够的点
-		# 	if skip_points > 0:
-		# 		route_interp = route_interp[skip_points:]
 		
 		steer = self.turn_controller.step(route_interp, speed)
 		steer = np.clip(steer, -1.0, 1.0)
@@ -1012,13 +1223,53 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			if reason_feat.dim() == 2:
 				reason_feat = reason_feat.unsqueeze(0)  # (1, Nr, C)
 			
+			# ========== Run TransFuser backbone to get 4 features ==========
+			with torch.no_grad():
+				# Convert inputs to bfloat16 to match transfuser backbone
+				transfuser_rgb_bf16 = tick_data['transfuser_rgb'].to(torch.bfloat16)
+				transfuser_lidar_bev_bf16 = tick_data['transfuser_lidar_bev'].to(torch.bfloat16)
+				transfuser_output = self.transfuser_backbone(
+					rgb=transfuser_rgb_bf16,  # (1, 3, H, W) on GPU, bfloat16
+					lidar_bev=transfuser_lidar_bev_bf16  # (1, C, H, W) on GPU, bfloat16
+				)
+			
+			# Extract 4 transfuser features (single frame, no history needed)
+			# bev_feature: (B, 1512, 8, 8) - original BEV feature (x4)
+			# bev_feature_upscale: (B, 64, 64, 64) - upsampled BEV (p3)
+			# fused_features: (B, 1512) or (B, 1512, 8, 8) - global fused features
+			# image_feature_grid: (B, 1512, 12, 32) - image feature grid
+			transfuser_bev_feature = transfuser_output['bev_feature']  # (1, 1512, 8, 8)
+			transfuser_bev_feature_upsample = transfuser_output['bev_feature_upscale']  # (1, 64, 64, 64)
+			transfuser_fused_features = transfuser_output['fused_features']  # may need reshape
+			transfuser_image_feature_grid = transfuser_output['image_feature_grid']  # (1, 1512, 12, 32)
+			
+			# Handle fused_features: if it's 2D (B, C), reshape to (B, C, 1, 1) then tile
+			if transfuser_fused_features is not None:
+				if transfuser_fused_features.dim() == 2:
+					# (B, C) -> (B, C, 8, 8) to match bev_feature shape
+					transfuser_fused_features = transfuser_fused_features.unsqueeze(-1).unsqueeze(-1)
+					transfuser_fused_features = transfuser_fused_features.expand(-1, -1, 8, 8)
+			else:
+				# If fused_features is None, use bev_feature as fallback
+				transfuser_fused_features = transfuser_bev_feature
+			
+			# If image_feature_grid is None, create a placeholder
+			if transfuser_image_feature_grid is None:
+				# Create dummy (B, 1512, 12, 32)
+				transfuser_image_feature_grid = torch.zeros(1, 1512, 12, 32, device='cuda')
+			
+			# Build dp_obs_dict with transfuser features
 			dp_obs_dict = {
-                    'lidar_bev': lidar_stacked,
-                    'ego_status': ego_status_stacked,  
-                    'gen_vit_tokens': dp_vit_feat,
-                    'reasoning_query_tokens': reason_feat[:7],
-                    'anchor': predicted_answer['traj']  # Pass anchor for truncated diffusion
-                }
+				'ego_status': ego_status_stacked,
+				# TransFuser features (single frame)
+				'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
+				'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
+				'transfuser_fused_features': transfuser_fused_features,  # (B, 1512, 8, 8)
+				'transfuser_image_feature_grid': transfuser_image_feature_grid,  # (B, 1512, 12, 32)
+				# Reasoning tokens from MoT
+				'reasoning_query_tokens': reason_feat[:, :7, :],  # (1, 7, C)
+				'anchor': predicted_answer['traj']  # Pass anchor for truncated diffusion
+			}
 			dp_pred_traj = self.net.predict_action(dp_obs_dict)
 			# self.last_dp_pred_traj = dp_pred_traj['action'].squeeze(0).copy()  # (6, 2) in [x, y] format
 			# print("dp_pred_traj:", dp_pred_traj)
@@ -1043,8 +1294,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			gt_velocity = tick_data['speed']
 			
-			# Route is not truncated anymore - use full route_waypoints for control
-			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=None)
+			# Use target_point to truncate route for lateral control
+			steer, throttle, brake = self.control_pid(route_waypoints, gt_velocity, speed_waypoints, target_point=target_point)
 			
 			# Restart mechanism in case the car got stuck (following simlingo logic)
 			# 0.1 is just an arbitrary low number to threshold when the car is stopped
@@ -1072,8 +1323,8 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			control.steer = float(steer)
 			control.throttle = float(throttle)
 			control.brake = float(brake)
-			control.throttle = max(0.0, min(0.75, control.throttle))
-			control.steer = max(-0.4, min(0.4, control.steer))
+			# control.throttle = max(0.0, min(0.75, control.throttle))
+			# control.steer = max(-0.4, min(0.4, control.steer))
 			# control.throttle = 0.0 if np.abs(control.steer) > 0.4 and gt_velocity > 1.0 else control.throttle  # Sharp turn cut throttle
 			
 			# Speed limit enforcement: if current speed > 35 km/h, force brake
@@ -1361,6 +1612,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		y = scale * EARTH_RADIUS_EQUA * math.log(math.tan((90.0 + self.lat_ref) * math.pi / 360.0)) - my
 		x = mx - scale * self.lon_ref * math.pi * EARTH_RADIUS_EQUA / 180.0
 		return np.array([x, y])
+
 
 
 
