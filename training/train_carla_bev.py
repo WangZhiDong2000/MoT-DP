@@ -171,11 +171,10 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 loss = model_for_inference.compute_loss(batch)
                 val_metrics['loss'].append(loss.item())
                 
+                # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
                 obs_dict = {
                     'transfuser_bev_feature': batch['transfuser_bev_feature'],
                     'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
-                    'transfuser_fused_features': batch['transfuser_fused_features'],
-                    'transfuser_image_feature_grid': batch['transfuser_image_feature_grid'],
                     'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
                     'reasoning_query_tokens': batch['reasoning_query_tokens'],
                     'anchor': batch['anchor']  # Pass anchor for truncated diffusion
