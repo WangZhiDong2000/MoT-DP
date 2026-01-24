@@ -78,11 +78,10 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             images_tensor = self.load_image(image_paths, sample_path)
 
         # --- Load Transfuser Features (single frame, no temporal) ---
-        # Four features: bev_feature, bev_feature_upsample, fused_features, image_feature_grid
+        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
+        # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
         transfuser_bev_feature = None
         transfuser_bev_feature_upsample = None
-        transfuser_fused_features = None
-        transfuser_image_feature_grid = None
         
         if 'transfuser_bev_feature' in sample:
             bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
@@ -91,14 +90,6 @@ class CARLAImageDataset(torch.utils.data.Dataset):
         if 'transfuser_bev_feature_upsample' in sample:
             bev_feature_upsample_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature_upsample'])
             transfuser_bev_feature_upsample = torch.load(bev_feature_upsample_path, weights_only=True).squeeze(0)
-        
-        if 'transfuser_fused_features' in sample:
-            fused_features_path = os.path.join(self.image_data_root, sample['transfuser_fused_features'])
-            transfuser_fused_features = torch.load(fused_features_path, weights_only=True).squeeze(0)
-        
-        if 'transfuser_image_feature_grid' in sample:
-            image_feature_grid_path = os.path.join(self.image_data_root, sample['transfuser_image_feature_grid'])
-            transfuser_image_feature_grid = torch.load(image_feature_grid_path, weights_only=True).squeeze(0)
         
         # Load VQA feature from pt file
         vqa_path = sample.get('vqa', None)
@@ -144,14 +135,11 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 final_sample[key] = value
 
         # Add transfuser features to final_sample
+        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         if transfuser_bev_feature is not None:
             final_sample['transfuser_bev_feature'] = transfuser_bev_feature
         if transfuser_bev_feature_upsample is not None:
             final_sample['transfuser_bev_feature_upsample'] = transfuser_bev_feature_upsample
-        if transfuser_fused_features is not None:
-            final_sample['transfuser_fused_features'] = transfuser_fused_features
-        if transfuser_image_feature_grid is not None:
-            final_sample['transfuser_image_feature_grid'] = transfuser_image_feature_grid
 
         # Build ego_status: concatenate historical low-dimensional states
         # Order: speed_hist, theta_hist, command_hist, waypoints_hist

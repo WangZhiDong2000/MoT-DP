@@ -47,12 +47,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
         
         # Transfuser feature dimensions (based on backbone output)
+        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
-        # fused_features: (1512, 8, 8), image_feature_grid: (1512, 12, 32)
         transfuser_cfg = config.get('transfuser_encoder', {})
         self.bev_feature_dim = transfuser_cfg.get('bev_feature_dim', 1512)
         self.bev_feature_upsample_dim = transfuser_cfg.get('bev_feature_upsample_dim', 64)
-        self.image_feature_grid_dim = transfuser_cfg.get('image_feature_grid_dim', 1512)
 
         vlm_feature_dim = 2560  # 隐藏层维度
         self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
@@ -86,11 +85,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             status_dim=status_dim,
             ego_status_seq_len=ego_status_seq_len,
             # Transfuser feature dimensions (from transfuser backbone)
+            # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
             # bev_feature: (1512, 8, 8), bev_feature_upsample: (64, 64, 64)
-            # fused_features: (1512, 8, 8), image_feature_grid: (1512, 12, 32)
             transfuser_bev_dim=self.bev_feature_dim,
             transfuser_bev_upsample_dim=self.bev_feature_upsample_dim,
-            transfuser_image_dim=self.image_feature_grid_dim,
             num_waypoints=num_waypoints,  # Number of route waypoints
         )
 
@@ -334,10 +332,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         batch: {
             # Transfuser features (single frame, no temporal)
+            # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
             'transfuser_bev_feature': (B, 1512, 8, 8) - BEV feature
             'transfuser_bev_feature_upsample': (B, 64, 64, 64) - Upscaled BEV feature
-            'transfuser_fused_features': (B, 1512, 8, 8) - Fused camera-lidar features
-            'transfuser_image_feature_grid': (B, 1512, 12, 32) - Image feature grid
             
             'agent_pos': (B, horizon, 2) - 未来轨迹点
             'ego_status': (B, obs_horizon, state_dim) - 车辆状态
@@ -369,10 +366,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
         # Load transfuser features (single frame, no temporal)
+        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        transfuser_fused_features = batch['transfuser_fused_features'].to(device=device, dtype=model_dtype)
-        transfuser_image_feature_grid = batch['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
 
         # Prepare reasoning tokens
         reasoning_query_tokens = batch['reasoning_query_tokens']
@@ -388,8 +384,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             anchor=anchor,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            transfuser_fused_features=transfuser_fused_features,
-            transfuser_image_feature_grid=transfuser_image_feature_grid,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
             route_gt=route_gt,
@@ -405,8 +399,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         anchor: torch.Tensor,
         transfuser_bev_feature: torch.Tensor,
         transfuser_bev_feature_upsample: torch.Tensor,
-        transfuser_fused_features: torch.Tensor,
-        transfuser_image_feature_grid: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         device: torch.device,
@@ -425,8 +417,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
-            transfuser_fused_features: (B, 1512, 8, 8) - Fused camera-lidar features
-            transfuser_image_feature_grid: (B, 1512, 12, 32) - Image feature grid
             reasoning_query_tokens: (B, seq_len, dim) - reasoning tokens
             ego_status: (B, To, status_dim) - ego vehicle status
             device: torch device
@@ -469,8 +459,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             cond=cond,  # For API compatibility
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            transfuser_fused_features=transfuser_fused_features,
-            transfuser_image_feature_grid=transfuser_image_feature_grid,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status
         )
@@ -501,8 +489,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def conditional_sample(self, 
             transfuser_bev_feature: torch.Tensor,
             transfuser_bev_feature_upsample: torch.Tensor,
-            transfuser_fused_features: torch.Tensor,
-            transfuser_image_feature_grid: torch.Tensor,
             reasoning_query_tokens: torch.Tensor,
             ego_status: torch.Tensor,
             anchor: torch.Tensor,
@@ -517,8 +503,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Args:
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upscaled BEV feature
-            transfuser_fused_features: (B, 1512, 8, 8) - Fused camera-lidar features
-            transfuser_image_feature_grid: (B, 1512, 12, 32) - Image feature grid
             reasoning_query_tokens: (B, seq_len, 1536) - reasoning tokens
             ego_status: (B, To, status_dim) - ego status history
             anchor: (B, T, 2) - anchor trajectory
@@ -530,8 +514,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             anchor=anchor,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            transfuser_fused_features=transfuser_fused_features,
-            transfuser_image_feature_grid=transfuser_image_feature_grid,
             ego_status=ego_status,
             reasoning_query_tokens=reasoning_query_tokens,
             device=device,
@@ -546,8 +528,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         anchor: torch.Tensor,
         transfuser_bev_feature: torch.Tensor,
         transfuser_bev_feature_upsample: torch.Tensor,
-        transfuser_fused_features: torch.Tensor,
-        transfuser_image_feature_grid: torch.Tensor,
         ego_status: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         device: torch.device,
@@ -613,8 +593,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
                 cond=cond,
                 transfuser_bev_feature=transfuser_bev_feature,
                 transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-                transfuser_fused_features=transfuser_fused_features,
-                transfuser_image_feature_grid=transfuser_image_feature_grid,
                 reasoning_query_tokens=reasoning_query_tokens,
                 ego_status=ego_status,
             )
@@ -649,10 +627,9 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         To = self.n_obs_steps
 
         # Load transfuser features (single frame, no temporal)
+        # Following DiffusionDriveV2: only use bev_feature and bev_feature_upsample
         transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
         transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        transfuser_fused_features = nobs['transfuser_fused_features'].to(device=device, dtype=model_dtype)
-        transfuser_image_feature_grid = nobs['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
 
         # Process reasoning tokens
         reasoning_query_tokens = nobs['reasoning_query_tokens']
@@ -676,8 +653,6 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         nsample, route_pred = self.conditional_sample(
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            transfuser_fused_features=transfuser_fused_features,
-            transfuser_image_feature_grid=transfuser_image_feature_grid,
             reasoning_query_tokens=reasoning_query_tokens,
             ego_status=ego_status,
             anchor=anchor,

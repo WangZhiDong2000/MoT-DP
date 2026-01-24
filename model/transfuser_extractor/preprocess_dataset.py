@@ -4,6 +4,9 @@
 加载 TransFuser backbone，处理 pdm_lite_mini 数据集，
 保存 BEV feature 和上采样后的 BEV feature。
 
+Following DiffusionDriveV2: only save bev_feature and bev_feature_upsample.
+fused_features and image_feature_grid are NOT used.
+
 使用方法:
     python preprocess_dataset.py --dataset_path /home/wang/Dataset/pdm_lite_mini \
                                  --config_path /home/wang/Project/carla_garage/leaderboard/leaderboard/pretrained_models/all_towns
@@ -182,14 +185,12 @@ class DatasetPreprocessor:
             # 获取帧号
             frame_num = lidar_file.stem  # e.g., "0001"
             
-            # 检查是否已存在
+            # 检查是否已存在 (following DiffusionDriveV2: only bev_feature and bev_feature_upsample)
             feature_path = feature_dir / f"{frame_num}_feature.pt"
             feature_upsample_path = feature_dir / f"{frame_num}_feature_upsample.pt"
-            fused_features_path = feature_dir / f"{frame_num}_fused_features.pt"
-            image_feature_grid_path = feature_dir / f"{frame_num}_image_feature_grid.pt"
             
-            if self.skip_existing and feature_path.exists() and feature_upsample_path.exists() \
-               and fused_features_path.exists() and image_feature_grid_path.exists():
+            if self.skip_existing and feature_path.exists() and feature_upsample_path.exists():
+                print('skipping')
                 continue
             
             # RGB 文件路径
@@ -208,27 +209,16 @@ class DatasetPreprocessor:
                 with torch.no_grad():
                     output = self.extractor(rgb, lidar_bev)
                 
-                # 保存所有四个特征 (移到 CPU)
+                # 保存 bev_feature 和 bev_feature_upsample (移到 CPU)
+                # Following DiffusionDriveV2: only use these two features
                 bev_feature = output['bev_feature']
                 bev_feature_upsample = output['bev_feature_upscale']
-                fused_features = output['fused_features']
-                image_feature_grid = output['image_feature_grid']
-                
-                # 定义保存路径
-                fused_features_path = feature_dir / f"{frame_num}_fused_features.pt"
-                image_feature_grid_path = feature_dir / f"{frame_num}_image_feature_grid.pt"
                 
                 if bev_feature is not None:
                     torch.save(bev_feature.cpu(), feature_path)
                 
                 if bev_feature_upsample is not None:
                     torch.save(bev_feature_upsample.cpu(), feature_upsample_path)
-                
-                if fused_features is not None:
-                    torch.save(fused_features.cpu(), fused_features_path)
-                
-                if image_feature_grid is not None:
-                    torch.save(image_feature_grid.cpu(), image_feature_grid_path)
                     
             except Exception as e:
                 print(f"Error processing frame {frame_num} in {route_dir}: {e}")

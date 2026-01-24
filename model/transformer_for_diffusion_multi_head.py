@@ -3,7 +3,7 @@ Decoder-Only Transformer for Diffusion-based Trajectory Prediction.
 
 This module implements a decoder-only architecture for trajectory prediction,
 using sequential cross-attention to multiple condition sources:
-- Transfuser features (4 types from transfuser backbone)
+- Transfuser features (2 types from transfuser backbone, following DiffusionDriveV2)
 - State tokens (low-dim ego status)  
 - Reasoning tokens (vision-language features)
 
@@ -14,11 +14,12 @@ Key design choices:
 - Unified decoder with heterogeneous queries for trajectory (6) + route (20)
 - MLP output heads (no GRU)
 
-Transfuser Features:
-- bev_feature: (B, 1512, 8, 8) - Original BEV from lidar
-- bev_feature_upsample: (B, 64, 64, 64) - FPN output p3 (used for spatial cross-attention)
-- fused_features: (B, 1512, 8, 8) - Camera-lidar fusion
-- image_feature_grid: (B, 1512, 12, 32) - Image features
+Transfuser Features (following DiffusionDriveV2):
+- bev_feature: (B, 1512, 8, 8) - Original BEV from lidar, downscaled for cross-attention
+- bev_feature_upsample: (B, 64, 64, 64) - FPN output p3 (used for spatial cross-attention via GridSampleCrossBEVAttention)
+
+Note: Unlike the original 4-feature version, we now only use bev_feature and bev_feature_upsample,
+following DiffusionDriveV2's approach where fused_features and image_feature_grid are NOT used.
 """
 
 from typing import Union, Optional, Tuple
@@ -303,17 +304,17 @@ class GridSampleCrossBEVAttention(nn.Module):
 
 class MultiSourceAttentionBlock(nn.Module):
     """
-    Multi-Source Attention Block for Transfuser Features.
+    Multi-Source Attention Block for Transfuser Features (DiffusionDriveV2 style).
     
-    Adapted for 4 transfuser feature sources:
-    - bev_feature: (B, 64, d_model) - flattened BEV feature
-    - fused_feature: (B, 64, d_model) - flattened fused feature
-    - image_feature: (B, 384, d_model) - flattened image feature grid
+    Adapted for 2 transfuser feature sources following DiffusionDriveV2:
+    - bev_feature: (B, 64, d_model) - flattened BEV feature (downscaled)
     - reasoning_tokens: (B, T_r, d_model) - reasoning tokens
+    
+    Note: fused_feature and image_feature are removed following DiffusionDriveV2's approach.
     
     Architecture:
         1. Self-attention on main sequence with RoPE on both Q and K
-        2. Cross-attention to transfuser features (bev, fused, image) with RoPE on K only
+        2. Cross-attention to BEV feature with RoPE on K only
         3. Cross-attention to reasoning tokens with RoPE on K only + gating
         4. Residual + FFN
         
@@ -348,10 +349,8 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Q projections (source-specific for better modality adaptation) ==========
         self.q_proj = nn.Linear(d_model, d_model)  # Shared base Q
         # Small adaptation layers for cross-attention queries (low-rank for efficiency)
-        # For 4 transfuser sources: bev, fused, image, reasoning
+        # For 2 transfuser sources: bev, reasoning (following DiffusionDriveV2)
         self.q_adapter_bev = nn.Linear(d_model, d_model // 4)
-        self.q_adapter_fused = nn.Linear(d_model, d_model // 4)
-        self.q_adapter_image = nn.Linear(d_model, d_model // 4)
         self.q_adapter_reason = nn.Linear(d_model, d_model // 4)
         self.q_adapter_out = nn.Linear(d_model // 4, d_model)
         
@@ -359,13 +358,9 @@ class MultiSourceAttentionBlock(nn.Module):
         self.k_self = nn.Linear(d_model, d_model)
         self.v_self = nn.Linear(d_model, d_model)
         
-        # ========== Transfuser cross-attention K, V (for bev, fused, image) ==========
+        # ========== Transfuser cross-attention K, V (for bev only, following DiffusionDriveV2) ==========
         self.k_bev = nn.Linear(d_model, d_model)
         self.v_bev = nn.Linear(d_model, d_model)
-        self.k_fused = nn.Linear(d_model, d_model)
-        self.v_fused = nn.Linear(d_model, d_model)
-        self.k_image = nn.Linear(d_model, d_model)
-        self.v_image = nn.Linear(d_model, d_model)
         
         # ========== Reasoning cross-attention K, V ==========
         self.k_reasoning = nn.Linear(d_model, d_model)
@@ -380,15 +375,11 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Per-source learnable temperature (log scale for stability) ==========
         self.temp_self = nn.Parameter(torch.zeros(1))
         self.temp_bev = nn.Parameter(torch.zeros(1))
-        self.temp_fused = nn.Parameter(torch.zeros(1))
-        self.temp_image = nn.Parameter(torch.zeros(1))
         self.temp_reason = nn.Parameter(torch.zeros(1))
         
         # ========== Per-source learnable bias (attention prior) ==========
         self.bias_self = nn.Parameter(torch.zeros(1))
         self.bias_bev = nn.Parameter(torch.zeros(1))
-        self.bias_fused = nn.Parameter(torch.zeros(1))
-        self.bias_image = nn.Parameter(torch.zeros(1))
         self.bias_reason = nn.Parameter(torch.zeros(1))
         
         # ========== Source-Specific Residual Paths ==========
@@ -400,22 +391,6 @@ class MultiSourceAttentionBlock(nn.Module):
         )
         self.bev_residual_gate = nn.Parameter(torch.zeros(1))
         
-        # Fused residual path
-        self.fused_residual_proj = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model),
-        )
-        self.fused_residual_gate = nn.Parameter(torch.zeros(1))
-        
-        # Image residual path
-        self.image_residual_proj = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model),
-        )
-        self.image_residual_gate = nn.Parameter(torch.zeros(1))
-        
         # Reasoning residual path: attention pooling (query-based)
         self.reason_residual_query = nn.Parameter(torch.randn(1, 1, d_model))
         self.reason_residual_attn = nn.MultiheadAttention(d_model, num_heads=4, dropout=dropout, batch_first=True)
@@ -425,19 +400,13 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Route-Specific Components (Stability Enhancement) ==========
         # Route-specific Q adapters
         self.route_q_adapter_bev = nn.Linear(d_model, d_model // 4)
-        self.route_q_adapter_fused = nn.Linear(d_model, d_model // 4)
-        self.route_q_adapter_image = nn.Linear(d_model, d_model // 4)
         self.route_q_adapter_reason = nn.Linear(d_model, d_model // 4)
         self.route_q_adapter_out = nn.Linear(d_model // 4, d_model)
         
         # Route-specific attention temperature and bias
         self.route_temp_bev = nn.Parameter(torch.zeros(1))
-        self.route_temp_fused = nn.Parameter(torch.zeros(1))
-        self.route_temp_image = nn.Parameter(torch.zeros(1))
         self.route_temp_reason = nn.Parameter(torch.zeros(1))
         self.route_bias_bev = nn.Parameter(torch.zeros(1))
-        self.route_bias_fused = nn.Parameter(torch.zeros(1))
-        self.route_bias_image = nn.Parameter(torch.zeros(1))
         self.route_bias_reason = nn.Parameter(torch.zeros(1))
         
         # Route-specific AdaLN modulation
@@ -489,31 +458,25 @@ class MultiSourceAttentionBlock(nn.Module):
         self,
         x: torch.Tensor,  # (B, T, d_model) - main sequence [trajectory | route]
         bev_tokens: torch.Tensor,     # (B, T_bev, d_model) - BEV tokens (already projected)
-        fused_tokens: torch.Tensor,   # (B, T_fused, d_model) - Fused tokens (already projected)
-        image_tokens: torch.Tensor,   # (B, T_img, d_model) - Image tokens (already projected)
         reasoning_tokens: torch.Tensor,  # (B, T_r, d_model) - reasoning tokens (already projected)
         conditioning: torch.Tensor,  # (B, d_model) - conditioning for AdaLN
         self_attn_mask: Optional[torch.Tensor] = None,
         bev_padding_mask: Optional[torch.Tensor] = None,
-        fused_padding_mask: Optional[torch.Tensor] = None,
-        image_padding_mask: Optional[torch.Tensor] = None,
         reasoning_padding_mask: Optional[torch.Tensor] = None,
         route_conditioning: Optional[torch.Tensor] = None,
         T_traj: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Forward pass with multi-source attention for transfuser features.
+        Forward pass with multi-source attention for transfuser features (DiffusionDriveV2 style).
         
-        Cross-attention sources:
+        Cross-attention sources (following DiffusionDriveV2):
         1. bev_tokens: flattened BEV feature (64 tokens)
-        2. fused_tokens: flattened fused feature (64 tokens)
-        3. image_tokens: flattened image feature grid (384 tokens)
-        4. reasoning_tokens: reasoning/VLM tokens
+        2. reasoning_tokens: reasoning/VLM tokens
+        
+        Note: fused_tokens and image_tokens are removed following DiffusionDriveV2's approach.
         """
         B, T, C = x.shape
         T_bev = bev_tokens.shape[1]
-        T_fused = fused_tokens.shape[1]
-        T_img = image_tokens.shape[1]
         T_r = reasoning_tokens.shape[1]
         
         # Determine if we have route-specific processing
@@ -550,14 +513,10 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Temperature scaling factors ==========
         temp_self = 1.0 + torch.nn.functional.softplus(self.temp_self)
         temp_bev = 1.0 + torch.nn.functional.softplus(self.temp_bev)
-        temp_fused = 1.0 + torch.nn.functional.softplus(self.temp_fused)
-        temp_image = 1.0 + torch.nn.functional.softplus(self.temp_image)
         temp_reason = 1.0 + torch.nn.functional.softplus(self.temp_reason)
         
         # Route-specific temperatures
         route_temp_bev = 1.0 + torch.nn.functional.softplus(self.route_temp_bev)
-        route_temp_fused = 1.0 + torch.nn.functional.softplus(self.route_temp_fused)
-        route_temp_image = 1.0 + torch.nn.functional.softplus(self.route_temp_image)
         route_temp_reason = 1.0 + torch.nn.functional.softplus(self.route_temp_reason)
         
         # ========== Q projection ==========
@@ -565,25 +524,17 @@ class MultiSourceAttentionBlock(nn.Module):
         
         # Trajectory Q adaptations
         q_adapt_bev_traj = self.q_adapter_out(torch.tanh(self.q_adapter_bev(x_norm[:, :T_traj, :])))
-        q_adapt_fused_traj = self.q_adapter_out(torch.tanh(self.q_adapter_fused(x_norm[:, :T_traj, :])))
-        q_adapt_image_traj = self.q_adapter_out(torch.tanh(self.q_adapter_image(x_norm[:, :T_traj, :])))
         q_adapt_reason_traj = self.q_adapter_out(torch.tanh(self.q_adapter_reason(x_norm[:, :T_traj, :])))
         
         # Route Q adaptations
         if T_route > 0:
             q_adapt_bev_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_bev(x_norm[:, T_traj:, :])))
-            q_adapt_fused_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_fused(x_norm[:, T_traj:, :])))
-            q_adapt_image_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_image(x_norm[:, T_traj:, :])))
             q_adapt_reason_route = self.route_q_adapter_out(torch.tanh(self.route_q_adapter_reason(x_norm[:, T_traj:, :])))
             
             q_adapt_bev = torch.cat([q_adapt_bev_traj, q_adapt_bev_route], dim=1)
-            q_adapt_fused = torch.cat([q_adapt_fused_traj, q_adapt_fused_route], dim=1)
-            q_adapt_image = torch.cat([q_adapt_image_traj, q_adapt_image_route], dim=1)
             q_adapt_reason = torch.cat([q_adapt_reason_traj, q_adapt_reason_route], dim=1)
         else:
             q_adapt_bev = q_adapt_bev_traj
-            q_adapt_fused = q_adapt_fused_traj
-            q_adapt_image = q_adapt_image_traj
             q_adapt_reason = q_adapt_reason_traj
         
         # ========== Self-attention K, V ==========
@@ -593,36 +544,24 @@ class MultiSourceAttentionBlock(nn.Module):
         # ========== Cross-attention K, V ==========
         k_bev = self.k_bev(bev_tokens)
         v_bev = self.v_bev(bev_tokens)
-        k_fused = self.k_fused(fused_tokens)
-        v_fused = self.v_fused(fused_tokens)
-        k_image = self.k_image(image_tokens)
-        v_image = self.v_image(image_tokens)
         k_reason = self.k_reasoning(reasoning_tokens)
         v_reason = self.v_reasoning(reasoning_tokens)
         
         # ========== Reshape to multi-head ==========
         q_base = self._reshape_heads(q_base, B, T)
         q_bev = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_bev, B, T)
-        q_fused = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_fused, B, T)
-        q_image = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_image, B, T)
         q_reason = self._reshape_heads(q_base.transpose(1, 2).reshape(B, T, C) + q_adapt_reason, B, T)
         
         k_self = self._reshape_heads(k_self, B, T)
         v_self = self._reshape_heads(v_self, B, T)
         k_bev = self._reshape_heads(k_bev, B, T_bev)
         v_bev = self._reshape_heads(v_bev, B, T_bev)
-        k_fused = self._reshape_heads(k_fused, B, T_fused)
-        v_fused = self._reshape_heads(v_fused, B, T_fused)
-        k_image = self._reshape_heads(k_image, B, T_img)
-        v_image = self._reshape_heads(v_image, B, T_img)
         k_reason = self._reshape_heads(k_reason, B, T_r)
         v_reason = self._reshape_heads(v_reason, B, T_r)
         
         # ========== Apply QK Normalization ==========
         q_base, k_self = self._apply_qk_norm(q_base, k_self)
         q_bev, k_bev = self._apply_qk_norm(q_bev, k_bev)
-        q_fused, k_fused = self._apply_qk_norm(q_fused, k_fused)
-        q_image, k_image = self._apply_qk_norm(q_image, k_image)
         q_reason, k_reason = self._apply_qk_norm(q_reason, k_reason)
         
         # ========== Apply RoPE ==========
@@ -633,8 +572,6 @@ class MultiSourceAttentionBlock(nn.Module):
         k_self = apply_rope_single(k_self, cos_main, sin_main)
         
         q_bev = apply_rope_single(q_bev, cos_main, sin_main)
-        q_fused = apply_rope_single(q_fused, cos_main, sin_main)
-        q_image = apply_rope_single(q_image, cos_main, sin_main)
         q_reason = apply_rope_single(q_reason, cos_main, sin_main)
         
         # K gets RoPE for cross-attention
@@ -642,16 +579,6 @@ class MultiSourceAttentionBlock(nn.Module):
         cos_bev = cos_bev.unsqueeze(0).unsqueeze(0)
         sin_bev = sin_bev.unsqueeze(0).unsqueeze(0)
         k_bev = apply_rope_single(k_bev, cos_bev, sin_bev)
-        
-        cos_fused, sin_fused = self._get_rope_embed(T_fused, x.device, x.dtype)
-        cos_fused = cos_fused.unsqueeze(0).unsqueeze(0)
-        sin_fused = sin_fused.unsqueeze(0).unsqueeze(0)
-        k_fused = apply_rope_single(k_fused, cos_fused, sin_fused)
-        
-        cos_img, sin_img = self._get_rope_embed(T_img, x.device, x.dtype)
-        cos_img = cos_img.unsqueeze(0).unsqueeze(0)
-        sin_img = sin_img.unsqueeze(0).unsqueeze(0)
-        k_image = apply_rope_single(k_image, cos_img, sin_img)
         
         cos_r, sin_r = self._get_rope_embed(T_r, x.device, x.dtype)
         cos_r = cos_r.unsqueeze(0).unsqueeze(0)
@@ -664,40 +591,30 @@ class MultiSourceAttentionBlock(nn.Module):
         attn_self = torch.matmul(q_base, k_self.transpose(-2, -1)) * temp_self + self.bias_self
         
         attn_bev_raw = torch.matmul(q_bev, k_bev.transpose(-2, -1))
-        attn_fused_raw = torch.matmul(q_fused, k_fused.transpose(-2, -1))
-        attn_image_raw = torch.matmul(q_image, k_image.transpose(-2, -1))
         attn_reason_raw = torch.matmul(q_reason, k_reason.transpose(-2, -1)) * ratio_g
         
         if T_route > 0:
             # Trajectory-specific temperature/bias
             attn_bev_traj = attn_bev_raw[:, :, :T_traj, :] * temp_bev + self.bias_bev
-            attn_fused_traj = attn_fused_raw[:, :, :T_traj, :] * temp_fused + self.bias_fused
-            attn_image_traj = attn_image_raw[:, :, :T_traj, :] * temp_image + self.bias_image
             attn_reason_traj = attn_reason_raw[:, :, :T_traj, :] * temp_reason + self.bias_reason
             
             # Route-specific temperature/bias
             attn_bev_route = attn_bev_raw[:, :, T_traj:, :] * route_temp_bev + self.route_bias_bev
-            attn_fused_route = attn_fused_raw[:, :, T_traj:, :] * route_temp_fused + self.route_bias_fused
-            attn_image_route = attn_image_raw[:, :, T_traj:, :] * route_temp_image + self.route_bias_image
             attn_reason_route = attn_reason_raw[:, :, T_traj:, :] * route_temp_reason + self.route_bias_reason
             
             attn_bev = torch.cat([attn_bev_traj, attn_bev_route], dim=2)
-            attn_fused = torch.cat([attn_fused_traj, attn_fused_route], dim=2)
-            attn_image = torch.cat([attn_image_traj, attn_image_route], dim=2)
             attn_reason = torch.cat([attn_reason_traj, attn_reason_route], dim=2)
         else:
             attn_bev = attn_bev_raw * temp_bev + self.bias_bev
-            attn_fused = attn_fused_raw * temp_fused + self.bias_fused
-            attn_image = attn_image_raw * temp_image + self.bias_image
             attn_reason = attn_reason_raw * temp_reason + self.bias_reason
         
         # Concatenate all attention scores
-        attn_scores = torch.cat([attn_self, attn_bev, attn_fused, attn_image, attn_reason], dim=-1)
+        attn_scores = torch.cat([attn_self, attn_bev, attn_reason], dim=-1)
         attn_scores = attn_scores / scale
         
         # Apply self-attention mask if provided
         if self_attn_mask is not None:
-            total_kv_len = T + T_bev + T_fused + T_img + T_r
+            total_kv_len = T + T_bev + T_r
             full_mask = torch.zeros(T, total_kv_len, device=x.device, dtype=x.dtype)
             full_mask[:, :T] = self_attn_mask
             attn_scores = attn_scores + full_mask.unsqueeze(0).unsqueeze(0)
@@ -709,16 +626,6 @@ class MultiSourceAttentionBlock(nn.Module):
             attn_scores[:, :, :, offset:offset+T_bev] = attn_scores[:, :, :, offset:offset+T_bev].masked_fill(mask, float('-inf'))
         offset += T_bev
         
-        if fused_padding_mask is not None:
-            mask = fused_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores[:, :, :, offset:offset+T_fused] = attn_scores[:, :, :, offset:offset+T_fused].masked_fill(mask, float('-inf'))
-        offset += T_fused
-        
-        if image_padding_mask is not None:
-            mask = image_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_scores[:, :, :, offset:offset+T_img] = attn_scores[:, :, :, offset:offset+T_img].masked_fill(mask, float('-inf'))
-        offset += T_img
-        
         if reasoning_padding_mask is not None:
             mask = reasoning_padding_mask.unsqueeze(1).unsqueeze(2)
             attn_scores[:, :, :, offset:] = attn_scores[:, :, :, offset:].masked_fill(mask, float('-inf'))
@@ -727,7 +634,7 @@ class MultiSourceAttentionBlock(nn.Module):
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
-        v_combined = torch.cat([v_self, v_bev, v_fused, v_image, v_reason], dim=2)
+        v_combined = torch.cat([v_self, v_bev, v_reason], dim=2)
         output = torch.matmul(attn_weights, v_combined)
         
         # Reshape and output projection
@@ -739,14 +646,6 @@ class MultiSourceAttentionBlock(nn.Module):
         bev_pooled = bev_tokens.mean(dim=1, keepdim=True)
         bev_residual = self.bev_residual_proj(bev_pooled).expand(-1, T, -1)
         
-        fused_gate = torch.sigmoid(self.fused_residual_gate)
-        fused_pooled = fused_tokens.mean(dim=1, keepdim=True)
-        fused_residual = self.fused_residual_proj(fused_pooled).expand(-1, T, -1)
-        
-        image_gate = torch.sigmoid(self.image_residual_gate)
-        image_pooled = image_tokens.mean(dim=1, keepdim=True)
-        image_residual = self.image_residual_proj(image_pooled).expand(-1, T, -1)
-        
         reason_gate = torch.sigmoid(self.reason_residual_gate)
         reason_query = self.reason_residual_query.expand(B, -1, -1)
         reason_pooled, _ = self.reason_residual_attn(
@@ -755,7 +654,7 @@ class MultiSourceAttentionBlock(nn.Module):
         )
         reason_residual = self.reason_residual_proj(reason_pooled).expand(-1, T, -1)
         
-        output = output + bev_gate * bev_residual + fused_gate * fused_residual + image_gate * image_residual + reason_gate * reason_residual
+        output = output + bev_gate * bev_residual + reason_gate * reason_residual
         
         # ========== Residual with segment-specific gate ==========
         if T_route > 0:
@@ -1079,7 +978,7 @@ class RouteMLPHead(nn.Module):
 
 class UnifiedDecoderOnlyTransformer(nn.Module):
     """
-    Unified Decoder-Only Transformer with heterogeneous queries.
+    Unified Decoder-Only Transformer with heterogeneous queries (DiffusionDriveV2 style).
     
     Combines trajectory prediction (horizon points) and route prediction (20 waypoints)
     into a single decoder, using:
@@ -1096,16 +995,16 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
     - Route positions: 0, 1, 2, ... (num_waypoints-1) representing spatial waypoints
     - Segment embeddings differentiate the two modalities
     
-    Cross-attention sources: All fused in single attention operation with:
+    Cross-attention sources (following DiffusionDriveV2):
         - Self-attention with RoPE on Q and K
-        - Adapter cross-attention (bev, vl) with RoPE on K only
-        - Task cross-attention (reasoning) with RoPE on K only + gating
+        - BEV cross-attention with RoPE on K only
+        - Reasoning cross-attention with RoPE on K only + gating
     
-    Transfuser Feature Processing:
+    Transfuser Feature Processing (following DiffusionDriveV2):
         - bev_feature: (B, 1512, 8, 8) -> flatten to (B, 64, 1512) -> project to (B, 64, d_model)
-        - bev_feature_upsample: (B, 64, 64, 64) -> used for GridSampleCrossBEVAttention
-        - fused_features: (B, 1512, 8, 8) -> flatten to (B, 64, 1512) -> project to (B, 64, d_model)
-        - image_feature_grid: (B, 1512, 12, 32) -> flatten to (B, 384, 1512) -> project to (B, 384, d_model)
+        - bev_feature_upsample: (B, 64, 64, 64) -> used for GridSampleCrossBEVAttention (spatial attention)
+        
+    Note: fused_features and image_feature_grid are NOT used, following DiffusionDriveV2's approach.
     """
     def __init__(
         self,
@@ -1114,10 +1013,9 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         num_layers: int = 12,
         dim_feedforward: int = 3072,
         dropout: float = 0.1,
-        # Transfuser feature dimensions
-        transfuser_bev_dim: int = 1512,       # bev_feature, fused_features channel dim
+        # Transfuser feature dimensions (following DiffusionDriveV2)
+        transfuser_bev_dim: int = 1512,       # bev_feature channel dim
         transfuser_bev_upsample_dim: int = 64, # bev_feature_upsample channel dim
-        transfuser_image_dim: int = 1512,      # image_feature_grid channel dim
         reasoning_dim: int = 1536,
         horizon: int = 8,
         num_waypoints: int = 20,
@@ -1129,22 +1027,10 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         self.horizon = horizon
         self.num_waypoints = num_waypoints
         
-        # ========== Transfuser Feature Projections ==========
+        # ========== Transfuser Feature Projections (following DiffusionDriveV2) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, d_model)
         self.bev_feature_proj = nn.Sequential(
             nn.Linear(transfuser_bev_dim, d_model), 
-            nn.LayerNorm(d_model)
-        )
-        
-        # fused_features: (B, 1512, 8, 8) -> (B, 64, d_model)
-        self.fused_feature_proj = nn.Sequential(
-            nn.Linear(transfuser_bev_dim, d_model), 
-            nn.LayerNorm(d_model)
-        )
-        
-        # image_feature_grid: (B, 1512, 12, 32) -> (B, 384, d_model)
-        self.image_feature_proj = nn.Sequential(
-            nn.Linear(transfuser_image_dim, d_model), 
             nn.LayerNorm(d_model)
         )
         
@@ -1154,7 +1040,7 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             nn.LayerNorm(d_model)
         )
         
-        # ========== GridSampleCrossBEVAttention for spatial BEV features ==========
+        # ========== GridSampleCrossBEVAttention for spatial BEV features (DiffusionDriveV2 style) ==========
         # Uses bev_feature_upsample: (B, 64, 64, 64) for spatial sampling
         self.bev_spatial_attn = GridSampleCrossBEVAttention(
             embed_dims=d_model,
@@ -1165,9 +1051,9 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             lidar_max_y=32.0
         )
         
-        # Position embeddings for cross-attention sources (combined tokens)
-        # Total tokens: 64 (bev) + 64 (fused) + 384 (image) = 512
-        self.combined_pos_emb = nn.Parameter(torch.zeros(1, 512, d_model))
+        # Position embeddings for cross-attention sources (BEV tokens only now)
+        # Total tokens: 64 (bev)
+        self.combined_pos_emb = nn.Parameter(torch.zeros(1, 64, d_model))
         
         # Route queries (learnable)
         self.route_queries = nn.Parameter(torch.randn(1, num_waypoints, d_model))
@@ -1291,8 +1177,6 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         traj_emb: torch.Tensor,  # (B, horizon, d_model) - trajectory query embeddings
         transfuser_bev_feature: torch.Tensor,       # (B, 1512, 8, 8)
         transfuser_bev_feature_upsample: torch.Tensor,  # (B, 64, 64, 64)
-        transfuser_fused_features: torch.Tensor,    # (B, 1512, 8, 8)
-        transfuser_image_feature_grid: torch.Tensor,  # (B, 1512, 12, 32)
         reasoning_tokens: torch.Tensor,             # (B, T_r, reasoning_dim)
         conditioning: torch.Tensor,                 # (B, d_model)
         traj_points: Optional[torch.Tensor] = None,  # (B, horizon, 2) for GridSampleCrossBEVAttention
@@ -1300,25 +1184,23 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
         route_conditioning: Optional[torch.Tensor] = None,  # (B, d_model) - route-specific conditioning
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass with unified queries and multi-source attention.
+        Forward pass with unified queries and multi-source attention (DiffusionDriveV2 style).
         
         Uses unidirectional self-attention mask:
         - Trajectory queries can see: trajectory + route (route guides trajectory)
         - Route queries can only see: route (independent planning)
-        - Both can attend to all cross-attention sources (transfuser features, reasoning)
+        - Both can attend to all cross-attention sources (BEV features, reasoning)
         
-        Transfuser Feature Processing:
+        Transfuser Feature Processing (following DiffusionDriveV2):
         - bev_feature: flatten to (B, 64, 1512) -> project to (B, 64, d_model)
         - bev_feature_upsample: used for GridSampleCrossBEVAttention at trajectory points
-        - fused_features: flatten to (B, 64, 1512) -> project to (B, 64, d_model)
-        - image_feature_grid: flatten to (B, 384, 1512) -> project to (B, 384, d_model)
+        
+        Note: fused_features and image_feature_grid are NOT used, following DiffusionDriveV2.
         
         Args:
             traj_emb: (B, horizon, d_model) - trajectory query embeddings (noisy traj embedded)
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature from transfuser
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upsampled BEV for spatial attention
-            transfuser_fused_features: (B, 1512, 8, 8) - Fused camera-lidar features
-            transfuser_image_feature_grid: (B, 1512, 12, 32) - Image feature grid
             reasoning_tokens: (B, T_r, reasoning_dim) - reasoning tokens
             conditioning: (B, d_model) - timestep + current_status conditioning
             traj_points: (B, horizon, 2) - trajectory points for spatial BEV attention
@@ -1352,29 +1234,14 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             T_traj, T_route, device=x.device, dtype=x.dtype
         )
         
-        # ========== Process Transfuser Features ==========
+        # ========== Process Transfuser Features (DiffusionDriveV2 style) ==========
         # bev_feature: (B, 1512, 8, 8) -> (B, 64, 1512) -> (B, 64, d_model)
         bev_feat = transfuser_bev_feature.flatten(2).permute(0, 2, 1)  # (B, 64, 1512)
         bev_proj = self.bev_feature_proj(bev_feat)  # (B, 64, d_model)
         
-        # fused_features: (B, 1512, 8, 8) -> (B, 64, 1512) -> (B, 64, d_model)
-        fused_feat = transfuser_fused_features.flatten(2).permute(0, 2, 1)  # (B, 64, 1512)
-        fused_proj = self.fused_feature_proj(fused_feat)  # (B, 64, d_model)
-        
-        # image_feature_grid: (B, 1512, 12, 32) -> (B, 384, 1512) -> (B, 384, d_model)
-        image_feat = transfuser_image_feature_grid.flatten(2).permute(0, 2, 1)  # (B, 384, 1512)
-        image_proj = self.image_feature_proj(image_feat)  # (B, 384, d_model)
-        
-        # Add position embeddings to each feature type
-        # BEV: 64 tokens
+        # Add position embeddings to BEV feature
         if bev_proj.shape[1] <= self.combined_pos_emb.shape[1]:
             bev_proj = bev_proj + self.combined_pos_emb[:, :bev_proj.shape[1], :]
-        # Fused: 64 tokens (use different offset for different position)
-        if fused_proj.shape[1] <= self.combined_pos_emb.shape[1]:
-            fused_proj = fused_proj + self.combined_pos_emb[:, :fused_proj.shape[1], :]
-        # Image: 384 tokens
-        if image_proj.shape[1] <= self.combined_pos_emb.shape[1]:
-            image_proj = image_proj + self.combined_pos_emb[:, :image_proj.shape[1], :]
         
         # Project reasoning tokens
         reasoning_proj = self.reasoning_proj(reasoning_tokens)
@@ -1392,14 +1259,10 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
             x = layer(
                 x, 
                 bev_proj,           # bev_tokens: (B, 64, d_model)
-                fused_proj,         # fused_tokens: (B, 64, d_model)
-                image_proj,         # image_tokens: (B, 384, d_model)
                 reasoning_proj,     # reasoning_tokens
                 conditioning,
                 self_attn_mask, 
                 None,               # bev_padding_mask
-                None,               # fused_padding_mask
-                None,               # image_padding_mask
                 reasoning_padding_mask,
                 route_conditioning=route_conditioning,
                 T_traj=T_traj,
@@ -1427,11 +1290,11 @@ class UnifiedDecoderOnlyTransformer(nn.Module):
 
 class TransformerForDiffusion(ModuleAttrMixin):
     """
-    Decoder-Only Transformer for Diffusion-based Trajectory Prediction.
+    Decoder-Only Transformer for Diffusion-based Trajectory Prediction (DiffusionDriveV2 style).
     
     Key features:
     - Unified decoder with heterogeneous queries for trajectory + route
-    - Cross-attention to: Transfuser features (4 types) + Reasoning
+    - Cross-attention to: Transfuser features (bev_feature, bev_feature_upsample) + Reasoning
     - DiffusionDriveV2-style GridSampleCrossBEVAttention for spatial BEV
     - ego_status history used for AdaLN conditioning only (not cross-attention)
     - Segment embeddings to distinguish query types
@@ -1439,13 +1302,12 @@ class TransformerForDiffusion(ModuleAttrMixin):
     - AdaLN modulation based on timestep + current_ego_status + GRU(history)
     
     Query structure: [trajectory (horizon) | route (20)]
-    Cross-attention sources: Transfuser features (bev, fused, image) + Reasoning
-    
-    Transfuser Features:
+    Cross-attention sources (following DiffusionDriveV2):
     - bev_feature: (B, 1512, 8, 8) - Original BEV from lidar
     - bev_feature_upsample: (B, 64, 64, 64) - FPN output p3 (for spatial attention)
-    - fused_features: (B, 1512, 8, 8) - Camera-lidar fusion
-    - image_feature_grid: (B, 1512, 12, 32) - Image features
+    - Reasoning tokens
+    
+    Note: fused_features and image_feature_grid are NOT used, following DiffusionDriveV2.
     
     Loss design:
     - Trajectory loss: for longitudinal control (speed/acceleration)
@@ -1469,10 +1331,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
         reasoning_emb_dim: int = 1536,
         status_dim: int = 15,
         ego_status_seq_len: int = 1,
-        # Transfuser feature dimensions (from transfuser backbone)
-        transfuser_bev_dim: int = 1512,        # bev_feature, fused_features channel dim
+        # Transfuser feature dimensions (following DiffusionDriveV2)
+        transfuser_bev_dim: int = 1512,        # bev_feature channel dim
         transfuser_bev_upsample_dim: int = 64,  # bev_feature_upsample channel dim
-        transfuser_image_dim: int = 1512,       # image_feature_grid channel dim
         num_waypoints: int = 20,
     ) -> None:
         super().__init__()
@@ -1487,7 +1348,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.reasoning_emb_dim = reasoning_emb_dim
         self.transfuser_bev_dim = transfuser_bev_dim
         self.transfuser_bev_upsample_dim = transfuser_bev_upsample_dim
-        self.transfuser_image_dim = transfuser_image_dim
         self.T = horizon
         
         # Input embedding for noisy trajectory
@@ -1512,8 +1372,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             nn.Linear(n_emb, n_emb),
         )
         
-        # Unified Decoder with heterogeneous queries
-        # Uses transfuser features instead of InterfuserBEVEncoder output
+        # Unified Decoder with heterogeneous queries (DiffusionDriveV2 style)
+        # Uses transfuser features (bev_feature, bev_feature_upsample) only
         self.decoder = UnifiedDecoderOnlyTransformer(
             d_model=n_emb,
             nhead=n_head,
@@ -1522,7 +1382,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
             dropout=p_drop_attn,
             transfuser_bev_dim=transfuser_bev_dim,
             transfuser_bev_upsample_dim=transfuser_bev_upsample_dim,
-            transfuser_image_dim=transfuser_image_dim,
             reasoning_dim=reasoning_emb_dim,
             horizon=horizon,
             num_waypoints=num_waypoints,
@@ -1632,15 +1491,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
         cond: torch.Tensor,
         transfuser_bev_feature: torch.Tensor,
         transfuser_bev_feature_upsample: torch.Tensor,
-        transfuser_fused_features: torch.Tensor,
-        transfuser_image_feature_grid: torch.Tensor,
         reasoning_query_tokens: torch.Tensor,
         ego_status: torch.Tensor,
         reasoning_mask: Optional[torch.Tensor] = None,
         **kwargs
     ):
         """
-        Forward pass with unified decoder and transfuser features.
+        Forward pass with unified decoder and transfuser features (DiffusionDriveV2 style).
         
         Args:
             sample: (B, T, input_dim) - noisy trajectory
@@ -1648,10 +1505,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
             cond: (B, T_obs, cond_dim) - for API compatibility (not used)
             transfuser_bev_feature: (B, 1512, 8, 8) - BEV feature from transfuser
             transfuser_bev_feature_upsample: (B, 64, 64, 64) - Upsampled BEV for spatial attention
-            transfuser_fused_features: (B, 1512, 8, 8) - Fused camera-lidar features
-            transfuser_image_feature_grid: (B, 1512, 12, 32) - Image feature grid
             reasoning_query_tokens: (B, T_r, reasoning_dim) - reasoning tokens
             ego_status: (B, T_obs, status_dim) - ego status history (complete 4 frames)
+            
+        Note: transfuser_fused_features and transfuser_image_feature_grid are NOT used,
+        following DiffusionDriveV2's approach.
             
         Returns:
             trajectory: (B, T, output_dim) - for longitudinal control
@@ -1665,8 +1523,6 @@ class TransformerForDiffusion(ModuleAttrMixin):
         sample = sample.contiguous().to(dtype=model_dtype)
         transfuser_bev_feature = transfuser_bev_feature.contiguous().to(dtype=model_dtype)
         transfuser_bev_feature_upsample = transfuser_bev_feature_upsample.contiguous().to(dtype=model_dtype)
-        transfuser_fused_features = transfuser_fused_features.contiguous().to(dtype=model_dtype)
-        transfuser_image_feature_grid = transfuser_image_feature_grid.contiguous().to(dtype=model_dtype)
         reasoning_tokens = reasoning_query_tokens.contiguous().to(dtype=model_dtype)
         ego_status = ego_status.to(dtype=model_dtype)
         
@@ -1709,18 +1565,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
         # ========== Padding Masks ==========
         reasoning_padding_mask = ~reasoning_mask if reasoning_mask is not None else (torch.norm(reasoning_tokens, dim=-1) == 0)
         
-        # ========== Unified Decoder ==========
+        # ========== Unified Decoder (DiffusionDriveV2 style) ==========
         # Note: Unidirectional self-attention mask is created internally by decoder
         # - Trajectory can see: trajectory + route (route guides trajectory)
         # - Route can only see: route (independent planning)
-        # Cross-attention: Transfuser features (bev, fused, image) + Reasoning
+        # Cross-attention: Transfuser features (bev) + Reasoning (following DiffusionDriveV2)
         # Route-specific processing: independent Q adapters, temperature/bias, AdaLN
         traj_out, route_out = self.decoder(
             traj_emb,
             transfuser_bev_feature=transfuser_bev_feature,
             transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-            transfuser_fused_features=transfuser_fused_features,
-            transfuser_image_feature_grid=transfuser_image_feature_grid,
             reasoning_tokens=reasoning_tokens,
             conditioning=conditioning,
             traj_points=sample,  # Use noisy trajectory for spatial BEV attention
@@ -1744,10 +1598,10 @@ class TransformerForDiffusion(ModuleAttrMixin):
 # =============================================================================
 
 def test():
-    """Test the unified decoder-only architecture with transfuser features."""
+    """Test the unified decoder-only architecture with transfuser features (DiffusionDriveV2 style)."""
     print("=" * 60)
     print("Testing TransformerForDiffusion (Unified Decoder-Only)")
-    print("With Transfuser Features + Reasoning")
+    print("With Transfuser Features + Reasoning (DiffusionDriveV2 style)")
     print("=" * 60)
     
     transformer = TransformerForDiffusion(
@@ -1762,10 +1616,9 @@ def test():
         causal_attn=True,
         reasoning_emb_dim=1536,
         status_dim=14,  # Updated: speed(1) + theta(1) + command(6) + target_point(2) + target_point_next(2) + waypoints(2)
-        # Transfuser feature dimensions
+        # Transfuser feature dimensions (following DiffusionDriveV2)
         transfuser_bev_dim=1512,
         transfuser_bev_upsample_dim=64,
-        transfuser_image_dim=1512,
         num_waypoints=20,
     )
     
@@ -1776,11 +1629,9 @@ def test():
     sample = torch.randn((B, 8, 2))
     cond = torch.zeros((B, 4, 10))
     
-    # Transfuser features (matching backbone output shapes)
+    # Transfuser features (following DiffusionDriveV2: only bev_feature and bev_feature_upsample)
     transfuser_bev_feature = torch.randn((B, 1512, 8, 8))
     transfuser_bev_feature_upsample = torch.randn((B, 64, 64, 64))
-    transfuser_fused_features = torch.randn((B, 1512, 8, 8))
-    transfuser_image_feature_grid = torch.randn((B, 1512, 12, 32))
     
     reasoning_tokens = torch.randn((B, 10, 1536))
     ego_status = torch.randn((B, 4, 14))  # 4 frames of history with updated dim
@@ -1790,8 +1641,6 @@ def test():
         sample=sample, timestep=timestep, cond=cond,
         transfuser_bev_feature=transfuser_bev_feature,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-        transfuser_fused_features=transfuser_fused_features,
-        transfuser_image_feature_grid=transfuser_image_feature_grid,
         reasoning_query_tokens=reasoning_tokens,
         ego_status=ego_status,
     )
@@ -1806,8 +1655,6 @@ def test():
         sample=sample, timestep=timestep, cond=cond,
         transfuser_bev_feature=transfuser_bev_feature2,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-        transfuser_fused_features=transfuser_fused_features,
-        transfuser_image_feature_grid=transfuser_image_feature_grid,
         reasoning_query_tokens=reasoning_tokens,
         ego_status=ego_status,
     )
@@ -1821,8 +1668,6 @@ def test():
         sample=sample, timestep=timestep, cond=cond,
         transfuser_bev_feature=transfuser_bev_feature,
         transfuser_bev_feature_upsample=transfuser_bev_feature_upsample,
-        transfuser_fused_features=transfuser_fused_features,
-        transfuser_image_feature_grid=transfuser_image_feature_grid,
         reasoning_query_tokens=reasoning_tokens,
         ego_status=ego_status2,
     )
@@ -1837,12 +1682,11 @@ def test():
     print("\n" + "=" * 60)
     print("✓ All tests passed!")
     print("=" * 60)
-    print("\nArchitecture Improvements:")
-    print("  1. Transfuser Features:")
+    print("\nArchitecture (DiffusionDriveV2 style):")
+    print("  1. Transfuser Features (following DiffusionDriveV2):")
     print("     - bev_feature: (1512, 8, 8) -> flattened cross-attention")
     print("     - bev_feature_upsample: (64, 64, 64) -> GridSampleCrossBEVAttention")
-    print("     - fused_features: (1512, 8, 8) -> flattened cross-attention")
-    print("     - image_feature_grid: (1512, 12, 32) -> flattened cross-attention")
+    print("     - NOTE: fused_features and image_feature_grid are NOT used")
     print("\n  2. GridSampleCrossBEVAttention (DiffusionDriveV2 style):")
     print("     - Samples BEV features at trajectory point locations")
     print("     - Attention-weighted aggregation of sampled features")
