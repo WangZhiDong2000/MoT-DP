@@ -7,7 +7,10 @@ import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from model.transformer_for_diffusion_multi_head import TransformerForDiffusion
+from model.transfuser_extractor.backbone_extractor import TransFuserBackboneExtractor
 import os
+import cv2
+import laspy
 
 
 
@@ -96,6 +99,25 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         self.model = model
         
+        # ========== TransFuser Backbone for feature extraction ==========
+        transfuser_backbone_cfg = config.get('transfuser_backbone', {})
+        transfuser_config_path = transfuser_backbone_cfg.get(
+            'config_path', 
+            '/home/wang/Project/carla_garage/leaderboard/leaderboard/pretrained_models/all_towns'
+        )
+        transfuser_device = transfuser_backbone_cfg.get('device', 'cuda:0')
+        
+        print(f"Loading TransFuser backbone from: {transfuser_config_path}")
+        self.transfuser_backbone = TransFuserBackboneExtractor(
+            config_path=transfuser_config_path,
+            device=transfuser_device
+        )
+        # Backbone is already frozen in TransFuserBackboneExtractor
+        self.transfuser_backbone.eval()
+        # Get config for lidar processing
+        self.transfuser_config = self.transfuser_backbone.config
+        print("✓ TransFuser backbone loaded and frozen.")
+        
         # ========== Truncated Diffusion Configuration (DiffusionDriveV2 style) ==========
         diffusion_cfg = config.get('truncated_diffusion', {})
         self.num_train_timesteps = diffusion_cfg.get('num_train_timesteps', 1000)
@@ -127,6 +149,148 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self.obs_feature_dim = obs_feature_dim
         self.horizon = policy_cfg.get('horizon', 16)
         self.n_action_steps = policy_cfg.get('action_horizon', 8)
+    
+    # ========== TransFuser Preprocessing Functions ==========
+    # These functions match model/transfuser_extractor/preprocess_dataset.py exactly
+    
+    def preprocess_rgb(self, rgb_path: str) -> torch.Tensor:
+        """
+        Preprocess RGB image (same as preprocess_dataset.py)
+        
+        Args:
+            rgb_path: Path to RGB image file
+            
+        Returns:
+            torch.Tensor: Preprocessed RGB tensor [1, 3, H, W]
+        """
+        from model.transfuser_extractor import transfuser_utils as t_u
+        
+        # Read image
+        image = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Crop (same as data.py)
+        image = t_u.crop_array(self.transfuser_config, image)
+        
+        # Convert to PyTorch format (C, H, W)
+        image = np.transpose(image, (2, 0, 1))
+        
+        # Convert to tensor
+        image = torch.from_numpy(image).float().unsqueeze(0)
+        
+        return image
+    
+    def preprocess_lidar(self, lidar_path: str) -> torch.Tensor:
+        """
+        Preprocess LiDAR point cloud (same as preprocess_dataset.py)
+        
+        Args:
+            lidar_path: Path to LiDAR .laz file
+            
+        Returns:
+            torch.Tensor: Preprocessed LiDAR BEV tensor [1, C, H, W]
+        """
+        # Read LiDAR data
+        las_object = laspy.read(lidar_path)
+        lidar = las_object.xyz
+        
+        # Convert to histogram features (same as data.py's lidar_to_histogram_features)
+        lidar_bev = self.lidar_to_histogram_features(lidar, use_ground_plane=self.transfuser_config.use_ground_plane)
+        
+        # Convert to tensor
+        lidar_bev = torch.from_numpy(lidar_bev).float().unsqueeze(0)
+        
+        return lidar_bev
+    
+    def lidar_to_histogram_features(self, lidar: np.ndarray, use_ground_plane: bool) -> np.ndarray:
+        """
+        Convert LiDAR point cloud to 2-bin histogram BEV representation
+        (Same as backbone_extractor.py and data.py)
+        
+        Args:
+            lidar: (N, 3) numpy, LiDAR point cloud
+            use_ground_plane: Whether to use ground plane
+            
+        Returns:
+            (C, H, W) numpy, LiDAR BEV features
+        """
+        config = self.transfuser_config
+        
+        def splat_points(point_cloud):
+            # 256 x 256 grid
+            xbins = np.linspace(config.min_x, config.max_x,
+                                (config.max_x - config.min_x) * int(config.pixels_per_meter) + 1)
+            ybins = np.linspace(config.min_y, config.max_y,
+                                (config.max_y - config.min_y) * int(config.pixels_per_meter) + 1)
+            hist = np.histogramdd(point_cloud[:, :2], bins=(xbins, ybins))[0]
+            hist[hist > config.hist_max_per_pixel] = config.hist_max_per_pixel
+            overhead_splat = hist / config.hist_max_per_pixel
+            return overhead_splat.T
+        
+        # Remove points above vehicle
+        lidar = lidar[lidar[..., 2] < config.max_height_lidar]
+        below = lidar[lidar[..., 2] <= config.lidar_split_height]
+        above = lidar[lidar[..., 2] > config.lidar_split_height]
+        below_features = splat_points(below)
+        above_features = splat_points(above)
+        
+        if use_ground_plane:
+            features = np.stack([below_features, above_features], axis=-1)
+        else:
+            features = np.stack([above_features], axis=-1)
+        
+        features = np.transpose(features, (2, 0, 1)).astype(np.float32)
+        return features
+    
+    def extract_transfuser_features(self, rgb_paths: list, lidar_paths: list, device: torch.device, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+        """
+        Extract TransFuser features from RGB and LiDAR paths for a batch.
+        
+        Args:
+            rgb_paths: List of RGB image paths
+            lidar_paths: List of LiDAR .laz file paths
+            device: Target device
+            dtype: Target dtype (e.g., torch.bfloat16)
+            
+        Returns:
+            Dict containing:
+                - 'bev_feature': (B, 1512, 8, 8)
+                - 'bev_feature_upscale': (B, 64, 64, 64)
+                - 'fused_features': (B, 1512, 8, 8) or (B, 1512)
+                - 'image_feature_grid': (B, 1512, 12, 32)
+        """
+        batch_size = len(rgb_paths)
+        
+        # Process each sample in the batch
+        rgb_tensors = []
+        lidar_tensors = []
+        
+        for i in range(batch_size):
+            rgb = self.preprocess_rgb(rgb_paths[i])
+            lidar_bev = self.preprocess_lidar(lidar_paths[i])
+            rgb_tensors.append(rgb)
+            lidar_tensors.append(lidar_bev)
+        
+        # Stack into batch tensors
+        rgb_batch = torch.cat(rgb_tensors, dim=0).to(device=device, dtype=dtype)
+        lidar_batch = torch.cat(lidar_tensors, dim=0).to(device=device, dtype=dtype)
+        
+        # Run through TransFuser backbone (already frozen)
+        with torch.no_grad():
+            output = self.transfuser_backbone(rgb_batch, lidar_batch)
+        
+        # Process fused_features: if 2D (B, C), reshape to (B, C, 8, 8)
+        fused_features = output['fused_features']
+        if fused_features is not None and fused_features.dim() == 2:
+            fused_features = fused_features.unsqueeze(-1).unsqueeze(-1)
+            fused_features = fused_features.expand(-1, -1, 8, 8)
+        
+        return {
+            'transfuser_bev_feature': output['bev_feature'],
+            'transfuser_bev_feature_upsample': output['bev_feature_upscale'],
+            'transfuser_fused_features': fused_features if fused_features is not None else output['bev_feature'],
+            'transfuser_image_feature_grid': output['image_feature_grid'] if output['image_feature_grid'] is not None else torch.zeros(batch_size, 1512, 12, 32, device=device, dtype=dtype)
+        }
     
     # ========== Normalization Functions ==========
     def norm_odo(self, odo_info_fut: torch.Tensor) -> torch.Tensor:
@@ -333,7 +497,11 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
-            # Transfuser features (single frame, no temporal)
+            # TransFuser input paths (for on-the-fly feature extraction)
+            'transfuser_rgb_path': List[str] - RGB image paths
+            'transfuser_lidar_path': List[str] - LiDAR .laz file paths
+            
+            # OR precomputed Transfuser features (backward compatible)
             'transfuser_bev_feature': (B, 1512, 8, 8) - BEV feature
             'transfuser_bev_feature_upsample': (B, 64, 64, 64) - Upscaled BEV feature
             'transfuser_fused_features': (B, 1512, 8, 8) - Fused camera-lidar features
@@ -368,11 +536,22 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if route_gt is not None:
             route_gt = route_gt.to(device=device, dtype=model_dtype)  # (B, num_waypoints, 2)
         
-        # Load transfuser features (single frame, no temporal)
-        transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        transfuser_fused_features = batch['transfuser_fused_features'].to(device=device, dtype=model_dtype)
-        transfuser_image_feature_grid = batch['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
+        # Extract TransFuser features from RGB/LiDAR paths or use precomputed features
+        if 'transfuser_rgb_path' in batch and 'transfuser_lidar_path' in batch:
+            # On-the-fly feature extraction from paths
+            rgb_paths = batch['transfuser_rgb_path']
+            lidar_paths = batch['transfuser_lidar_path']
+            transfuser_features = self.extract_transfuser_features(rgb_paths, lidar_paths, device, model_dtype)
+            transfuser_bev_feature = transfuser_features['transfuser_bev_feature']
+            transfuser_bev_feature_upsample = transfuser_features['transfuser_bev_feature_upsample']
+            transfuser_fused_features = transfuser_features['transfuser_fused_features']
+            transfuser_image_feature_grid = transfuser_features['transfuser_image_feature_grid']
+        else:
+            # Use precomputed features (backward compatible)
+            transfuser_bev_feature = batch['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+            transfuser_bev_feature_upsample = batch['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+            transfuser_fused_features = batch['transfuser_fused_features'].to(device=device, dtype=model_dtype)
+            transfuser_image_feature_grid = batch['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
 
         # Prepare reasoning tokens
         reasoning_query_tokens = batch['reasoning_query_tokens']
@@ -640,19 +819,46 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
-        nobs = dict_apply(obs_dict, lambda x: x.to(device))
+        
+        # Handle non-tensor values (paths) separately
+        nobs = {}
+        for key, value in obs_dict.items():
+            if isinstance(value, torch.Tensor):
+                nobs[key] = value.to(device)
+            else:
+                nobs[key] = value  # Keep paths as-is
 
-        value = next(iter(nobs.values()))
-        B = value.shape[0]
+        # Determine batch size from first tensor
+        for value in nobs.values():
+            if isinstance(value, torch.Tensor):
+                B = value.shape[0]
+                break
+        else:
+            B = 1
+            
         T = self.horizon
         Da = self.action_dim
         To = self.n_obs_steps
 
-        # Load transfuser features (single frame, no temporal)
-        transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
-        transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
-        transfuser_fused_features = nobs['transfuser_fused_features'].to(device=device, dtype=model_dtype)
-        transfuser_image_feature_grid = nobs['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
+        # Extract TransFuser features from RGB/LiDAR paths or use precomputed features
+        if 'transfuser_rgb_path' in nobs and 'transfuser_lidar_path' in nobs:
+            # On-the-fly feature extraction from paths
+            rgb_paths = nobs['transfuser_rgb_path']
+            lidar_paths = nobs['transfuser_lidar_path']
+            if not isinstance(rgb_paths, list):
+                rgb_paths = [rgb_paths]
+                lidar_paths = [lidar_paths]
+            transfuser_features = self.extract_transfuser_features(rgb_paths, lidar_paths, device, model_dtype)
+            transfuser_bev_feature = transfuser_features['transfuser_bev_feature']
+            transfuser_bev_feature_upsample = transfuser_features['transfuser_bev_feature_upsample']
+            transfuser_fused_features = transfuser_features['transfuser_fused_features']
+            transfuser_image_feature_grid = transfuser_features['transfuser_image_feature_grid']
+        else:
+            # Use precomputed features (from closed-loop agent)
+            transfuser_bev_feature = nobs['transfuser_bev_feature'].to(device=device, dtype=model_dtype)
+            transfuser_bev_feature_upsample = nobs['transfuser_bev_feature_upsample'].to(device=device, dtype=model_dtype)
+            transfuser_fused_features = nobs['transfuser_fused_features'].to(device=device, dtype=model_dtype)
+            transfuser_image_feature_grid = nobs['transfuser_image_feature_grid'].to(device=device, dtype=model_dtype)
 
         # Process reasoning tokens
         reasoning_query_tokens = nobs['reasoning_query_tokens']

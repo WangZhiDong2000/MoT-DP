@@ -554,31 +554,21 @@ def preprocess(folder_list, idx, tmp_dir, data_root, out_dir,
                     
             frame_data['rgb_hist_jpg'] = rgb_hist
             
-            # --- Transfuser Features (single frame, no temporal) ---
-            # Load four features: bev_feature, bev_feature_upsample, fused_features, image_feature_grid
-            transfuser_feature_dir = join(folder_path, 'transfuser_feature')
+            # --- RGB and LiDAR paths for TransFuser backbone (single frame, no temporal) ---
+            # Instead of loading precomputed features, store paths for on-the-fly processing
+            rgb_file = join(folder_path, 'rgb', f"{ii:04d}.jpg")
+            lidar_file = join(folder_path, 'lidar', f"{ii:04d}.laz")
             
-            if os.path.exists(transfuser_feature_dir):
-                # Check if all four feature files exist for current frame
-                bev_feature_file = join(transfuser_feature_dir, f"{ii:04d}_feature.pt")
-                bev_feature_upsample_file = join(transfuser_feature_dir, f"{ii:04d}_feature_upsample.pt")
-                fused_features_file = join(transfuser_feature_dir, f"{ii:04d}_fused_features.pt")
-                image_feature_grid_file = join(transfuser_feature_dir, f"{ii:04d}_image_feature_grid.pt")
-                
-                if all(os.path.exists(f) for f in [bev_feature_file, bev_feature_upsample_file, 
-                                                    fused_features_file, image_feature_grid_file]):
-                    # Store relative paths for lazy loading
-                    frame_data['transfuser_bev_feature'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_feature.pt")
-                    frame_data['transfuser_bev_feature_upsample'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_feature_upsample.pt")
-                    frame_data['transfuser_fused_features'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_fused_features.pt")
-                    frame_data['transfuser_image_feature_grid'] = join(folder_name, 'transfuser_feature', f"{ii:04d}_image_feature_grid.pt")
-                else:
-                    # Skip this sample if any transfuser feature is missing
-                    continue
-            else:
-                # Skip this sample if transfuser_feature directory doesn't exist
-                print(f"Warning: transfuser_feature directory not found in {folder_name}, skipping frame {ii}...")
+            if not os.path.exists(rgb_file):
+                print(f"Warning: RGB file not found: {rgb_file}, skipping frame {ii}...")
                 continue
+            if not os.path.exists(lidar_file):
+                print(f"Warning: LiDAR file not found: {lidar_file}, skipping frame {ii}...")
+                continue
+            
+            # Store relative paths for lazy loading by backbone
+            frame_data['transfuser_rgb_path'] = join(folder_name, 'rgb', f"{ii:04d}.jpg")
+            frame_data['transfuser_lidar_path'] = join(folder_name, 'lidar', f"{ii:04d}.laz")
 
             # --- VQA Features (dp_vl_feature) ---
             # Load only the current frame's corresponding .pt file (no history)

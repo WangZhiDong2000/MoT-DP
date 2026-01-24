@@ -18,6 +18,34 @@ sys.path.append(project_root)
 from dataset.unified_carla_dataset import CARLAImageDataset
 from policy.diffusion_dit_carla_policy import DiffusionDiTCarlaPolicy
 
+
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle mixed types (tensors and strings).
+    Strings (file paths) are collected into lists, tensors are stacked.
+    """
+    elem = batch[0]
+    result = {}
+    
+    for key in elem.keys():
+        values = [d[key] for d in batch]
+        
+        # Check if all values are tensors
+        if isinstance(values[0], torch.Tensor):
+            result[key] = torch.stack(values, dim=0)
+        elif isinstance(values[0], np.ndarray):
+            result[key] = torch.from_numpy(np.stack(values, axis=0))
+        elif isinstance(values[0], str):
+            # Keep strings as a list (file paths)
+            result[key] = values
+        elif isinstance(values[0], (int, float)):
+            result[key] = torch.tensor(values)
+        else:
+            # For other types, just keep as list
+            result[key] = values
+    
+    return result
+
 def load_config(config_path=None):
     if config_path is None:
         config_path = os.path.join(project_root, "config", "pdm_server.yaml")
@@ -171,15 +199,23 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 loss = model_for_inference.compute_loss(batch)
                 val_metrics['loss'].append(loss.item())
                 
+                # Build obs_dict - support both path-based and precomputed features
                 obs_dict = {
-                    'transfuser_bev_feature': batch['transfuser_bev_feature'],
-                    'transfuser_bev_feature_upsample': batch['transfuser_bev_feature_upsample'],
-                    'transfuser_fused_features': batch['transfuser_fused_features'],
-                    'transfuser_image_feature_grid': batch['transfuser_image_feature_grid'],
                     'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
                     'reasoning_query_tokens': batch['reasoning_query_tokens'],
                     'anchor': batch['anchor']  # Pass anchor for truncated diffusion
                 }
+                
+                # Add TransFuser inputs (paths or precomputed features)
+                if 'transfuser_rgb_path' in batch:
+                    obs_dict['transfuser_rgb_path'] = batch['transfuser_rgb_path']
+                    obs_dict['transfuser_lidar_path'] = batch['transfuser_lidar_path']
+                else:
+                    obs_dict['transfuser_bev_feature'] = batch['transfuser_bev_feature']
+                    obs_dict['transfuser_bev_feature_upsample'] = batch['transfuser_bev_feature_upsample']
+                    obs_dict['transfuser_fused_features'] = batch['transfuser_fused_features']
+                    obs_dict['transfuser_image_feature_grid'] = batch['transfuser_image_feature_grid']
+                    
                 target_actions = batch['agent_pos']  
                 
                 try:
@@ -381,7 +417,8 @@ def train_pdm_policy(config_path):
         pin_memory=True,
         persistent_workers=persistent_workers if num_workers > 0 else False,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        drop_last=True
+        drop_last=True,
+        collate_fn=custom_collate_fn  # Handle mixed types (tensors + strings)
     )
     
     # Validation loader: only create meaningful loader for rank 0
@@ -401,7 +438,8 @@ def train_pdm_policy(config_path):
             shuffle=False,
             num_workers=0,  # No workers needed for empty validation
             pin_memory=False,
-            drop_last=True
+            drop_last=True,
+            collate_fn=custom_collate_fn  # Handle mixed types (tensors + strings)
         )
     else:
         # Rank 0 or single GPU: use full validation dataset
@@ -414,7 +452,8 @@ def train_pdm_policy(config_path):
             pin_memory=True,
             persistent_workers=persistent_workers if num_workers > 0 else False,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            drop_last=True
+            drop_last=True,
+            collate_fn=custom_collate_fn  # Handle mixed types (tensors + strings)
         )
     
     if rank == 0:

@@ -77,28 +77,16 @@ class CARLAImageDataset(torch.utils.data.Dataset):
             image_paths = sample.get('rgb_hist_jpg', [])
             images_tensor = self.load_image(image_paths, sample_path)
 
-        # --- Load Transfuser Features (single frame, no temporal) ---
-        # Four features: bev_feature, bev_feature_upsample, fused_features, image_feature_grid
-        transfuser_bev_feature = None
-        transfuser_bev_feature_upsample = None
-        transfuser_fused_features = None
-        transfuser_image_feature_grid = None
+        # --- Load RGB and LiDAR paths for TransFuser backbone (single frame, no temporal) ---
+        # Instead of loading precomputed features, we load raw data paths for on-the-fly processing
+        transfuser_rgb_path = None
+        transfuser_lidar_path = None
         
-        if 'transfuser_bev_feature' in sample:
-            bev_feature_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature'])
-            transfuser_bev_feature = torch.load(bev_feature_path, weights_only=True).squeeze(0)  # Remove batch dim
+        if 'transfuser_rgb_path' in sample:
+            transfuser_rgb_path = os.path.join(self.image_data_root, sample['transfuser_rgb_path'])
         
-        if 'transfuser_bev_feature_upsample' in sample:
-            bev_feature_upsample_path = os.path.join(self.image_data_root, sample['transfuser_bev_feature_upsample'])
-            transfuser_bev_feature_upsample = torch.load(bev_feature_upsample_path, weights_only=True).squeeze(0)
-        
-        if 'transfuser_fused_features' in sample:
-            fused_features_path = os.path.join(self.image_data_root, sample['transfuser_fused_features'])
-            transfuser_fused_features = torch.load(fused_features_path, weights_only=True).squeeze(0)
-        
-        if 'transfuser_image_feature_grid' in sample:
-            image_feature_grid_path = os.path.join(self.image_data_root, sample['transfuser_image_feature_grid'])
-            transfuser_image_feature_grid = torch.load(image_feature_grid_path, weights_only=True).squeeze(0)
+        if 'transfuser_lidar_path' in sample:
+            transfuser_lidar_path = os.path.join(self.image_data_root, sample['transfuser_lidar_path'])
         
         # Load VQA feature from pt file
         vqa_path = sample.get('vqa', None)
@@ -136,22 +124,18 @@ class CARLAImageDataset(torch.utils.data.Dataset):
                 route_data = torch.from_numpy(value).float()
                 final_sample['route'] = route_data
             elif key.startswith('transfuser_'):
-                # Skip transfuser paths, we already loaded them as tensors
+                # Skip transfuser paths, we handle them separately
                 continue
             elif isinstance(value, np.ndarray):
                 final_sample[key] = torch.from_numpy(value).float()
             else:
                 final_sample[key] = value
 
-        # Add transfuser features to final_sample
-        if transfuser_bev_feature is not None:
-            final_sample['transfuser_bev_feature'] = transfuser_bev_feature
-        if transfuser_bev_feature_upsample is not None:
-            final_sample['transfuser_bev_feature_upsample'] = transfuser_bev_feature_upsample
-        if transfuser_fused_features is not None:
-            final_sample['transfuser_fused_features'] = transfuser_fused_features
-        if transfuser_image_feature_grid is not None:
-            final_sample['transfuser_image_feature_grid'] = transfuser_image_feature_grid
+        # Add transfuser RGB and LiDAR paths for backbone processing
+        if transfuser_rgb_path is not None:
+            final_sample['transfuser_rgb_path'] = transfuser_rgb_path
+        if transfuser_lidar_path is not None:
+            final_sample['transfuser_lidar_path'] = transfuser_lidar_path
 
         # Build ego_status: concatenate historical low-dimensional states
         # Order: speed_hist, theta_hist, command_hist, waypoints_hist
