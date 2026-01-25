@@ -285,7 +285,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.brake_ratio = 1.1
 		self.clip_delta = 1.0
 		self.clip_throttle = 1.0
-		self.stuck_threshold = 800 #800
+		self.stuck_threshold = 300 #800
 		self.stuck_helper_threshold = 100
 		self.creep_duration = 15
 		self.creep_throttle = 0.4
@@ -1290,8 +1290,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			
 			# Force move: override throttle and brake to get unstuck
 			if self.force_move > 0:
-				# throttle = max(self.creep_throttle, throttle)
-				throttle = 0
+				throttle = max(self.creep_throttle, throttle)
 				brake = False
 				self.force_move -= 1
 				print(f"force_move: {self.force_move}")
