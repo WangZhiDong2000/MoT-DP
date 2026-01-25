@@ -193,7 +193,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		self.config = create_carla_config()
 		device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 		checkpoint_base_path = self.config.get('training', {}).get('checkpoint_dir', "/home/wang/Project/MoT-DP/checkpoints/carla_dit_best")
-		checkpoint_path = os.path.join(checkpoint_base_path, "dit_policy_best.pt")
+		checkpoint_path = os.path.join(checkpoint_base_path, "dit_policy_best_epoch129.pt")
 		self.net = load_best_model(checkpoint_path, self.config, device)
 		self.net = self.net.to(torch.bfloat16)
 		if hasattr(self.net, 'obs_encoder'):
@@ -1223,7 +1223,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			if reason_feat.dim() == 2:
 				reason_feat = reason_feat.unsqueeze(0)  # (1, Nr, C)
 			
-			# ========== Run TransFuser backbone to get 4 features ==========
+			# ========== Run TransFuser backbone to get BEV features ==========
 			with torch.no_grad():
 				# Convert inputs to bfloat16 to match transfuser backbone
 				transfuser_rgb_bf16 = tick_data['transfuser_rgb'].to(torch.bfloat16)
@@ -1233,39 +1233,18 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 					lidar_bev=transfuser_lidar_bev_bf16  # (1, C, H, W) on GPU, bfloat16
 				)
 			
-			# Extract 4 transfuser features (single frame, no history needed)
+			# Extract transfuser features (following DiffusionDriveV2: only 2 features)
 			# bev_feature: (B, 1512, 8, 8) - original BEV feature (x4)
 			# bev_feature_upscale: (B, 64, 64, 64) - upsampled BEV (p3)
-			# fused_features: (B, 1512) or (B, 1512, 8, 8) - global fused features
-			# image_feature_grid: (B, 1512, 12, 32) - image feature grid
 			transfuser_bev_feature = transfuser_output['bev_feature']  # (1, 1512, 8, 8)
 			transfuser_bev_feature_upsample = transfuser_output['bev_feature_upscale']  # (1, 64, 64, 64)
-			transfuser_fused_features = transfuser_output['fused_features']  # may need reshape
-			transfuser_image_feature_grid = transfuser_output['image_feature_grid']  # (1, 1512, 12, 32)
-			
-			# Handle fused_features: if it's 2D (B, C), reshape to (B, C, 1, 1) then tile
-			if transfuser_fused_features is not None:
-				if transfuser_fused_features.dim() == 2:
-					# (B, C) -> (B, C, 8, 8) to match bev_feature shape
-					transfuser_fused_features = transfuser_fused_features.unsqueeze(-1).unsqueeze(-1)
-					transfuser_fused_features = transfuser_fused_features.expand(-1, -1, 8, 8)
-			else:
-				# If fused_features is None, use bev_feature as fallback
-				transfuser_fused_features = transfuser_bev_feature
-			
-			# If image_feature_grid is None, create a placeholder
-			if transfuser_image_feature_grid is None:
-				# Create dummy (B, 1512, 12, 32)
-				transfuser_image_feature_grid = torch.zeros(1, 1512, 12, 32, device='cuda')
 			
 			# Build dp_obs_dict with transfuser features
 			dp_obs_dict = {
 				'ego_status': ego_status_stacked,
-				# TransFuser features (single frame)
+				# TransFuser features (single frame, following DiffusionDriveV2)
 				'transfuser_bev_feature': transfuser_bev_feature,  # (B, 1512, 8, 8)
 				'transfuser_bev_feature_upsample': transfuser_bev_feature_upsample,  # (B, 64, 64, 64)
-				'transfuser_fused_features': transfuser_fused_features,  # (B, 1512, 8, 8)
-				'transfuser_image_feature_grid': transfuser_image_feature_grid,  # (B, 1512, 12, 32)
 				# Reasoning tokens from MoT
 				'reasoning_query_tokens': reason_feat[:, :7, :],  # (1, 7, C)
 				'anchor': predicted_answer['traj']  # Pass anchor for truncated diffusion
@@ -1323,9 +1302,6 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			control.steer = float(steer)
 			control.throttle = float(throttle)
 			control.brake = float(brake)
-			# control.throttle = max(0.0, min(0.75, control.throttle))
-			# control.steer = max(-0.4, min(0.4, control.steer))
-			# control.throttle = 0.0 if np.abs(control.steer) > 0.4 and gt_velocity > 1.0 else control.throttle  # Sharp turn cut throttle
 			
 			# Speed limit enforcement: if current speed > 35 km/h, force brake
 			# gt_velocity is in m/s, convert to km/h by multiplying 3.6
