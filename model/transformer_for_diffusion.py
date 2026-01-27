@@ -162,179 +162,132 @@ def apply_rope_single(x, cos, sin):
 
 class SparseInstanceSpatialAttention(nn.Module):
     """
-    Spatial Cross Attention for SparseDrive sparse instance features.
+    Simplified Spatial Cross Attention for SparseDrive sparse instance features.
     
-    Unlike BEV grid-based attention, this module leverages the sparse nature of
-    SparseDrive features (detection instances with positions, map instances, ego).
-    
-    Key idea: Use trajectory points to query nearby detection instances based on
-    spatial proximity, enabling the model to attend to obstacles that are relevant
-    to the planned trajectory.
+    Key improvements over previous version:
+    1. Use learned position embeddings instead of explicit distance computation
+    2. Don't rely on coordinate system alignment (let model learn it)
+    3. Simpler architecture with better gradient flow
+    4. Position info is encoded and added to features, not used for explicit bias
     
     SparseDrive features structure:
     - det_instance_feature: (B, 50, 256) - 50 detection instances
     - det_prediction: (B, 50, 11) - positions (x, y, z, w, l, h, sin, cos, vx, vy, vz)
-    - map_instance_feature: (B, 10, 256) - 10 map instances  
-    - ego_feature: (B, 1, 256) - ego vehicle feature
     
     Architecture:
-    1. Compute distance between trajectory points and detection instance positions
-    2. Use distance-based attention weights (closer instances get higher weights)
-    3. Aggregate detection features weighted by spatial relevance
-    4. Combine with standard cross-attention output
+    1. Encode detection positions into embeddings
+    2. Encode trajectory positions (normalized) into embeddings  
+    3. Standard cross-attention with position-enhanced features
+    4. Gated residual connection
     """
     def __init__(
         self,
         embed_dims: int,
         num_heads: int = 8,
         num_det_instances: int = 50,
-        num_map_instances: int = 10,
         dropout: float = 0.1,
-        distance_scale: float = 10.0,  # Scale factor for distance-based attention
     ):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_heads = num_heads
         self.num_det_instances = num_det_instances
-        self.num_map_instances = num_map_instances
-        self.distance_scale = distance_scale
         
-        # Query projection for trajectory queries
-        self.query_proj = nn.Linear(embed_dims, embed_dims)
-        
-        # Key/Value projections for detection instances
-        self.det_key_proj = nn.Linear(embed_dims, embed_dims)
-        self.det_value_proj = nn.Linear(embed_dims, embed_dims)
-        
-        # Position encoding for detection instances (from prediction: x, y, vx, vy)
+        # Position encoders - let the model learn coordinate transformation
+        # Detection: (x, y, z, w, l, h, sin, cos, vx, vy, vz) -> embed_dims
         self.det_pos_encoder = nn.Sequential(
-            nn.Linear(4, embed_dims // 2),
-            nn.ReLU(),
+            nn.Linear(11, embed_dims // 2),
+            nn.GELU(),
             nn.Linear(embed_dims // 2, embed_dims),
         )
         
-        # Trajectory point position encoder
+        # Trajectory: (x, y) normalized -> embed_dims
         self.traj_pos_encoder = nn.Sequential(
             nn.Linear(2, embed_dims // 2),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(embed_dims // 2, embed_dims),
         )
         
-        # Distance-based attention bias projection
-        self.distance_bias_proj = nn.Sequential(
-            nn.Linear(1, embed_dims // 4),
-            nn.ReLU(),
-            nn.Linear(embed_dims // 4, num_heads),
+        # Standard multi-head cross attention
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
         )
         
-        # Output projection
+        # Output projection with gating
         self.output_proj = nn.Linear(embed_dims, embed_dims)
+        self.spatial_gate = nn.Parameter(torch.zeros(1))  # Initialize to 0 for stable training
         
-        # Gating for spatial attention output
-        self.spatial_gate = nn.Parameter(torch.zeros(1))
-        
-        self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(embed_dims)
+        self.dropout = nn.Dropout(dropout)
         
         self._init_weights()
     
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.query_proj.weight)
-        nn.init.xavier_uniform_(self.det_key_proj.weight)
-        nn.init.xavier_uniform_(self.det_value_proj.weight)
+        for module in [self.det_pos_encoder, self.traj_pos_encoder]:
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
         nn.init.xavier_uniform_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
     
     def forward(
         self,
         traj_queries: torch.Tensor,      # (B, T, embed_dims) - trajectory query features
-        traj_points: torch.Tensor,        # (B, T, 2) - trajectory point positions (x, y)
+        traj_points: torch.Tensor,        # (B, T, 2) - trajectory positions (normalized)
         det_features: torch.Tensor,       # (B, 50, embed_dims) - detection instance features
-        det_positions: torch.Tensor,      # (B, 50, 11) - detection predictions (x,y,z,w,l,h,sin,cos,vx,vy,vz)
+        det_positions: torch.Tensor,      # (B, 50, 11) - detection predictions
         det_mask: Optional[torch.Tensor] = None,  # (B, 50) - mask for valid detections
     ) -> torch.Tensor:
         """
+        Simplified spatial cross-attention.
+        
+        Key insight: Let the model learn coordinate transformation through position encodings
+        instead of hard-coding coordinate alignment.
+        
         Args:
             traj_queries: Trajectory query features (B, T, embed_dims)
-            traj_points: Trajectory positions in meters (B, T, 2) - (x, y)
-            det_features: Detection instance features from SparseDrive (B, 50, embed_dims)
-            det_positions: Detection predictions with position info (B, 50, 11)
+            traj_points: Trajectory positions normalized to [-1, 1] (B, T, 2)
+            det_features: Detection instance features (B, 50, embed_dims)
+            det_positions: Detection predictions (B, 50, 11) - (x,y,z,w,l,h,sin,cos,vx,vy,vz)
             det_mask: Mask for valid detections, True = valid (B, 50)
             
         Returns:
             Enhanced trajectory features (B, T, embed_dims)
         """
         B, T, _ = traj_queries.shape
-        num_det = det_features.shape[1]
         
-        # Extract position info from det_positions: (x, y, vx, vy)
-        det_xy = det_positions[..., :2]  # (B, 50, 2)
-        det_vel = det_positions[..., 8:10]  # (B, 50, 2) - vx, vy
-        det_pos_info = torch.cat([det_xy, det_vel], dim=-1)  # (B, 50, 4)
-        
-        # Encode positions
-        det_pos_emb = self.det_pos_encoder(det_pos_info)  # (B, 50, embed_dims)
+        # Encode positions - let model learn the coordinate transformation
+        det_pos_emb = self.det_pos_encoder(det_positions)  # (B, 50, embed_dims)
         traj_pos_emb = self.traj_pos_encoder(traj_points)  # (B, T, embed_dims)
         
         # Add position embeddings to features
-        det_features_with_pos = det_features + det_pos_emb
-        traj_queries_with_pos = traj_queries + traj_pos_emb
+        det_features_with_pos = det_features + det_pos_emb  # (B, 50, embed_dims)
+        traj_queries_with_pos = traj_queries + traj_pos_emb  # (B, T, embed_dims)
         
-        # Project Q, K, V
-        Q = self.query_proj(traj_queries_with_pos)  # (B, T, embed_dims)
-        K = self.det_key_proj(det_features_with_pos)  # (B, 50, embed_dims)
-        V = self.det_value_proj(det_features)  # (B, 50, embed_dims)
-        
-        # Reshape for multi-head attention
-        head_dim = self.embed_dims // self.num_heads
-        Q = Q.view(B, T, self.num_heads, head_dim).transpose(1, 2)  # (B, H, T, head_dim)
-        K = K.view(B, num_det, self.num_heads, head_dim).transpose(1, 2)  # (B, H, 50, head_dim)
-        V = V.view(B, num_det, self.num_heads, head_dim).transpose(1, 2)  # (B, H, 50, head_dim)
-        
-        # Compute standard attention scores
-        scale = math.sqrt(head_dim)
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / scale  # (B, H, T, 50)
-        
-        # Compute distance-based attention bias
-        # Distance between each trajectory point and each detection
-        traj_xy = traj_points.unsqueeze(2)  # (B, T, 1, 2)
-        det_xy_expanded = det_xy.unsqueeze(1)  # (B, 1, 50, 2)
-        distances = torch.norm(traj_xy - det_xy_expanded, dim=-1)  # (B, T, 50)
-        
-        # Convert distance to attention bias (closer = higher attention)
-        # Use negative distance scaled by distance_scale
-        distance_bias = -distances / self.distance_scale  # (B, T, 50)
-        distance_bias = distance_bias.unsqueeze(-1)  # (B, T, 50, 1)
-        distance_bias = self.distance_bias_proj(distance_bias)  # (B, T, 50, num_heads)
-        distance_bias = distance_bias.permute(0, 3, 1, 2)  # (B, num_heads, T, 50)
-        
-        # Add distance bias to attention scores
-        attn_scores = attn_scores + distance_bias
-        
-        # Apply detection mask if provided
+        # Prepare attention mask
+        key_padding_mask = None
         if det_mask is not None:
-            # det_mask: (B, 50), True = valid
-            mask = ~det_mask  # Invert: True = padding
-            mask = mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, 50)
-            attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+            key_padding_mask = ~det_mask  # True = padding (to be masked)
         
-        # Softmax and dropout
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        # Cross attention: trajectory queries attend to detection features
+        attn_out, _ = self.cross_attn(
+            query=traj_queries_with_pos,
+            key=det_features_with_pos,
+            value=det_features,  # Use original features without position for value
+            key_padding_mask=key_padding_mask,
+        )
         
-        # Weighted sum of values
-        out = torch.matmul(attn_weights, V)  # (B, H, T, head_dim)
-        
-        # Reshape and project output
-        out = out.transpose(1, 2).contiguous().view(B, T, self.embed_dims)  # (B, T, embed_dims)
-        out = self.output_proj(out)
-        
-        # Apply gating
+        # Project and apply gating
+        out = self.output_proj(attn_out)
         gate = torch.sigmoid(self.spatial_gate)
         out = gate * out
         
         # Residual connection with layer norm
-        out = self.layer_norm(traj_queries + out)
+        out = self.layer_norm(traj_queries + self.dropout(out))
         
         return out
 
@@ -1016,9 +969,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 embed_dims=n_emb,
                 num_heads=n_head,
                 num_det_instances=num_det_instances,
-                num_map_instances=num_map_instances,
                 dropout=p_drop_attn,
-                distance_scale=10.0,  # 10 meters scale
             )
         
         # Causal mask for trajectory queries
