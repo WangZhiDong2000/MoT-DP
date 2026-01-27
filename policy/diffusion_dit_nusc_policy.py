@@ -7,8 +7,7 @@ import numpy as np
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from model.transformer_for_diffusion import TransformerForDiffusion
-from model.interfuser_bev_encoder import InterfuserBEVEncoder
-from model.interfuser_bev_encoder import load_lidar_submodules
+# NOTE: InterfuserBEVEncoder is NO LONGER used - replaced by SparseDrive features
 import os
 
 
@@ -48,37 +47,53 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
         self.n_obs_steps = policy_cfg.get('n_obs_steps', config.get('obs_horizon', 1))
         
-        # Load BEV encoder configuration from config file
-        bev_encoder_cfg = config.get('bev_encoder', {})
-        obs_encoder = InterfuserBEVEncoder(
-            perception_backbone=None,
-            state_dim=bev_encoder_cfg.get('state_dim', 13),  # 修改为13维以支持拼接后的ego_status
-            freeze_backbone=bev_encoder_cfg.get('freeze_backbone', False),
-            bev_input_size=tuple(bev_encoder_cfg.get('bev_input_size', [448, 448]))
+        # ========== SparseDrive Feature Encoders (replacing InterfuserBEVEncoder) ==========
+        # SparseDrive features have dimension 256, we project them to match transformer dimension
+        sparsedrive_cfg = config.get('sparsedrive', {})
+        sparse_dim = sparsedrive_cfg.get('sparse_dim', 256)  # SparseDrive feature dimension
+        proj_dim = sparsedrive_cfg.get('proj_dim', 512)      # Projection dimension for transformer
+        
+        # Detection feature encoder: combines instance features with anchor embeddings
+        # Input: det_instance_feature (50, 256) + det_anchor_embed (50, 256) -> (50, 512) -> project to proj_dim
+        self.det_feature_encoder = nn.Sequential(
+            nn.Linear(sparse_dim * 2, proj_dim),
+            nn.LayerNorm(proj_dim),
+            nn.GELU(),
+            nn.Linear(proj_dim, proj_dim)
         )
         
-        # Load pretrained weights from config
-        pretrained_path = bev_encoder_cfg.get('pretrained_path', None)
-        if pretrained_path is not None and os.path.exists(pretrained_path):
-            load_lidar_submodules(obs_encoder, pretrained_path, strict=False, logger=None)
-            print(f"✓ BEV encoder loaded from: {pretrained_path}")
-        else:
-            print(f"⚠ BEV encoder pretrained_path not found or not specified: {pretrained_path}")
-            print("  Continuing with random initialization...")
+        # Map feature encoder: combines instance features with anchor embeddings
+        # Input: map_instance_feature (10, 256) + map_anchor_embed (10, 256) -> (10, 512) -> project to proj_dim
+        self.map_feature_encoder = nn.Sequential(
+            nn.Linear(sparse_dim * 2, proj_dim),
+            nn.LayerNorm(proj_dim),
+            nn.GELU(),
+            nn.Linear(proj_dim, proj_dim)
+        )
         
-        self.obs_encoder = obs_encoder
-
-        vlm_feature_dim = 2560  # 隐藏层维度
+        # Ego feature encoder
+        # Input: sparse_ego_feature (1, 256) -> project to proj_dim
+        self.ego_feature_encoder = nn.Sequential(
+            nn.Linear(sparse_dim, proj_dim),
+            nn.LayerNorm(proj_dim),
+            nn.GELU(),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        
+        # Senna hidden states encoder (action/reasoning)
+        vlm_feature_dim = 2560  # Hidden layer dimension from Senna
         self.feature_encoder = nn.Linear(vlm_feature_dim, 1536)
 
         obs_feature_dim = 256  
 
-        # Get status_dim from bev_encoder config
-        status_dim = bev_encoder_cfg.get('state_dim', 15)
+        # Get status_dim from config
+        status_dim = policy_cfg.get('status_dim', 14)  # ego_status dimension
         
         # Get ego_status_seq_len from policy config (defaults to n_obs_steps)
         ego_status_seq_len = policy_cfg.get('ego_status_seq_len', self.n_obs_steps)
 
+        # TransformerForDiffusion with SparseDrive features
+        # bev_dim is now the projection dimension for SparseDrive features
         model = TransformerForDiffusion(
             input_dim=policy_cfg.get('input_dim', 2),
             output_dim=policy_cfg.get('output_dim', 2),
@@ -95,8 +110,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             n_cond_layers=policy_cfg.get('n_cond_layers', 4),
             status_dim=status_dim,
             ego_status_seq_len=ego_status_seq_len,
-            bev_dim=512,  # BEV token dimension from InterfuserBEVEncoder
-            state_token_dim=128,  # State token dimension from InterfuserBEVEncoder
+            bev_dim=proj_dim,  # SparseDrive projected feature dimension (512)
+            state_token_dim=128,  # State token dimension (kept for compatibility)
             action_emb_dim=1536,  # Action hidden states dimension (same as reasoning)
         )
 
@@ -331,58 +346,48 @@ class DiffusionDiTCarlaPolicy(nn.Module):
 
     
 
-    def extract_bev_state_tokens(self, obs_dict):
+    def encode_sparsedrive_features(self, batch: Dict[str, torch.Tensor]):
         """
-        使用InterfuserBEVEncoder提取BEV tokens和State tokens (Decoder-Only架构)
+        Encode SparseDrive sparse instance features into combined perception tokens.
         
-        支持两种模式：
-        1. 使用预处理好的BEV特征（推荐，快速）
-        2. 使用原始lidar_bev图像（兼容模式，慢）
+        This replaces the InterfuserBEVEncoder for extracting BEV tokens.
+        SparseDrive features are concatenated and projected to create perception tokens.
         
         Args:
-            obs_dict: 观测字典，应包含：
-                - 'lidar_token': (B, seq_len, 512) 预处理的空间特征，或
-                - 'lidar_token_global': (B, 1, 512) 预处理的全局特征，或
-                - 'lidar_bev': (B, 3, 448, 448) 原始BEV图像（兼容模式）
-                - 'ego_status' (B, state_dim): 状态向量
+            batch: Dictionary containing SparseDrive features:
+                - 'det_instance_feature': (B, 50, 256) - Detection instance features
+                - 'det_anchor_embed': (B, 50, 256) - Detection anchor embeddings
+                - 'map_instance_feature': (B, 10, 256) - Map instance features
+                - 'map_anchor_embed': (B, 10, 256) - Map anchor embeddings
+                - 'sparse_ego_feature': (B, 1, 256) - Ego vehicle feature
                 
         Returns:
-            bev_tokens: (B, seq_len+1, 512) - BEV空间tokens + global token
-            state_tokens: (B, 1, 128) - 状态编码tokens
+            sparse_tokens: (B, 61, proj_dim) - Combined perception tokens
+                          [50 det tokens + 10 map tokens + 1 ego token]
         """
-        try:
-            device = next(self.parameters()).device
-            model_dtype = next(self.parameters()).dtype
-            state = obs_dict['ego_status'].to(device=device, dtype=model_dtype)
-            
-            use_precomputed = 'lidar_token' in obs_dict and 'lidar_token_global' in obs_dict
-            
-            if use_precomputed:
-                lidar_token = obs_dict['lidar_token'].to(device=device, dtype=model_dtype)
-                lidar_token_global = obs_dict['lidar_token_global'].to(device=device, dtype=model_dtype)
-                
-                bev_tokens, state_tokens = self.obs_encoder(
-                    state=state,
-                    lidar_token=lidar_token,
-                    lidar_token_global=lidar_token_global,
-                )
-            else:
-                if 'lidar_bev' not in obs_dict:
-                    raise KeyError("Neither pre-computed features (lidar_token, lidar_token_global) nor raw BEV images (lidar_bev) found in obs_dict")
-                
-                lidar_bev_img = obs_dict['lidar_bev'].to(device=device, dtype=model_dtype)
-                
-                bev_tokens, state_tokens = self.obs_encoder(
-                    image=lidar_bev_img,
-                    state=state,
-                )
-            
-            return bev_tokens, state_tokens
-                
-        except KeyError as e:
-            raise KeyError(f"Missing required field in obs_dict for BEV/State token extraction: {e}")
-        except Exception as e:
-            raise RuntimeError(f"Error in TCP feature extraction: {e}")
+        device = next(self.parameters()).device
+        model_dtype = next(self.parameters()).dtype
+        
+        # Get features from batch
+        det_instance = batch['det_instance_feature'].to(device=device, dtype=model_dtype)  # (B, 50, 256)
+        det_anchor = batch['det_anchor_embed'].to(device=device, dtype=model_dtype)        # (B, 50, 256)
+        map_instance = batch['map_instance_feature'].to(device=device, dtype=model_dtype)  # (B, 10, 256)
+        map_anchor = batch['map_anchor_embed'].to(device=device, dtype=model_dtype)        # (B, 10, 256)
+        sparse_ego = batch['sparse_ego_feature'].to(device=device, dtype=model_dtype)      # (B, 1, 256)
+        
+        # Concatenate instance features with anchor embeddings
+        det_combined = torch.cat([det_instance, det_anchor], dim=-1)  # (B, 50, 512)
+        map_combined = torch.cat([map_instance, map_anchor], dim=-1)  # (B, 10, 512)
+        
+        # Encode features through projection layers
+        det_tokens = self.det_feature_encoder(det_combined)  # (B, 50, proj_dim)
+        map_tokens = self.map_feature_encoder(map_combined)  # (B, 10, proj_dim)
+        ego_tokens = self.ego_feature_encoder(sparse_ego)    # (B, 1, proj_dim)
+        
+        # Concatenate all tokens: det + map + ego
+        sparse_tokens = torch.cat([det_tokens, map_tokens, ego_tokens], dim=1)  # (B, 61, proj_dim)
+        
+        return sparse_tokens
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -396,17 +401,20 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         batch: {
-            # BEV特征（二选一）
-            'lidar_token': (B, obs_horizon, seq_len, 512) - 预处理的空间特征（推荐）
-            'lidar_token_global': (B, obs_horizon, 1, 512) - 预处理的全局特征（推荐）
-            'lidar_bev': (B, obs_horizon, 3, 448, 448) - 原始LiDAR BEV图像（兼容模式）
+            # SparseDrive sparse features (replacing lidar BEV tokens)
+            'det_instance_feature': (B, 50, 256) - Detection instance features
+            'det_anchor_embed': (B, 50, 256) - Detection anchor embeddings
+            'det_classification': (B, 50, 10) - Detection class scores
+            'det_prediction': (B, 50, 11) - Detection box predictions
+            'map_instance_feature': (B, 10, 256) - Map instance features
+            'map_anchor_embed': (B, 10, 256) - Map anchor embeddings
+            'sparse_ego_feature': (B, 1, 256) - Ego vehicle feature
             
-            'agent_pos': (B, horizon, 2) - 未来轨迹点
-            'ego_status': (B, obs_horizon, state_dim) - 车辆状态
-            'anchor_trajectory': (B, horizon, 2) - anchor轨迹点（用于truncated diffusion）
+            'agent_pos': (B, horizon, 2) - Future trajectory points
+            'ego_status': (B, obs_horizon, state_dim) - Ego vehicle status
+            'anchor_trajectory': (B, horizon, 2) - Anchor trajectory (for truncated diffusion)
             
-            # Senna hidden states
-            'vit_hidden_states': (B, 128, 2560) - VIT hidden states
+            # Senna hidden states (vit_hidden_states is NO LONGER used)
             'action_hidden_states': (B, 4, 2560) - Action hidden states
             'reasoning_hidden_states': (B, 20, 2560) - Reasoning hidden states
         }
@@ -414,19 +422,19 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
         nobs = {}
-        required_fields = ['lidar_token', 'lidar_token_global', 'lidar_bev', 'ego_status', 'agent_pos', 
-                          'reasoning_hidden_states', 'vit_hidden_states', 'action_hidden_states', 'anchor_trajectory']
         
-        for field in required_fields:
+        # SparseDrive feature keys
+        sparsedrive_keys = ['det_instance_feature', 'det_anchor_embed', 'det_classification',
+                           'det_prediction', 'map_instance_feature', 'map_anchor_embed', 
+                           'sparse_ego_feature', 'ego_status', 'agent_pos', 
+                           'reasoning_hidden_states', 'action_hidden_states', 'anchor_trajectory']
+        
+        for field in sparsedrive_keys:
             if field in batch:
-                if field in ['lidar_bev', 'lidar_token', 'lidar_token_global']:
-                    nobs[field] = batch[field].to(device=device, dtype=model_dtype)
-                else:
-                    nobs[field] = batch[field].to(device)
+                nobs[field] = batch[field].to(device=device)
 
         raw_agent_pos = batch['agent_pos'].to(device)
 
-        To = self.n_obs_steps
         nactions = raw_agent_pos
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
@@ -439,24 +447,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         if anchor is not None:
             anchor = anchor.to(device=device, dtype=model_dtype)  # (B, horizon, 2)
         
-        # Extract BEV tokens and State tokens (Decoder-Only架构)
-        # Flatten temporal dimension for feature extraction
-        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
-        
-        # Use only the last timestep's features (or average over time)
-        # bev_tokens: (B*To, seq_len+1, 512) -> use last timestep
-        # state_tokens: (B*To, 1, 128) -> use last timestep
-        bev_tokens = bev_tokens.reshape(batch_size, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
-        state_tokens = state_tokens.reshape(batch_size, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
+        # Encode SparseDrive sparse features (replaces BEV token extraction)
+        sparse_tokens = self.encode_sparsedrive_features(nobs)  # (B, 61, proj_dim)
 
-        # Prepare VL tokens (Senna: vit_hidden_states)
-        vit_hidden_states = batch['vit_hidden_states']
+        # Prepare hidden states (vit_hidden_states is NO LONGER used)
         reasoning_hidden_states = batch['reasoning_hidden_states']
         action_hidden_states = batch['action_hidden_states']
-        
-        vit_hidden_states = vit_hidden_states.to(device=device, dtype=model_dtype)
-        vit_hidden_states = self.feature_encoder(vit_hidden_states)  # (B, 128, 1536)
         
         reasoning_hidden_states = reasoning_hidden_states.to(device=device, dtype=model_dtype)
         reasoning_hidden_states = self.feature_encoder(reasoning_hidden_states)  # (B, 20, 1536)
@@ -471,9 +467,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         loss = self._compute_truncated_diffusion_loss(
             trajectory=trajectory,
             anchor=anchor,
-            bev_tokens=bev_tokens,
-            state_tokens=state_tokens,
-            vit_hidden_states=vit_hidden_states,
+            sparse_tokens=sparse_tokens,  # SparseDrive features instead of bev_tokens
             reasoning_hidden_states=reasoning_hidden_states,
             action_hidden_states=action_hidden_states,
             ego_status=ego_status,
@@ -487,9 +481,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         self,
         trajectory: torch.Tensor,
         anchor: torch.Tensor,
-        bev_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
-        vit_hidden_states: torch.Tensor,
+        sparse_tokens: torch.Tensor,
         reasoning_hidden_states: torch.Tensor,
         action_hidden_states: torch.Tensor,
         ego_status: torch.Tensor,
@@ -503,15 +495,10 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         Training: Add scheduler-based multiplicative noise (noise level depends on timestep)
         
-        Data Augmentation: Apply small random perturbations to trajectory during training
-        to improve generalization (reduce overfitting).
-        
         Args:
             trajectory: (B, horizon, 2) - ground truth trajectory
             anchor: (B, horizon, 2) - anchor trajectory for truncated diffusion
-            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens from encoder
-            state_tokens: (B, 1, 128) - state tokens from encoder
-            vit_hidden_states: (B, seq_len, 1536) - VIT tokens
+            sparse_tokens: (B, 61, proj_dim) - SparseDrive perception tokens
             reasoning_hidden_states: (B, seq_len, 1536) - reasoning tokens
             action_hidden_states: (B, seq_len, 1536) - action hidden states
             ego_status: (B, To, status_dim) - ego vehicle status
@@ -548,12 +535,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         cond = torch.zeros(batch_size, ego_status.shape[1], 256, device=device, dtype=model_dtype)
         
         # 7. Predict clean sample using decoder-only model
+        # NOTE: Using sparse_tokens as bev_tokens (SparseDrive features)
         pred = self.model(
             sample=noisy_trajectory_denorm,
             timestep=timesteps,
             cond=cond,  # For API compatibility
-            bev_tokens=bev_tokens,
-            gen_vit_tokens=vit_hidden_states,
+            bev_tokens=sparse_tokens,  # SparseDrive sparse tokens
             reasoning_query_tokens=reasoning_hidden_states,
             action_tokens=action_hidden_states,
             ego_status=ego_status
@@ -574,9 +561,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         return traj_loss
 
     def conditional_sample(self, 
-            bev_tokens: torch.Tensor,
-            state_tokens: torch.Tensor,
-            vit_hidden_states: torch.Tensor,
+            sparse_tokens: torch.Tensor,
             reasoning_hidden_states: torch.Tensor,
             action_hidden_states: torch.Tensor,
             ego_status: torch.Tensor,
@@ -590,9 +575,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         Generate trajectory samples using truncated diffusion (DiffusionDriveV2 style).
         
         Args:
-            bev_tokens: (B, seq_len+1, 512) - BEV spatial tokens
-            state_tokens: (B, 1, 128) - state tokens
-            vit_hidden_states: (B, 128, 1536) - VIT hidden states
+            sparse_tokens: (B, 61, proj_dim) - SparseDrive perception tokens
             reasoning_hidden_states: (B, 20, 1536) - reasoning hidden states
             action_hidden_states: (B, 4, 1536) - action hidden states
             ego_status: (B, To, status_dim) - ego status history
@@ -603,10 +586,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         """
         result = self._truncated_diffusion_sample(
             anchor=anchor,
-            bev_tokens=bev_tokens,
-            state_tokens=state_tokens,
+            sparse_tokens=sparse_tokens,
             ego_status=ego_status,
-            vit_hidden_states=vit_hidden_states,
             reasoning_hidden_states=reasoning_hidden_states,
             action_hidden_states=action_hidden_states,
             device=device,
@@ -619,10 +600,8 @@ class DiffusionDiTCarlaPolicy(nn.Module):
     def _truncated_diffusion_sample(
         self,
         anchor: torch.Tensor,
-        bev_tokens: torch.Tensor,
-        state_tokens: torch.Tensor,
+        sparse_tokens: torch.Tensor,
         ego_status: torch.Tensor,
-        vit_hidden_states: torch.Tensor,
         reasoning_hidden_states: torch.Tensor,
         action_hidden_states: torch.Tensor,
         device: torch.device,
@@ -681,12 +660,12 @@ class DiffusionDiTCarlaPolicy(nn.Module):
             timesteps = timesteps.expand(bs)
             
             # Predict clean sample using decoder-only model
+            # NOTE: sparse_tokens as bev_tokens (SparseDrive features)
             pred = self.model(
                 sample=noisy_traj_points.to(dtype=model_dtype),
                 timestep=timesteps,
                 cond=cond,
-                bev_tokens=bev_tokens,
-                gen_vit_tokens=vit_hidden_states,
+                bev_tokens=sparse_tokens,  # SparseDrive sparse tokens
                 reasoning_query_tokens=reasoning_hidden_states,
                 action_tokens=action_hidden_states,
                 ego_status=ego_status,
@@ -711,31 +690,32 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         return pred
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Predict action from observation using SparseDrive features.
+        
+        Args:
+            obs_dict: Dictionary containing:
+                - SparseDrive features (det_instance_feature, det_anchor_embed, etc.)
+                - reasoning_hidden_states
+                - action_hidden_states
+                - ego_status
+                - anchor_trajectory
+        """
         device = next(self.parameters()).device
         model_dtype = next(self.parameters()).dtype
         nobs = dict_apply(obs_dict, lambda x: x.to(device))
 
         value = next(iter(nobs.values()))
-        B, To = value.shape[:2]
+        B = value.shape[0]
         T = self.horizon
         Da = self.action_dim
-        To = self.n_obs_steps
 
-        # Extract BEV tokens and State tokens
-        batch_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))  # (B*To, ...)
-        bev_tokens, state_tokens = self.extract_bev_state_tokens(batch_nobs)
-        
-        # Use only the last timestep's features
-        bev_tokens = bev_tokens.reshape(B, To, -1, 512)[:, -1, :, :]  # (B, seq_len+1, 512)
-        state_tokens = state_tokens.reshape(B, To, 1, 128)[:, -1, :, :]  # (B, 1, 128)
+        # Encode SparseDrive sparse features
+        sparse_tokens = self.encode_sparsedrive_features(nobs)  # (B, 61, proj_dim)
 
-        # Process VL tokens (Senna hidden states)
-        vit_hidden_states = nobs['vit_hidden_states']
+        # Process hidden states (vit_hidden_states is NO LONGER used)
         reasoning_hidden_states = nobs['reasoning_hidden_states']
         action_hidden_states = nobs['action_hidden_states']
-        
-        vit_hidden_states = vit_hidden_states.to(device=device, dtype=model_dtype)
-        vit_hidden_states = self.feature_encoder(vit_hidden_states)
         
         reasoning_hidden_states = reasoning_hidden_states.to(device=device, dtype=model_dtype)
         reasoning_hidden_states = self.feature_encoder(reasoning_hidden_states)
@@ -758,9 +738,7 @@ class DiffusionDiTCarlaPolicy(nn.Module):
         
         # Generate samples using truncated diffusion
         nsample = self.conditional_sample(
-            bev_tokens=bev_tokens,
-            state_tokens=state_tokens,
-            vit_hidden_states=vit_hidden_states,
+            sparse_tokens=sparse_tokens,
             reasoning_hidden_states=reasoning_hidden_states,
             action_hidden_states=action_hidden_states,
             ego_status=ego_status,

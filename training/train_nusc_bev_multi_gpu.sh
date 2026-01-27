@@ -4,6 +4,10 @@
 # Usage: bash train_carla_bev_multi_gpu.sh [num_gpus] [config_path]
 # pkill -9 -f "train_nusc_bev"
 
+# Activate conda environment
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate nusc
+
 # Select GPUs 0-7
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 

@@ -177,10 +177,16 @@ def validate_model(policy, val_loader, device, rank=0, world_size=1):
                 val_metrics['loss'].append(loss.item())
                 
                 obs_dict = {
-                    'lidar_token': batch['lidar_token'][:, :model_for_inference.n_obs_steps],
-                    'lidar_token_global': batch['lidar_token_global'][:, :model_for_inference.n_obs_steps],
+                    # SparseDrive features
+                    'det_instance_feature': batch['det_instance_feature'],
+                    'det_anchor_embed': batch['det_anchor_embed'],
+                    'det_classification': batch['det_classification'],
+                    'det_prediction': batch['det_prediction'],
+                    'map_instance_feature': batch['map_instance_feature'],
+                    'map_anchor_embed': batch['map_anchor_embed'],
+                    'sparse_ego_feature': batch['sparse_ego_feature'],
+                    # Hidden states and ego status
                     'ego_status': batch['ego_status'][:, :model_for_inference.n_obs_steps],  
-                    'vit_hidden_states': batch['vit_hidden_states'],
                     'reasoning_hidden_states': batch['reasoning_hidden_states'],
                     'action_hidden_states': batch['action_hidden_states'],
                     'anchor_trajectory': batch['anchor_trajectory']  # Pass anchor for truncated diffusion
@@ -328,8 +334,8 @@ def train_pdm_policy(config_path):
     # dataset
     # For SennaDataset: processed_data_path is the pkl file, dataset_root is nuScenes root
     processed_data_dir = config.get('training', {}).get('dataset_path')
-    train_processed_path = os.path.join(processed_data_dir, 'senna_train_4obs_with_features.pkl')
-    val_processed_path = os.path.join(processed_data_dir, 'senna_val_4obs_with_features.pkl')
+    train_processed_path = os.path.join(processed_data_dir, 'senna_train_4obs_with_sparse_features.pkl')
+    val_processed_path = os.path.join(processed_data_dir, 'senna_val_4obs_with_sparse_features.pkl')
     dataset_root = config.get('training', {}).get('image_data_root')
     
     train_dataset = SennaDataset(

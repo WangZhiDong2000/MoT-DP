@@ -1,16 +1,18 @@
 """
-Senna nuScenes Dataset Loader for preprocessed Senna data with hidden states.
+Senna nuScenes Dataset Loader for preprocessed Senna data with SparseDrive features.
 
 This module loads preprocessed Senna nuScenes samples with:
-- BEV features from LIDAR
+- SparseDrive sparse instance features (replacing BEV features)
 - Historical waypoints
 - Future trajectories
 - Navigation commands
 - Ego status (velocity, acceleration, etc.)
-- ViT hidden states
 - Action hidden states (decision features)
 - Reasoning hidden states
 - Anchor trajectory (predicted trajectory from Senna model)
+
+NOTE: vit_hidden_states and lidar BEV tokens are NO LONGER used.
+      SparseDrive sparse features replace them as the perception backbone.
 """
 
 import os
@@ -32,23 +34,30 @@ import random
 
 class SennaDataset(torch.utils.data.Dataset):
     """
-    Dataset for preprocessed Senna nuScenes data with visualization support.
+    Dataset for preprocessed Senna nuScenes data with SparseDrive features.
     
     Each sample contains:
-    - lidar_token: BEV features (obs_horizon, 196, 512)
-    - lidar_token_global: Global BEV features (obs_horizon, 1, 512)
+    - SparseDrive sparse features (replacing lidar BEV tokens):
+      - det_instance_feature: (50, 256) - Detection instance features
+      - det_anchor_embed: (50, 256) - Detection anchor embeddings
+      - det_classification: (50, 10) - Detection class scores
+      - det_prediction: (50, 11) - Detection box predictions
+      - map_instance_feature: (10, 256) - Map instance features
+      - map_anchor_embed: (10, 256) - Map anchor embeddings
+      - sparse_ego_feature: (1, 256) - Ego vehicle feature
     - hist_waypoints: Historical waypoints in ego frame (obs_horizon, 2)
     - fut_waypoints: Future waypoints in ego frame (action_horizon, 2)
     - fut_valid_mask: Valid mask for future waypoints (action_horizon,)
     - ego_status: Ego vehicle status (obs_horizon, 9)
     - nav_command: Navigation command (obs_horizon, 3)
-    - vit_hidden_states: ViT visual features (128, 2560)
     - action_hidden_states: Decision/action features (4, 2560)
     - reasoning_hidden_states: Reasoning features (20, 2560)
     - anchor_trajectory: Anchor trajectory prediction (1, 6, 2)
     
+    NOTE: vit_hidden_states and lidar BEV tokens are NO LONGER used.
+    
     Args:
-        processed_data_path (str): Path to preprocessed pkl file with features
+        processed_data_path (str): Path to preprocessed pkl file with SparseDrive features
         dataset_root (str): Root directory of nuScenes dataset
         mode (str): 'train' or 'val'
         load_bev_images (bool): Whether to load BEV images for visualization
@@ -93,7 +102,8 @@ class SennaDataset(torch.utils.data.Dataset):
         # Determine obs_horizon and action_horizon from data
         if len(self.samples) > 0:
             sample = self.samples[0]
-            self.obs_horizon = len(sample.get('hist_bev_token_paths', [])) or 5
+            # Note: hist_bev_token_paths may not exist in new format with SparseDrive features
+            self.obs_horizon = len(sample.get('hist_ego_status', [])) or 5
             self.action_horizon = len(sample.get('fut_waypoints', [])) or 6
         else:
             self.obs_horizon = 5
@@ -104,14 +114,18 @@ class SennaDataset(torch.utils.data.Dataset):
         print(f"Load BEV images: {self.load_bev_images}")
         print(f"Load hidden states: {self.load_hidden_states}")
         
-        # Check if hidden states are available
+        # Check if SparseDrive features and hidden states are available
         if self.load_hidden_states and len(self.samples) > 0:
-            has_vit = 'vit_hidden_states' in self.samples[0]
+            # SparseDrive features (new)
+            has_det_features = 'det_instance_feature' in self.samples[0]
+            has_map_features = 'map_instance_feature' in self.samples[0]
+            has_sparse_ego = 'sparse_ego_feature' in self.samples[0]
+            # Senna hidden states
             has_action = 'action_hidden_states' in self.samples[0]
             has_reasoning = 'reasoning_hidden_states' in self.samples[0]
             has_anchor = 'anchor_trajectory' in self.samples[0]
-            print(f"Hidden states available: vit={has_vit}, action={has_action}, "
-                  f"reasoning={has_reasoning}, anchor={has_anchor}")
+            print(f"SparseDrive features available: det={has_det_features}, map={has_map_features}, ego={has_sparse_ego}")
+            print(f"Hidden states available: action={has_action}, reasoning={has_reasoning}, anchor={has_anchor}")
     
     def __len__(self):
         return len(self.samples)
@@ -119,21 +133,19 @@ class SennaDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # Load BEV features for all historical frames
-        lidar_tokens = []
-        lidar_token_globals = []
+        # ========== Load SparseDrive Sparse Features (replacing lidar BEV tokens) ==========
+        # Detection instance features
+        det_instance_feature = torch.tensor(sample['det_instance_feature'], dtype=torch.float32)  # (50, 256)
+        det_anchor_embed = torch.tensor(sample['det_anchor_embed'], dtype=torch.float32)          # (50, 256)
+        det_classification = torch.tensor(sample['det_classification'], dtype=torch.float32)      # (50, 10)
+        det_prediction = torch.tensor(sample['det_prediction'], dtype=torch.float32)              # (50, 11)
         
-        for token_path, token_global_path in zip(
-                sample['hist_bev_token_paths'], 
-                sample['hist_bev_token_global_paths']
-            ):
-            token = torch.load(token_path, weights_only=True)
-            token_global = torch.load(token_global_path, weights_only=True)
-            lidar_tokens.append(token)
-            lidar_token_globals.append(token_global)
+        # Map instance features
+        map_instance_feature = torch.tensor(sample['map_instance_feature'], dtype=torch.float32)  # (10, 256)
+        map_anchor_embed = torch.tensor(sample['map_anchor_embed'], dtype=torch.float32)          # (10, 256)
         
-        lidar_token = torch.stack(lidar_tokens, dim=0)
-        lidar_token_global = torch.stack(lidar_token_globals, dim=0)
+        # Ego feature from SparseDrive
+        sparse_ego_feature = torch.tensor(sample['sparse_ego_feature'], dtype=torch.float32)      # (1, 256)
         
         # Convert numpy arrays to tensors 
         hist_waypoints_offset = torch.tensor(sample['hist_waypoints'], dtype=torch.float32)  # (obs_horizon-1, 2) - offset format
@@ -166,9 +178,14 @@ class SennaDataset(torch.utils.data.Dataset):
         # Note: fut_obstacles are not included in output to avoid collate issues with variable-length tensors
         
         output = {
-            # BEV features
-            'lidar_token': lidar_token,                    # (obs_horizon, 196, 512)
-            'lidar_token_global': lidar_token_global,      # (obs_horizon, 1, 512)
+            # SparseDrive sparse features (replacing lidar BEV tokens)
+            'det_instance_feature': det_instance_feature,      # (50, 256)
+            'det_anchor_embed': det_anchor_embed,              # (50, 256)
+            'det_classification': det_classification,          # (50, 10)
+            'det_prediction': det_prediction,                  # (50, 11)
+            'map_instance_feature': map_instance_feature,      # (10, 256)
+            'map_anchor_embed': map_anchor_embed,              # (10, 256)
+            'sparse_ego_feature': sparse_ego_feature,          # (1, 256)
             
             # Waypoints
             'hist_waypoints': hist_waypoints,              # (obs_horizon-1, 2) or (4, 2)
@@ -185,20 +202,11 @@ class SennaDataset(torch.utils.data.Dataset):
             'scene_token': sample['scene_token'],
             'sample_token': sample['sample_token'],
             'timestamp': sample['timestamp'],
-            'lidar_token_str': sample['lidar_token'],
         }
         
-        # Load hidden state features
+        # Load hidden state features (only action and reasoning - vit_hidden_states is removed)
         if self.load_hidden_states:
-            # ViT hidden states (128, 2560) -> convert float16 to float32
-            if 'vit_hidden_states' in sample and sample['vit_hidden_states'] is not None:
-                vit_hs = sample['vit_hidden_states']
-                if isinstance(vit_hs, np.ndarray):
-                    output['vit_hidden_states'] = torch.tensor(vit_hs, dtype=torch.float32)
-                else:
-                    output['vit_hidden_states'] = vit_hs.float() if isinstance(vit_hs, torch.Tensor) else torch.tensor(vit_hs, dtype=torch.float32)
-            else:
-                output['vit_hidden_states'] = None
+            # NOTE: vit_hidden_states is NO LONGER used - replaced by SparseDrive features
             
             # Action hidden states (4, 2560)
             if 'action_hidden_states' in sample and sample['action_hidden_states'] is not None:
@@ -236,7 +244,7 @@ class SennaDataset(torch.utils.data.Dataset):
         
         # Load BEV images for visualization
         if self.load_bev_images:
-            lidar_token_str = sample['lidar_token']
+            lidar_token_str = sample.get('lidar_token', sample['sample_token'])  # Fallback to sample_token
             bev_image_path = os.path.join(
                 self.dataset_root,
                 'samples',
@@ -268,15 +276,20 @@ def collate_fn(batch):
     """
     Custom collate function to handle variable-length sequences.
     Handles fut_obstacles with variable number of obstacles per frame.
-    Also handles hidden states that may be None.
+    Also handles hidden states and SparseDrive features that may be None.
     """
     output = {}
+    
+    # Keys that may be None (optional features)
+    optional_keys = [
+        'action_hidden_states', 'reasoning_hidden_states', 
+        'anchor_trajectory', 'lidar_bev', 'lidar_bev_path'
+    ]
     
     for key in batch[0].keys():
         if key == 'fut_obstacles':
             output[key] = [sample[key] for sample in batch]
-        elif key in ['vit_hidden_states', 'action_hidden_states', 'reasoning_hidden_states', 
-                     'anchor_trajectory', 'lidar_bev', 'lidar_bev_path']:
+        elif key in optional_keys:
             # Handle optional features that may be None
             values = [sample[key] for sample in batch]
             if all(v is not None for v in values):
@@ -425,7 +438,7 @@ def visualize_sample(sample, save_path=None):
     ax2.set_xlim(all_y.min() - y_margin, all_y.max() + y_margin)
     ax2.set_ylim(all_x.min() - x_margin, all_x.max() + x_margin)
     
-    # Plot 3: BEV image or Hidden States Info
+    # Plot 3: BEV image or SparseDrive/Hidden States Info
     ax3 = axes[2]
     if 'lidar_bev' in sample and sample['lidar_bev'] is not None:
         # Take the last frame from obs_horizon
@@ -439,16 +452,33 @@ def visualize_sample(sample, save_path=None):
         ax3.imshow(bev_img)
         ax3.set_title('BEV Image (Current Frame)', fontsize=14, fontweight='bold')
     else:
-        # Show hidden states info if available
-        info_lines = ['Hidden States Information:']
+        # Show SparseDrive features and hidden states info
+        info_lines = ['SparseDrive & Hidden States Info:']
         info_lines.append('')
         
-        if 'vit_hidden_states' in sample and sample['vit_hidden_states'] is not None:
-            vit_hs = sample['vit_hidden_states']
-            if isinstance(vit_hs, torch.Tensor):
-                info_lines.append(f'ViT Hidden States: {tuple(vit_hs.shape)}')
+        # SparseDrive features
+        if 'det_instance_feature' in sample and sample['det_instance_feature'] is not None:
+            det_feat = sample['det_instance_feature']
+            if isinstance(det_feat, torch.Tensor):
+                info_lines.append(f'Det Instance Feature: {tuple(det_feat.shape)}')
             else:
-                info_lines.append(f'ViT Hidden States: {vit_hs.shape}')
+                info_lines.append(f'Det Instance Feature: {det_feat.shape}')
+        
+        if 'map_instance_feature' in sample and sample['map_instance_feature'] is not None:
+            map_feat = sample['map_instance_feature']
+            if isinstance(map_feat, torch.Tensor):
+                info_lines.append(f'Map Instance Feature: {tuple(map_feat.shape)}')
+            else:
+                info_lines.append(f'Map Instance Feature: {map_feat.shape}')
+        
+        if 'sparse_ego_feature' in sample and sample['sparse_ego_feature'] is not None:
+            ego_feat = sample['sparse_ego_feature']
+            if isinstance(ego_feat, torch.Tensor):
+                info_lines.append(f'Sparse Ego Feature: {tuple(ego_feat.shape)}')
+            else:
+                info_lines.append(f'Sparse Ego Feature: {ego_feat.shape}')
+        
+        info_lines.append('')
         
         if 'action_hidden_states' in sample and sample['action_hidden_states'] is not None:
             action_hs = sample['action_hidden_states']
@@ -472,8 +502,8 @@ def visualize_sample(sample, save_path=None):
                 info_lines.append(f'Anchor Trajectory: {anchor_hs.shape}')
         
         ax3.text(0.5, 0.5, '\n'.join(info_lines), ha='center', va='center', 
-                fontsize=14, family='monospace', transform=ax3.transAxes)
-        ax3.set_title('Hidden States Info', fontsize=14, fontweight='bold')
+                fontsize=12, family='monospace', transform=ax3.transAxes)
+        ax3.set_title('SparseDrive & Hidden States Info', fontsize=14, fontweight='bold')
     ax3.axis('off')
     
     # Add info text
@@ -511,7 +541,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--processed_data', type=str, default=None,
-                        help='Path to preprocessed Senna data with features')
+                        help='Path to preprocessed Senna data with SparseDrive features')
     parser.add_argument('--dataset_root', type=str, default=None,
                         help='Root directory of nuScenes dataset')
     parser.add_argument('--mode', type=str, default=None, choices=['train', 'val'])
@@ -525,7 +555,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     defaults = {
-        'processed_data': '/mnt/data2/nuscenes/processed_data/senna_val_4obs_with_features.pkl',
+        # Use new file with SparseDrive features
+        'processed_data': '/mnt/data2/nuscenes/processed_data/senna_val_4obs_with_sparse_features.pkl',
         'dataset_root': '/mnt/data2/nuscenes',
         'mode': 'val',
         'visualize': True,

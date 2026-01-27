@@ -77,7 +77,7 @@ policy:
   cond_dim: 256
   obs_as_global_cond: true
   # Reduced model size to prevent overfitting (was: 16 layers, 1024 dim)
-  n_layer: 16
+  n_layer: 4
   n_head: 16
   n_emb: 1024
   # Increased dropout for regularization (was: 0.1)
@@ -94,10 +94,10 @@ truncated_diffusion:
   train_trunc_timesteps: 50
   num_diffusion_steps: 2
   eta: 1.0
-  norm_x_offset: 16.0
-  norm_x_range: 92.0
-  norm_y_offset: 45.0
-  norm_y_range: 88.0
+  norm_x_offset: 15.0
+  norm_x_range: 30.0
+  norm_y_offset: 4.0
+  norm_y_range: 62.0
   route_loss_weight: 0.5
 training:
   num_epochs: 1000
