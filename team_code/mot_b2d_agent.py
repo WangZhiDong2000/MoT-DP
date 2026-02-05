@@ -349,6 +349,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		(self.save_path / 'meta').mkdir()
 		(self.save_path / 'bev').mkdir()
 		(self.save_path / 'lidar_bev').mkdir()
+		(self.save_path / 'interface').mkdir()
 		
 		# Initialize lidar buffer for combining two frames
 		self.lidar_buffer = deque(maxlen=2)
@@ -646,6 +647,14 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 						'roll': 0.0, 'pitch': -90.0, 'yaw': 0.0,
 						'width': 512, 'height': 512, 'fov': 5 * 10.0,
 						'id': 'bev'
+					},
+					# Third-person rear view camera for trajectory visualization
+					{
+						'type': 'sensor.camera.rgb',
+						'x': -8.0, 'y': 0.0, 'z': 6.0,  # 8m behind, 6m high
+						'roll': 0.0, 'pitch': -15.0, 'yaw': 0.0,  # Looking slightly down towards front
+						'width': 800, 'height': 600, 'fov': 90,
+						'id': 'CAM_REAR_VIEW'
 					}]
 		return sensors
 
@@ -777,6 +786,9 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 		# Process other sensors
 		bev = cv2.cvtColor(input_data['bev'][1][:, :, :3], cv2.COLOR_BGR2RGB)
 		
+		# Process rear view camera for trajectory visualization
+		rgb_rear_view = cv2.cvtColor(input_data['CAM_REAR_VIEW'][1][:, :, :3], cv2.COLOR_BGR2RGB)
+		
 		result = {
 				'rgb_front': rgb_front,
 				'lidar_bev': lidar_bev_tensor,
@@ -784,6 +796,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 				'speed': speed,
 				'compass': compass_filtered,  # Use UKF filtered compass
 				'bev': bev,
+				'rgb_rear_view': rgb_rear_view,  # Rear view camera for visualization
 				# TransFuser processed data for DP
 				'transfuser_rgb': transfuser_rgb_tensor,  # (1, 3, H, W) on GPU
 				'transfuser_lidar_bev': transfuser_lidar_bev_tensor,  # (1, C, H, W) on GPU
@@ -1011,6 +1024,105 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			return route_waypoints_np, -1
 		
 		return truncated, truncation_idx
+	
+	def project_waypoints_to_rear_view(self, waypoints, image):
+		"""
+		Project 2D ego-frame waypoints onto the rear view camera image.
+		Completely following simlingo's method.
+		
+		Args:
+			waypoints: numpy array (N, 2) in ego frame [x_forward, y_left]
+			image: numpy array (H, W, 3) RGB image from rear view camera
+		
+		Returns:
+			image: numpy array with projected waypoints drawn
+		
+		Rear view camera parameters (from sensors definition):
+			- Position: x=-8.0, y=0.0, z=6.0 (relative to ego vehicle)
+			- Rotation: roll=0, pitch=-15, yaw=0 (looking slightly down towards front)
+			- Image size: 800x600
+			- FOV: 90 degrees
+		"""
+		if waypoints is None or len(waypoints) == 0:
+			return image
+		
+		img = image.copy()
+		H, W = img.shape[:2]
+		fov = 90.0  # degrees
+		
+		# Camera intrinsics (same as simlingo get_camera_intrinsics)
+		focal = W / (2.0 * np.tan(fov * np.pi / 360.0))
+		K = np.identity(3, dtype=np.float32)
+		K[0, 0] = K[1, 1] = focal
+		K[0, 2] = W / 2.0
+		K[1, 2] = H / 2.0
+		
+		# Camera extrinsics for rear view camera
+		# simlingo HD_VIZ uses: tvec = [[0.0, 3.5, 5.5]] for a camera at higher position
+		# Our rear camera: x=-8.0, y=0.0, z=6.0, pitch=-15
+		# tvec format: [lateral, height, forward_offset_to_add_to_waypoint_x]
+		# For rear camera at x=-8.0, waypoints need +8.0 offset to be in front of camera
+		tvec = np.array([[0.0, 6.0, 8.0]], np.float32)
+		
+		# Rotation: simlingo uses cam_rots = [roll, pitch, yaw] = [0, -15, 0]
+		# Then: rot_matrix = get_rotation_matrix(-cam_rots[0], -cam_rots[1], cam_rots[2])
+		# So: get_rotation_matrix(0, 15, 0)
+		cam_rots = [0.0, -15.0, 0.0]
+		
+		# Build rotation matrix (exactly as simlingo get_rotation_matrix)
+		roll = (-cam_rots[0]) * np.pi / 180.0
+		pitch = (-cam_rots[1]) * np.pi / 180.0
+		yaw = cam_rots[2] * np.pi / 180.0
+		
+		yawMatrix = np.array([
+			[np.cos(yaw), -np.sin(yaw), 0],
+			[np.sin(yaw), np.cos(yaw), 0],
+			[0, 0, 1]
+		])
+		pitchMatrix = np.array([
+			[np.cos(pitch), 0, np.sin(pitch)],
+			[0, 1, 0],
+			[-np.sin(pitch), 0, np.cos(pitch)]
+		])
+		rollMatrix = np.array([
+			[1, 0, 0],
+			[0, np.cos(roll), -np.sin(roll)],
+			[0, np.sin(roll), np.cos(roll)]
+		])
+		
+		R = pitchMatrix @ yawMatrix @ rollMatrix
+		R = R.T  # inverse rotation
+		
+		rvec = cv2.Rodrigues(R)[0].flatten()
+		
+		# Now use simlingo's project_points logic
+		# In project_points: rvec_new = [[-rvec[1], rvec[2], rvec[0]]]
+		rvec_new = np.array([[-rvec[1], rvec[2], rvec[0]]], np.float32)
+		dist_coeffs = np.zeros((5, 1), np.float32)
+		
+		# Project each waypoint (exactly as simlingo project_points)
+		for wp in waypoints:
+			# simlingo: pos_3d = [point[1], 0, point[0] + tvec[0][2]]
+			# point = [x_forward, y_left]
+			# pos_3d = [y_left, 0, x_forward + offset]
+			pos_3d = np.array([[wp[1], 0, wp[0] + tvec[0][2]]], np.float32)
+			
+			points_2d, _ = cv2.projectPoints(
+				pos_3d,
+				rvec=rvec_new,
+				tvec=tvec,
+				cameraMatrix=K,
+				distCoeffs=dist_coeffs
+			)
+			
+			u, v = int(points_2d[0][0][0]), int(points_2d[0][0][1])
+			
+			# Check if point is within image bounds
+			if 0 <= u < W and 0 <= v < H:
+				# Draw blue point, small size, no border
+				cv2.circle(img, (u, v), 4, (255, 0, 0), -1)  # Blue color (BGR)
+		
+		return img
 	
 	def control_pid(self, route_waypoints, velocity, speed_waypoints, target_point=None):
 		"""
@@ -1381,6 +1493,13 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 
 			tick_data["rgb_raw"] = tick_data["rgb_front"]
 
+			# Project DP waypoints onto rear view camera image
+			speed_waypoints_np = dp_pred_traj['action'].squeeze(0)  # (N, 2) in ego frame [x_forward, y_left]
+			rgb_rear_view_with_waypoints = self.project_waypoints_to_rear_view(
+				speed_waypoints_np, tick_data['rgb_rear_view']
+			)
+			tick_data["rgb_rear_view_waypoints"] = rgb_rear_view_with_waypoints
+
 			tick_data["rgb"] = cv2.resize(tick_data["rgb_front"], (800, 600))
 			tick_data["bev_traj"] = cv2.resize(tick_data["bev_traj"], (400, 400))
 
@@ -1401,6 +1520,11 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			surface = self._hic.run_interface(tick_data)
 			tick_data["surface"] = surface
 
+			# Save interface image
+			if SAVE_PATH is not None:
+				frame = self.step
+				Image.fromarray(surface).save(self.save_path / 'interface' / ('%04d.png' % frame))
+
 		return control
 
 	def save(self, tick_data):
@@ -1415,7 +1539,7 @@ class MOTAgent(autonomous_agent.AutonomousAgent):
 			bev_img = self._draw_trajectory_on_bev(bev_img, self.last_pred_traj, self.last_target_point, 
 			                                        self.last_next_target_point, self.last_dp_pred_traj, self.last_route_pred)
 		tick_data['bev_traj'] = bev_img
-		Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
+		# Image.fromarray(bev_img).save(self.save_path / 'bev' / ('%04d.png' % frame))
 		
 		if 'lidar_bev' in tick_data:
 			lidar_bev_tensor = tick_data['lidar_bev']

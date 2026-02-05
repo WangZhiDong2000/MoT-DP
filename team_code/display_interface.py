@@ -24,7 +24,12 @@ class DisplayInterface(object):
         pygame.display.set_caption("MoT Agent")
 
     def run_interface(self, input_data):
-        rgb = input_data['rgb']
+        # Use rear view camera with projected waypoints as the main view (left side)
+        if 'rgb_rear_view_waypoints' in input_data:
+            rgb = input_data['rgb_rear_view_waypoints']
+        else:
+            rgb = input_data['rgb']
+        
         trajectory = input_data['predicted_trajectory']
         decision_1s = input_data['decision_1s']
         decision_2s = input_data['decision_2s']
